@@ -284,6 +284,11 @@ Callahan auto-detects and configures runners for:
 
 ---
 
+
+## ⚠️ Disclaimer
+
+Callahan CI is provided **"as is"** without warranty of any kind. The authors are not liable for any damages arising from the use of this software. See [LICENSE](LICENSE) for full terms.
+
 ## 🤝 Contributing
 
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
