@@ -52,7 +52,7 @@
 }
 
 @layer base {
-  * { @apply border-border; box-sizing: border-box; }
+  * { box-sizing: border-box; }
 
   html { font-family: var(--font-sans); }
 
