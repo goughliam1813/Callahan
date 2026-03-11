@@ -2,66 +2,172 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Figtree:wght@300;400;500;600;700;800;900&display=swap');
 
 @layer base {
   :root {
-    --background: 30 20% 97%;
-    --foreground: 220 20% 14%;
-    --card: 0 0% 100%;
-    --card-foreground: 220 20% 14%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 220 20% 14%;
-    --primary: 22 95% 52%;
-    --primary-foreground: 0 0% 100%;
-    --secondary: 30 15% 93%;
-    --secondary-foreground: 220 20% 14%;
-    --muted: 30 15% 93%;
-    --muted-foreground: 220 10% 46%;
-    --accent: 30 20% 90%;
-    --accent-foreground: 220 20% 14%;
-    --destructive: 0 84% 60%;
+    /* ── Brand colours — matches callahanci.com exactly ── */
+    --bg:            #080a0f;
+    --bg1:           #0d1117;
+    --bg2:           #111620;
+    --bg3:           #161c2c;
+    --line:          rgba(255,255,255,0.07);
+    --line2:         rgba(255,255,255,0.12);
+    --c-text:        #e8eaf0;
+    --c-text2:       #8892a4;
+    --c-text3:       #545f72;
+    --c-accent:      #00d4ff;
+    --c-accent2:     #0099cc;
+    --c-green:       #00e5a0;
+    --c-orange:      #ff6b2b;
+    --c-red:         #ff4455;
+    --c-yellow:      #f5c542;
+    --c-purple:      #a078ff;
+
+    /* shadcn/radix compat — mapped to dark theme */
+    --background:         8 15% 5%;
+    --foreground:         220 15% 92%;
+    --card:               220 20% 8%;
+    --card-foreground:    220 15% 92%;
+    --popover:            220 20% 8%;
+    --popover-foreground: 220 15% 92%;
+    --primary:            192 100% 50%;
+    --primary-foreground: 0 0% 0%;
+    --secondary:          220 15% 12%;
+    --secondary-foreground: 220 15% 70%;
+    --muted:              220 15% 12%;
+    --muted-foreground:   220 10% 45%;
+    --accent:             220 15% 14%;
+    --accent-foreground:  220 15% 92%;
+    --destructive:        354 70% 60%;
     --destructive-foreground: 0 0% 100%;
-    --border: 30 12% 88%;
-    --input: 30 15% 93%;
-    --ring: 22 95% 52%;
-    --radius: 0.6rem;
-    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+    --border:             220 15% 14%;
+    --input:              220 15% 12%;
+    --ring:               192 100% 50%;
+    --radius:             0.5rem;
+
+    --font-sans: 'Figtree', system-ui, sans-serif;
+    --font-mono: 'IBM Plex Mono', 'Fira Code', monospace;
   }
 }
 
 @layer base {
   * { @apply border-border; box-sizing: border-box; }
+
   html { font-family: var(--font-sans); }
+
   body {
-    @apply bg-background text-foreground;
+    background: var(--bg);
+    color: var(--c-text);
     font-family: var(--font-sans);
     font-size: 14px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Grid background — matches website */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(var(--line) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 64px 64px;
+    pointer-events: none;
+    z-index: 0;
+    mask-image: radial-gradient(ellipse 100% 50% at 50% 0%, black 20%, transparent 100%);
+  }
+
+  /* Cyan top glow */
+  body::after {
+    content: '';
+    position: fixed;
+    top: -200px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 800px;
+    height: 500px;
+    background: radial-gradient(ellipse, rgba(0,212,255,0.05) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
   ::-webkit-scrollbar { width: 4px; height: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: hsl(30 12% 82%); border-radius: 4px; }
-  ::-webkit-scrollbar-thumb:hover { background: hsl(30 12% 72%); }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
 }
 
 @layer components {
   .font-mono { font-family: var(--font-mono) !important; }
+
+  /* Accent button — cyan, matches website */
+  .btn-accent {
+    background: var(--c-accent);
+    color: #000;
+    font-weight: 700;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    transition: all 0.15s;
+  }
+  .btn-accent:hover {
+    background: #33ddff;
+    box-shadow: 0 0 20px rgba(0,212,255,0.3);
+  }
+
+  /* Ghost button */
+  .btn-ghost {
+    background: transparent;
+    color: var(--c-text2);
+    border: 1px solid var(--line2);
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-size: 13px;
+    transition: all 0.15s;
+  }
+  .btn-ghost:hover {
+    color: var(--c-text);
+    border-color: rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.04);
+  }
+
+  /* Card — matches website bento cards */
+  .ci-card {
+    background: var(--bg1);
+    border: 1px solid var(--line2);
+    border-radius: 10px;
+    transition: border-color 0.2s;
+  }
+  .ci-card:hover { border-color: rgba(0,212,255,0.25); }
+
+  /* Status tags */
+  .tag-success { background: rgba(0,229,160,0.1);  color: var(--c-green);  border: 1px solid rgba(0,229,160,0.2); }
+  .tag-running  { background: rgba(0,212,255,0.1);  color: var(--c-accent); border: 1px solid rgba(0,212,255,0.2); }
+  .tag-failed   { background: rgba(255,68,85,0.1);  color: var(--c-red);    border: 1px solid rgba(255,68,85,0.2); }
+  .tag-pending  { background: rgba(245,197,66,0.1); color: var(--c-yellow); border: 1px solid rgba(245,197,66,0.2); }
+  .tag-ai       { background: rgba(160,120,255,0.1);color: var(--c-purple); border: 1px solid rgba(160,120,255,0.2); }
 }
 
 /* Status pulse */
 @keyframes status-pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.25; }
+  50%       { opacity: 0.25; }
 }
 .status-dot-running { animation: status-pulse 1.5s ease-in-out infinite; }
+
+/* Blink */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+.blink { animation: blink 2s ease-in-out infinite; }
 
 /* Fade in */
 @keyframes fade-in {
   from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: translateY(0); }
 }
-.animate-fade-in { animation: fade-in 0.25s ease-out; }
+.animate-fade-in { animation: fade-in 0.2s ease-out; }

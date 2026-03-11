@@ -10,6 +10,7 @@ export const metadata: Metadata = {
     title: "Callahan CI",
     description: "AI-native, serverless CI/CD. Local-first. Zero cloud required.",
     type: "website",
+    url: "https://callahanci.com",
   },
 };
 
@@ -25,11 +26,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
         <link
-          href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+          href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Figtree:wght@300;400;500;600;700;800;900&display=swap"
           rel="stylesheet"
         />
       </head>
-      <body className="antialiased bg-background text-foreground">
+      <body className="antialiased">
         {children}
       </body>
     </html>
