@@ -1,0 +1,63 @@
+name: Rust CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        run: |
+          rustup update stable
+          rustup component add clippy rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cargo check
+        run: cargo check --all-features
+
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Tests
+        run: cargo test --all-features -- --test-threads=4
+
+      - name: Doc tests
+        run: cargo test --doc
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit
+          cargo audit
+
+  build:
+    name: Release Build
+    runs-on: ubuntu-latest
+    needs: [check, audit]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build release
+        run: cargo build --release
+      - name: Strip binary
+        run: strip target/release/app

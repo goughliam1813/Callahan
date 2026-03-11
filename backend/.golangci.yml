@@ -1,0 +1,15 @@
+linters:
+  enable:
+    - gofmt
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+linters-settings:
+  gofmt:
+    simplify: true
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters: [errcheck]

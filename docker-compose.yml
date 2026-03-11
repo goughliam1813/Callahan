@@ -1,0 +1,75 @@
+services:
+  callahan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: callahan-ci/callahan:local
+    container_name: callahan
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - callahan_data:/data
+      # Mac Docker Desktop socket (works on macOS + Linux)
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock:ro
+    environment:
+      # Core
+      PORT: "8080"
+      DB_PATH: "/data/callahan.db"
+      DATA_DIR: "/data"
+      JWT_SECRET: "${JWT_SECRET:-change-me-in-production}"
+      
+      # LLM Configuration (set at least one)
+      LLM_PROVIDER: "${LLM_PROVIDER:-anthropic}"
+      LLM_MODEL: "${LLM_MODEL:-claude-3-5-sonnet-20241022}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      OLLAMA_URL: "${OLLAMA_URL:-http://ollama:11434}"
+      
+      # Git Providers (optional)
+      GITHUB_CLIENT_ID: "${GITHUB_CLIENT_ID:-}"
+      GITHUB_CLIENT_SECRET: "${GITHUB_CLIENT_SECRET:-}"
+      GITLAB_CLIENT_ID: "${GITLAB_CLIENT_ID:-}"
+      GITLAB_CLIENT_SECRET: "${GITLAB_CLIENT_SECRET:-}"
+      
+      # Feature flags
+      TELEMETRY_ENABLED: "false"
+      DEV_MODE: "${DEV_MODE:-false}"
+    networks:
+      - callahan_net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Local Ollama for offline AI (no API keys needed)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: callahan-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    profiles:
+      - with-ollama
+    networks:
+      - callahan_net
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+volumes:
+  callahan_data:
+    driver: local
+  ollama_data:
+    driver: local
+
+networks:
+  callahan_net:
+    driver: bridge
