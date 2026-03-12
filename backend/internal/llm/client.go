@@ -84,7 +84,7 @@ func (c *Client) Complete(ctx context.Context, req CompletionRequest) (*Completi
 func (c *Client) anthropicComplete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
 	model := req.Model
 	if model == "" {
-		model = "claude-3-5-sonnet-20241022"
+		model = "claude-sonnet-4-5"
 	}
 
 	type AnthropicMsg struct {
@@ -168,7 +168,7 @@ func (c *Client) openaiComplete(ctx context.Context, req CompletionRequest) (*Co
 }
 
 func (c *Client) groqComplete(ctx context.Context, req CompletionRequest) (*CompletionResponse, error) {
-	return c.openaiCompatible(ctx, req, "https://api.groq.com/openai/v1/chat/completions", c.cfg.GroqKey, "llama-3.1-70b-versatile")
+	return c.openaiCompatible(ctx, req, "https://api.groq.com/openai/v1/chat/completions", c.cfg.GroqKey, "llama-3.3-70b-versatile")
 }
 
 func (c *Client) openaiCompatible(ctx context.Context, req CompletionRequest, url, apiKey, defaultModel string) (*CompletionResponse, error) {

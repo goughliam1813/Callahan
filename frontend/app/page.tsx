@@ -1315,7 +1315,7 @@ jobs:
     const PROVIDERS = [
       { id:'anthropic', name:'Anthropic', models:['claude-opus-4-5','claude-sonnet-4-5','claude-haiku-4-5-20251001'] },
       { id:'openai',    name:'OpenAI',    models:['gpt-4o','gpt-4o-mini','o1-mini'] },
-      { id:'groq',      name:'Groq',      models:['llama-3.3-70b-versatile','mixtral-8x7b-32768'] },
+      { id:'groq',      name:'Groq',      models:['llama-3.3-70b-versatile','llama3-8b-8192','gemma2-9b-it'] },
       { id:'ollama',    name:'Ollama (Local)', models:['llama3.2','mistral','codellama','phi3'] },
     ];
 

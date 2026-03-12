@@ -449,26 +449,44 @@ func (h *Handler) TestLLMConfig(c *gin.Context) {
 		Provider string `json:"provider"`
 		Model    string `json:"model"`
 		APIKey   string `json:"api_key"`
+		OllamaURL string `json:"ollama_url"`
 	}
 	c.ShouldBindJSON(&req)
 
-	// Temporarily use the provided key for the test
-	testCfg := *h.cfg
-	if req.APIKey != "" {
-		switch req.Provider {
-		case "anthropic": testCfg.AnthropicKey = req.APIKey
-		case "openai":    testCfg.OpenAIKey = req.APIKey
-		case "groq":      testCfg.GroqKey = req.APIKey
-		}
+	// Build a clean config scoped to exactly what the user submitted
+	testCfg := config.Config{
+		DefaultLLMProvider: req.Provider,
+		DefaultLLMModel:    req.Model,
+		OllamaURL:          h.cfg.OllamaURL,
 	}
-	if req.Provider != "" { testCfg.DefaultLLMProvider = req.Provider }
-	if req.Model != "" { testCfg.DefaultLLMModel = req.Model }
+	if req.OllamaURL != "" { testCfg.OllamaURL = req.OllamaURL }
+
+	// Use the key from the request; fall back to whatever is already stored
+	key := req.APIKey
+	if key == "" { key = h.resolveKey(req.Provider) }
+
+	switch req.Provider {
+	case "anthropic": testCfg.AnthropicKey = key
+	case "openai":    testCfg.OpenAIKey    = key
+	case "groq":      testCfg.GroqKey      = key
+	case "google":    testCfg.GoogleKey    = key
+	}
+
+	if req.Provider == "" {
+		c.JSON(200, gin.H{"ok": false, "error": "No provider selected"})
+		return
+	}
+	if key == "" && req.Provider != "ollama" {
+		c.JSON(200, gin.H{"ok": false, "error": "No API key provided — enter your key above before testing"})
+		return
+	}
 
 	testClient := llm.New(&testCfg)
 	resp, err := testClient.Complete(c.Request.Context(), llm.CompletionRequest{
-		Messages: []llm.Message{{Role: "user", Content: "Reply with exactly: Callahan AI online"}},
+		Messages:  []llm.Message{{Role: "user", Content: "Reply with exactly: Callahan AI online"}},
 		MaxTokens: 30,
 		Provider:  req.Provider,
+		Model:     req.Model,
 	})
 	if err != nil {
 		c.JSON(200, gin.H{"ok": false, "error": err.Error()})
@@ -485,6 +503,7 @@ func (h *Handler) ListModels(c *gin.Context) {
 		{"provider": "openai",    "model": "gpt-4o",                    "name": "GPT-4o",               "available": h.resolveKey("openai") != ""},
 		{"provider": "openai",    "model": "gpt-4o-mini",               "name": "GPT-4o Mini",          "available": h.resolveKey("openai") != ""},
 		{"provider": "groq",      "model": "llama-3.3-70b-versatile",   "name": "Llama 3.3 70B (Groq)", "available": h.resolveKey("groq") != ""},
+		{"provider": "groq",      "model": "llama3-8b-8192",             "name": "Llama 3 8B (Groq)",    "available": h.resolveKey("groq") != ""},
 		{"provider": "ollama",    "model": "llama3.2",                  "name": "Llama 3.2 (Local)",    "available": true},
 		{"provider": "ollama",    "model": "mistral",                   "name": "Mistral (Local)",      "available": true},
 	}
