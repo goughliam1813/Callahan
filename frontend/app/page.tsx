@@ -90,14 +90,13 @@ export default function App() {
   const [aiOpen, setAiOpen]       = useState(false);
   const [cmdOpen, setCmdOpen]     = useState(false);
   const [addProj, setAddProj]     = useState(false);
+  const [addFolder, setAddFolder] = useState(false);
   const [msgs, setMsgs]           = useState<ChatMsg[]>([
     { role:'assistant', content:"Hey — I'm Callahan AI. Ask me to generate a pipeline, explain a failure, or review your code." }
   ]);
   const [input, setInput]         = useState('');
   const [loading, setLoading]     = useState(false);
   const [folders, setFolders]     = useState<FolderItem[]>([]);
-  const [newName, setNewName]   = useState('');
-  const [newRepo, setNewRepo]   = useState('');
   const [cmdQ, setCmdQ]         = useState('');
   const chatEnd  = useRef<HTMLDivElement>(null);
   const cmdRef   = useRef<HTMLInputElement>(null);
@@ -189,10 +188,16 @@ export default function App() {
           padding:'4px 6px 8px' }}>
           <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
             letterSpacing:'0.1em', textTransform:'uppercase' }}>Projects</span>
-          <button onClick={()=>setAddProj(true)} style={{ background:'none', border:'none',
-            color:'#545f72', cursor:'pointer', padding:3, borderRadius:4, lineHeight:0 }}>
-            <Plus size={13}/>
-          </button>
+          <div style={{ display:'flex', gap:4 }}>
+            <button onClick={()=>setAddFolder(true)} title="New folder" style={{ background:'none', border:'none',
+              color:'#545f72', cursor:'pointer', padding:3, borderRadius:4, lineHeight:0 }}>
+              <FolderOpen size={13}/>
+            </button>
+            <button onClick={()=>setAddProj(true)} title="New project" style={{ background:'none', border:'none',
+              color:'#545f72', cursor:'pointer', padding:3, borderRadius:4, lineHeight:0 }}>
+              <Plus size={13}/>
+            </button>
+          </div>
         </div>
 
         {folders.map(f => (
@@ -808,48 +813,140 @@ jobs:
   };
 
   /* ── add project modal ────────────────────────────────────────────────────── */
-  const AddProject = () => (
-    <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
-      justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
-      onClick={()=>setAddProj(false)}>
-      <div style={{ width:480, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
-        borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
-        onClick={e=>e.stopPropagation()}>
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
-          <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700,
-            color:'#fff', margin:0, letterSpacing:'-0.02em' }}>Connect Repository</h3>
-          <button onClick={()=>setAddProj(false)} style={{ background:'none', border:'none',
-            cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={16}/></button>
-        </div>
-        {[{l:'Project Name',v:newName,s:setNewName,p:'my-service'},{l:'Repository URL',v:newRepo,s:setNewRepo,p:'github.com/org/repo'}].map(f=>(
-          <div key={f.l} style={{ marginBottom:16 }}>
-            <div style={{ fontSize:12, color:'#545f72', marginBottom:6,
-              fontFamily:"'Figtree',sans-serif" }}>{f.l}</div>
-            <input value={f.v} onChange={e=>f.s(e.target.value)} placeholder={f.p}
-              style={{ width:'100%', background:'#080a0f',
-                border:'1px solid rgba(255,255,255,0.12)', borderRadius:7,
-                padding:'10px 14px', color:'#e8eaf0',
+  const AddProject = () => {
+    const [name, setName] = useState('');
+    const [repo, setRepo] = useState('');
+    const nameRef = useRef<HTMLInputElement>(null);
+    useEffect(() => { setTimeout(() => nameRef.current?.focus(), 50); }, []);
+    const submit = () => {
+      if (!name.trim()) return;
+      const p: Project = { id: Date.now().toString(), name: name.trim(), repo_url: repo,
+        provider:'github', branch:'main', status:'pending', created_at: new Date().toISOString() };
+      setProjects(prev => [...prev, p]);
+      setSel(p);
+      setAddProj(false);
+    };
+    return (
+      <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
+        justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
+        onClick={()=>setAddProj(false)}>
+        <div style={{ width:480, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
+          onClick={e=>e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700,
+              color:'#fff', margin:0, letterSpacing:'-0.02em' }}>Connect Repository</h3>
+            <button onClick={()=>setAddProj(false)} style={{ background:'none', border:'none',
+              cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={16}/></button>
+          </div>
+          <div style={{ marginBottom:16 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:6, fontFamily:"'Figtree',sans-serif" }}>Project Name</div>
+            <input ref={nameRef} value={name} onChange={e=>setName(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()}
+              placeholder="my-service"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
                 fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
           </div>
-        ))}
-        <div style={{ display:'flex', gap:10, marginTop:24 }}>
-          <button onClick={()=>setAddProj(false)} style={{ flex:1, padding:10,
-            background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
-            borderRadius:7, color:'#8892a4', cursor:'pointer',
-            fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
-          <button onClick={()=>{
-            if(!newName) return;
-            const p:Project = { id:Date.now().toString(), name:newName, repo_url:newRepo,
-              provider:'github', branch:'main', status:'pending', created_at:new Date().toISOString() };
-            setProjects(prev=>[...prev,p]); setSel(p); setAddProj(false);
-            setNewName(''); setNewRepo('');
-          }} style={{ flex:1, padding:10, background:'#00d4ff', color:'#000',
-            border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
-            fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Connect</button>
+          <div style={{ marginBottom:16 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:6, fontFamily:"'Figtree',sans-serif" }}>Repository URL</div>
+            <input value={repo} onChange={e=>setRepo(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()}
+              placeholder="github.com/org/repo"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+          <div style={{ display:'flex', gap:10, marginTop:24 }}>
+            <button onClick={()=>setAddProj(false)} style={{ flex:1, padding:10,
+              background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
+              borderRadius:7, color:'#8892a4', cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+            <button onClick={submit} style={{ flex:1, padding:10, background:'#00d4ff',
+              color:'#000', border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Connect</button>
+          </div>
         </div>
       </div>
+    );
+  };
     </div>
   );
+
+  /* ── add folder modal ────────────────────────────────────────────────────── */
+  const AddFolderModal = () => {
+    const [name, setName] = useState('');
+    const [assignProj, setAssignProj] = useState<string[]>([]);
+    const inputRef = useRef<HTMLInputElement>(null);
+    useEffect(() => { setTimeout(() => inputRef.current?.focus(), 50); }, []);
+    const unfoldered = projects.filter(p => !folders.some(f => f.projects.find(fp => fp.id === p.id)));
+    const submit = () => {
+      if (!name.trim()) return;
+      const assigned = projects.filter(p => assignProj.includes(p.id));
+      setFolders(f => [...f, { id: Date.now().toString(), name: name.trim(), expanded: true, projects: assigned }]);
+      setAddFolder(false);
+    };
+    return (
+      <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
+        justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
+        onClick={()=>setAddFolder(false)}>
+        <div style={{ width:440, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
+          onClick={e=>e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:22 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700,
+              color:'#fff', margin:0, letterSpacing:'-0.02em' }}>New Folder</h3>
+            <button onClick={()=>setAddFolder(false)} style={{ background:'none', border:'none',
+              cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={16}/></button>
+          </div>
+          <div style={{ marginBottom:20 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:6, fontFamily:"'Figtree',sans-serif" }}>Folder Name</div>
+            <input ref={inputRef} value={name} onChange={e=>setName(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()}
+              placeholder="e.g. Production, Staging, Team-A"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+          {unfoldered.length > 0 && (
+            <div style={{ marginBottom:20 }}>
+              <div style={{ fontSize:12, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>
+                Add projects to this folder <span style={{ color:'#545f72', fontStyle:'italic' }}>(optional)</span>
+              </div>
+              {unfoldered.map(p => {
+                const checked = assignProj.includes(p.id);
+                return (
+                  <div key={p.id} onClick={()=>setAssignProj(a => checked ? a.filter(x=>x!==p.id) : [...a,p.id])}
+                    style={{ display:'flex', alignItems:'center', gap:10, padding:'8px 10px',
+                      borderRadius:7, cursor:'pointer', marginBottom:4,
+                      background: checked ? 'rgba(0,212,255,0.06)' : 'rgba(255,255,255,0.02)',
+                      border: `1px solid ${checked ? 'rgba(0,212,255,0.2)' : 'rgba(255,255,255,0.07)'}` }}>
+                    <div style={{ width:14, height:14, borderRadius:3, flexShrink:0,
+                      background: checked ? '#00d4ff' : 'transparent',
+                      border: `1.5px solid ${checked ? '#00d4ff' : 'rgba(255,255,255,0.2)'}`,
+                      display:'flex', alignItems:'center', justifyContent:'center' }}>
+                      {checked && <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 4l2 2 4-4" stroke="#000" strokeWidth="1.5" strokeLinecap="round" fill="none"/></svg>}
+                    </div>
+                    <span style={{ fontSize:13, color: checked ? '#e8eaf0' : '#8892a4',
+                      fontFamily:"'Figtree',sans-serif" }}>{p.name}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div style={{ display:'flex', gap:10 }}>
+            <button onClick={()=>setAddFolder(false)} style={{ flex:1, padding:10,
+              background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
+              borderRadius:7, color:'#8892a4', cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+            <button onClick={submit} style={{ flex:1, padding:10, background:'#00d4ff',
+              color:'#000', border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Create Folder</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   /* ── render ───────────────────────────────────────────────────────────────── */
   const main = () => {
@@ -882,9 +979,10 @@ jobs:
             {main()}
           </main>
         </div>
-        {aiOpen  && <AiPanel/>}
-        {cmdOpen && <CmdPalette/>}
-        {addProj && <AddProject/>}
+        {aiOpen     && <AiPanel/>}
+        {cmdOpen    && <CmdPalette/>}
+        {addProj    && <AddProject/>}
+        {addFolder  && <AddFolderModal/>}
       </div>
     </>
   );
