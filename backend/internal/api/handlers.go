@@ -410,38 +410,57 @@ func (h *Handler) GetLLMConfig(c *gin.Context) {
 
 func (h *Handler) SaveLLMConfig(c *gin.Context) {
 	var req struct {
-		Provider    string `json:"provider"`
-		Model       string `json:"model"`
-		APIKey      string `json:"api_key"`
-		OllamaURL   string `json:"ollama_url"`
+		Provider  string `json:"provider"`
+		Model     string `json:"model"`
+		APIKey    string `json:"api_key"`
+		OllamaURL string `json:"ollama_url"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
 
+	// Persist to DB
 	if req.Provider != "" { h.store.SetSystemSetting("llm_provider", req.Provider) }
-	if req.Model != "" { h.store.SetSystemSetting("llm_model", req.Model) }
+	if req.Model != ""    { h.store.SetSystemSetting("llm_model", req.Model) }
 	if req.OllamaURL != "" { h.store.SetSystemSetting("ollama_url", req.OllamaURL) }
-
-	// Store API key under provider-specific key
 	if req.APIKey != "" && req.Provider != "" {
 		h.store.SetSystemSetting("key_"+req.Provider, req.APIKey)
-		// Also reload into running config
+	}
+
+	// Apply immediately to live config so all subsequent requests use new settings
+	if req.Provider != "" { h.cfg.DefaultLLMProvider = req.Provider }
+	if req.Model != ""    { h.cfg.DefaultLLMModel = req.Model }
+	if req.OllamaURL != "" { h.cfg.OllamaURL = req.OllamaURL }
+	if req.APIKey != "" {
 		switch req.Provider {
 		case "anthropic": h.cfg.AnthropicKey = req.APIKey
-		case "openai":    h.cfg.OpenAIKey = req.APIKey
-		case "groq":      h.cfg.GroqKey = req.APIKey
-		case "google":    h.cfg.GoogleKey = req.APIKey
+		case "openai":    h.cfg.OpenAIKey    = req.APIKey
+		case "groq":      h.cfg.GroqKey      = req.APIKey
+		case "google":    h.cfg.GoogleKey    = req.APIKey
 		}
 	}
 
-	// Update active config
-	if req.Provider != "" { h.cfg.DefaultLLMProvider = req.Provider }
-	if req.Model != "" { h.cfg.DefaultLLMModel = req.Model }
-	if req.OllamaURL != "" { h.cfg.OllamaURL = req.OllamaURL }
+	// Also ensure any previously-saved key for this provider is loaded into cfg
+	// (handles case where key was saved earlier but cfg was empty)
+	if h.cfg.AnthropicKey == "" {
+		if v, _ := h.store.GetSystemSetting("key_anthropic"); v != "" { h.cfg.AnthropicKey = v }
+	}
+	if h.cfg.OpenAIKey == "" {
+		if v, _ := h.store.GetSystemSetting("key_openai"); v != "" { h.cfg.OpenAIKey = v }
+	}
+	if h.cfg.GroqKey == "" {
+		if v, _ := h.store.GetSystemSetting("key_groq"); v != "" { h.cfg.GroqKey = v }
+	}
+	if h.cfg.GoogleKey == "" {
+		if v, _ := h.store.GetSystemSetting("key_google"); v != "" { h.cfg.GoogleKey = v }
+	}
 
-	c.JSON(200, gin.H{"status": "saved"})
+	c.JSON(200, gin.H{
+		"status":   "saved",
+		"provider": h.cfg.DefaultLLMProvider,
+		"model":    h.cfg.DefaultLLMModel,
+	})
 }
 
 func (h *Handler) TestLLMConfig(c *gin.Context) {
