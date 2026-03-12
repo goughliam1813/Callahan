@@ -870,8 +870,6 @@ jobs:
       </div>
     );
   };
-    </div>
-  );
 
   /* ── add folder modal ────────────────────────────────────────────────────── */
   const AddFolderModal = () => {
