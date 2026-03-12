@@ -352,10 +352,10 @@ export default function App() {
       {/* per-project nav */}
       {sel && (
         <div style={{ padding:'8px 8px' }}>
-          {(['dashboard','builds','pipeline','secrets','settings'] as const).map(v=>{
+          {(['dashboard','builds','pipeline'] as const).map(v=>{
             const icons = {
               dashboard:<Activity size={13}/>, builds:<Zap size={13}/>,
-              pipeline:<GitBranch size={13}/>, secrets:<Lock size={13}/>, settings:<Settings size={13}/>
+              pipeline:<GitBranch size={13}/>
             } as Record<string,React.ReactNode>;
             const active = view===v;
             return (
@@ -372,18 +372,44 @@ export default function App() {
         </div>
       )}
 
-      {/* status dot + LLM config button */}
-      <div style={{ padding:'10px 16px', borderTop:'1px solid rgba(255,255,255,0.07)' }}>
-        <button onClick={()=>{ setSel(null); setView('llm-config'); }}
-          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 8px',
+      {/* status dot + bottom nav */}
+      <div style={{ padding:'10px 10px 10px', borderTop:'1px solid rgba(255,255,255,0.07)', display:'flex', flexDirection:'column', gap:2 }}>
+
+        {/* Secrets */}
+        <button onClick={()=>setView('secrets')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='secrets' ? 'rgba(0,212,255,0.06)' : 'transparent',
+            border: view==='secrets' ? '1px solid rgba(0,212,255,0.15)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Lock size={13} color={view==='secrets' ? '#00d4ff' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='secrets' ? '#00d4ff' : '#545f72', fontWeight:500 }}>Secrets</span>
+        </button>
+
+        {/* Settings */}
+        <button onClick={()=>setView('settings')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='settings' ? 'rgba(0,212,255,0.06)' : 'transparent',
+            border: view==='settings' ? '1px solid rgba(0,212,255,0.15)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Settings size={13} color={view==='settings' ? '#00d4ff' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='settings' ? '#00d4ff' : '#545f72', fontWeight:500 }}>Settings</span>
+        </button>
+
+        {/* LLM Config */}
+        <button onClick={()=>setView('llm-config')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
             background: view==='llm-config' ? 'rgba(160,120,255,0.1)' : 'transparent',
             border: view==='llm-config' ? '1px solid rgba(160,120,255,0.3)' : '1px solid transparent',
-            borderRadius:6, cursor:'pointer', marginBottom:8, textAlign:'left' }}>
-          <span style={{ fontSize:13 }}>✦</span>
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Sparkles size={13} color={view==='llm-config' ? '#a078ff' : '#545f72'}/>
           <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
             color: view==='llm-config' ? '#a078ff' : '#545f72', fontWeight:500 }}>Configure AI / LLM</span>
         </button>
-        <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+
+        {/* API status */}
+        <div style={{ display:'flex', alignItems:'center', gap:7, padding:'6px 10px 0' }}>
           <span style={{ width:6, height:6, borderRadius:'50%', background:'#00e5a0',
             boxShadow:'0 0 6px #00e5a0', display:'inline-block',
             animation:'blink 2s ease-in-out infinite' }}/>
@@ -993,12 +1019,13 @@ jobs:
   const CmdPalette = () => {
     const cmds = [
       { label:'Connect Repository',  icon:<Plus size={14}/>,      fn:()=>{setAddProj(true);setCmdOpen(false);} },
-      { label:'Run Build',           icon:<Play size={14}/>,      fn:()=>{triggerBuild();setCmdOpen(false);} },
+      { label:'Run Build',           icon:<Play size={14}/>,      fn:()=>{if(sel){triggerBuild();}setCmdOpen(false);} },
       { label:'Open Callahan AI',    icon:<Sparkles size={14}/>,  fn:()=>{setAiOpen(true);setCmdOpen(false);} },
       { label:'View Builds',         icon:<Zap size={14}/>,       fn:()=>{setView('builds');setCmdOpen(false);} },
       { label:'Edit Pipeline',       icon:<FileCode size={14}/>,  fn:()=>{setView('pipeline');setCmdOpen(false);} },
       { label:'Manage Secrets',      icon:<Lock size={14}/>,      fn:()=>{setView('secrets');setCmdOpen(false);} },
       { label:'Settings',            icon:<Settings size={14}/>,  fn:()=>{setView('settings');setCmdOpen(false);} },
+      { label:'Configure AI / LLM',  icon:<Sparkles size={14}/>,  fn:()=>{setView('llm-config');setCmdOpen(false);} },
     ].filter(c=>!cmdQ||c.label.toLowerCase().includes(cmdQ.toLowerCase()));
     return (
       <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'flex-start',
@@ -1439,13 +1466,14 @@ jobs:
   /* ── render ───────────────────────────────────────────────────────────────── */
   const main = () => {
     if (view === 'llm-config') return <LLMConfigView/>;
+    if (view === 'secrets')    return <Secrets/>;
+    if (view === 'settings')   return <SettingsView/>;
     if (!sel) return <Welcome/>;
     switch(view) {
       case 'dashboard': return <Dashboard/>;
       case 'builds':    return <Builds/>;
       case 'pipeline':  return <Pipeline/>;
-      case 'secrets':   return <Secrets/>;
-      case 'settings':  return <SettingsView/>;
+      default:          return <Dashboard/>;
     }
   };
 
