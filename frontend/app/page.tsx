@@ -199,7 +199,6 @@ export default function App() {
   const [msgs, setMsgs]           = useState<ChatMsg[]>([
     { role:'assistant', content:"Hey — I'm Callahan AI. Ask me to generate a pipeline, explain a failure, or review your code." }
   ]);
-  const [input, setInput]         = useState('');
   const [loading, setLoading]     = useState(false);
   const [folders, setFolders]     = useState<FolderItem[]>([]);
   const [cmdQ, setCmdQ]         = useState('');
@@ -235,19 +234,6 @@ export default function App() {
     setFolders(f => f.map(fo => ({ ...fo, projects: fo.projects.filter(p => p.id !== id) })));
     if (sel?.id === id) { setSel(null); setView('dashboard'); }
     try { api.triggerBuild(id); } catch {} // best-effort API delete (no delete endpoint yet)
-  };
-
-  const sendChat = async () => {
-    if (!input.trim()||loading) return;
-    const msg = input.trim(); setInput('');
-    setMsgs(m=>[...m,{role:'user',content:msg}]); setLoading(true);
-    try {
-      const r = await api.aiChat(msg, sel?.id);
-      setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
-    } catch {
-      setMsgs(m=>[...m,{role:'assistant',content:'Start the backend first: `go run ./cmd/callahan` in the backend folder.'}]);
-    }
-    setLoading(false);
   };
 
   /* ── sidebar ─────────────────────────────────────────────────────────────── */
@@ -942,7 +928,28 @@ jobs:
   };
 
   /* ── AI panel ─────────────────────────────────────────────────────────────── */
-  const AiPanel = () => (
+  const AiPanel = () => {
+    const [localInput, setLocalInput] = useState('');
+    const inputRef = useRef<HTMLInputElement>(null);
+
+    useEffect(() => { setTimeout(()=>inputRef.current?.focus(), 80); }, []);
+
+    const send = async () => {
+      const msg = localInput.trim();
+      if (!msg || loading) return;
+      setLocalInput('');
+      setMsgs(m=>[...m,{role:'user',content:msg}]);
+      setLoading(true);
+      try {
+        const r = await api.aiChat(msg, sel?.id);
+        setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
+      } catch {
+        setMsgs(m=>[...m,{role:'assistant',content:'Backend offline — run `go run ./cmd/callahan` then try again.'}]);
+      }
+      setLoading(false);
+    };
+
+    return (
     <div style={{ position:'fixed', inset:0, zIndex:50, display:'flex' }}>
       <div onClick={()=>setAiOpen(false)} style={{ flex:1, background:'rgba(0,0,0,0.5)', backdropFilter:'blur(4px)' }}/>
       <div style={{ width:380, background:'#0d1117', borderLeft:'1px solid rgba(255,255,255,0.12)',
@@ -953,7 +960,7 @@ jobs:
             <Logo size={26}/>
             <div>
               <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:700, color:'#fff' }}>Callahan AI</div>
-              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>claude-3-5-sonnet</div>
+              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>ai assistant</div>
             </div>
           </div>
           <button onClick={()=>setAiOpen(false)} style={{ background:'none', border:'none',
@@ -965,10 +972,10 @@ jobs:
             display:'flex', flexDirection:'column', gap:6 }}>
             {['Generate a pipeline for my Next.js app','Why did my last build fail?',
               'Review my code for security issues','Explain this error in plain English'].map(s=>(
-              <button key={s} onClick={()=>setInput(s)} style={{ padding:'8px 12px',
-                background:'#111620', border:'1px solid rgba(255,255,255,0.12)',
-                borderRadius:7, color:'#8892a4', cursor:'pointer', fontSize:12,
-                textAlign:'left', fontFamily:"'Figtree',sans-serif" }}>{s}</button>
+              <button key={s} onClick={()=>{ setLocalInput(s); inputRef.current?.focus(); }}
+                style={{ padding:'8px 12px', background:'#111620', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:7, color:'#8892a4', cursor:'pointer', fontSize:12,
+                  textAlign:'left', fontFamily:"'Figtree',sans-serif" }}>{s}</button>
             ))}
           </div>
         )}
@@ -983,7 +990,7 @@ jobs:
                 border: m.role==='assistant'?'1px solid rgba(255,255,255,0.12)':'none',
                 color: m.role==='user'?'#000':'#e8eaf0',
                 fontSize:13, lineHeight:1.65, fontFamily:"'Figtree',sans-serif",
-                fontWeight: m.role==='user'?600:400 }}>
+                fontWeight: m.role==='user'?600:400, whiteSpace:'pre-wrap' }}>
                 {m.content}
               </div>
             </div>
@@ -999,21 +1006,26 @@ jobs:
 
         <div style={{ padding:'12px 16px', borderTop:'1px solid rgba(255,255,255,0.07)',
           display:'flex', gap:8 }}>
-          <input value={input} onChange={e=>setInput(e.target.value)}
-            onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&sendChat()}
+          <input
+            ref={inputRef}
+            value={localInput}
+            onChange={e=>setLocalInput(e.target.value)}
+            onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }}}
             placeholder="Ask anything…"
             style={{ flex:1, background:'#111620', border:'1px solid rgba(255,255,255,0.12)',
               borderRadius:8, padding:'10px 14px', color:'#e8eaf0',
               fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
-          <button onClick={sendChat} disabled={loading}
-            style={{ padding:'10px 14px', background:'#00d4ff', color:'#000',
-              border:'none', borderRadius:8, cursor:'pointer', lineHeight:0 }}>
+          <button onClick={send} disabled={loading}
+            style={{ padding:'10px 14px', background: loading?'#111620':'#00d4ff', color: loading?'#545f72':'#000',
+              border:'none', borderRadius:8, cursor: loading?'not-allowed':'pointer', lineHeight:0,
+              transition:'all 0.15s' }}>
             <Send size={14}/>
           </button>
         </div>
       </div>
     </div>
-  );
+    );
+  };
 
   /* ── command palette ──────────────────────────────────────────────────────── */
   const CmdPalette = () => {
@@ -1328,9 +1340,13 @@ jobs:
           body: JSON.stringify({ provider, model, api_key: apiKey, ollama_url: ollamaURL })
         });
         const d = await res.json();
-        setStatus({ ok: res.ok, msg: res.ok ? 'Configuration saved' : d.error });
-        if(res.ok && apiKey) setApiKey(''); // clear key field after save
-      } catch(e:any) { setStatus({ ok:false, msg: e.message }); }
+        if (res.ok) {
+          setStatus({ ok: true, msg: `✔ Saved — now using ${d.provider} / ${d.model}` });
+          setApiKey(''); // clear key field after save for security
+        } else {
+          setStatus({ ok: false, msg: d.error || 'Save failed' });
+        }
+      } catch(e:any) { setStatus({ ok:false, msg: 'Cannot reach backend — is it running?' }); }
       setSaving(false);
     };
 

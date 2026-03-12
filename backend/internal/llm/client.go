@@ -316,6 +316,8 @@ Return ONLY the YAML content, no explanation.`
 	resp, err := c.Complete(ctx, CompletionRequest{
 		System:   system,
 		Messages: []Message{{Role: "user", Content: prompt}},
+		Provider: c.cfg.DefaultLLMProvider,
+		Model:    c.cfg.DefaultLLMModel,
 	})
 	if err != nil {
 		return "", err
@@ -341,6 +343,8 @@ Be concise and actionable.`
 	resp, err := c.Complete(ctx, CompletionRequest{
 		System:   system,
 		Messages: []Message{{Role: "user", Content: prompt}},
+		Provider: c.cfg.DefaultLLMProvider,
+		Model:    c.cfg.DefaultLLMModel,
 	})
 	if err != nil {
 		return "Unable to analyze failure (AI unavailable)", nil
@@ -430,20 +434,22 @@ func (c *Client) DetectLanguage(ctx context.Context, files []string) (string, st
 }
 
 // Chat handles multi-turn conversation about builds/pipelines
-func (c *Client) Chat(ctx context.Context, messages []Message, context string) (string, error) {
+func (c *Client) Chat(ctx context.Context, messages []Message, contextStr string) (string, error) {
 	system := fmt.Sprintf(`You are Callahan AI, an expert CI/CD assistant embedded in the Callahan platform.
 You help developers understand build failures, optimize pipelines, fix security issues, and improve code quality.
 Be concise, technical, and actionable.
 
 Current context:
-%s`, context)
+%s`, contextStr)
 
 	resp, err := c.Complete(ctx, CompletionRequest{
 		System:   system,
 		Messages: messages,
+		Provider: c.cfg.DefaultLLMProvider,
+		Model:    c.cfg.DefaultLLMModel,
 	})
 	if err != nil {
-		return "I'm unable to respond right now. Please check your LLM configuration.", nil
+		return "I'm unable to respond right now. Please check your LLM configuration in the sidebar.", nil
 	}
 	return resp.Content, nil
 }
