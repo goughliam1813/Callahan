@@ -352,11 +352,11 @@ export default function App() {
       {/* per-project nav */}
       {sel && (
         <div style={{ padding:'8px 8px' }}>
-          {(['dashboard','builds','pipeline','secrets','settings'] as View[]).map(v=>{
-            const icons: Record<View, React.ReactNode> = {
+          {(['dashboard','builds','pipeline','secrets','settings'] as const).map(v=>{
+            const icons = {
               dashboard:<Activity size={13}/>, builds:<Zap size={13}/>,
               pipeline:<GitBranch size={13}/>, secrets:<Lock size={13}/>, settings:<Settings size={13}/>
-            };
+            } as Record<string,React.ReactNode>;
             const active = view===v;
             return (
               <button key={v} onClick={()=>setView(v)} style={{ display:'flex', alignItems:'center',
@@ -1128,7 +1128,7 @@ jobs:
               <div style={{ fontSize:12, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
                 GitHub PAT <span style={{ fontStyle:'italic' }}>(private repos)</span>
               </div>
-              <button onClick={()=>setShowToken((t:boolean)=>!t)} style={{ background:'none', border:'none',
+              <button onClick={()=>setShowToken(t=>!t)} style={{ background:'none', border:'none',
                 cursor:'pointer', color:'#545f72', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
                 {showToken ? 'hide' : 'show'}
               </button>
@@ -1438,14 +1438,14 @@ jobs:
 
   /* ── render ───────────────────────────────────────────────────────────────── */
   const main = () => {
+    if (view === 'llm-config') return <LLMConfigView/>;
     if (!sel) return <Welcome/>;
     switch(view) {
       case 'dashboard': return <Dashboard/>;
       case 'builds':    return <Builds/>;
       case 'pipeline':  return <Pipeline/>;
-      case 'secrets':    return <Secrets/>;
-      case 'settings':   return <SettingsView/>;
-      case 'llm-config': return <LLMConfigView/>;
+      case 'secrets':   return <Secrets/>;
+      case 'settings':  return <SettingsView/>;
     }
   };
 
