@@ -16,7 +16,7 @@ type Build = {
 };
 import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
-type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings';
+type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config';
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
 type FolderItem = { id: string; name: string; expanded: boolean; projects: Project[] };
 
@@ -80,59 +80,104 @@ function Card({ children, style = {}, onClick }: { children: React.ReactNode; st
   );
 }
 
-/* ─── animated running log with stop button ──────────────────────────────── */
-const STEPS = [
-  { msg:'Pipeline started',             color:'#00e5a0', delay:0    },
-  { msg:'▶ step[1] — install dependencies', color:'#00d4ff', delay:800  },
-  { msg:'  Resolving packages…',        color:'#545f72', delay:1800 },
-  { msg:'✔ Dependencies installed',     color:'#00e5a0', delay:3200 },
-  { msg:'▶ step[2] — run tests',        color:'#00d4ff', delay:4000 },
-  { msg:'  Running test suite…',        color:'#545f72', delay:5000 },
-];
-
+/* ─── real live build log via WebSocket ──────────────────────────────────── */
 function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
   const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
   const [stopped, setStopped] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket|null>(null);
+  const stoppedRef = useRef(false);
 
   useEffect(() => {
-    if (stopped) return;
-    const timers = STEPS.map((s,i) =>
-      setTimeout(() => {
-        if (!stopped) setLines(l => [...l, { msg: s.msg, color: s.color }]);
-      }, s.delay)
-    );
-    return () => timers.forEach(clearTimeout);
-  }, [stopped]);
+    if (stoppedRef.current) return;
+    // Connect WebSocket
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
+    wsRef.current = ws;
+
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'log' && msg.payload.build_id === build.id) {
+          const { line, stream } = msg.payload;
+          const color = stream === 'stderr' ? '#ff4455'
+            : line.startsWith('✔') || line.startsWith('└─ Job completed') ? '#00e5a0'
+            : line.startsWith('✖') || line.startsWith('└─ Job FAILED') ? '#ff4455'
+            : line.startsWith('▶') || line.startsWith('│ ▶') || line.startsWith('┌') || line.startsWith('╔') || line.startsWith('╚') ? '#00d4ff'
+            : line.startsWith('│ ✔') ? '#00e5a0'
+            : line.startsWith('│ ✖') ? '#ff4455'
+            : line.startsWith('  [AI]') ? '#a078ff'
+            : '#8892a4';
+          setLines(l => [...l, { msg: line, color }]);
+        }
+        if (msg.type === 'build_status' && msg.payload.build_id === build.id) {
+          const s = msg.payload.status;
+          if (s === 'success' || s === 'failed' || s === 'cancelled') {
+            onStop(); // signal parent to refresh build status
+          }
+        }
+      } catch {}
+    };
+
+    ws.onerror = () => {
+      if (!stoppedRef.current)
+        setLines(l => [...l, { msg: '  WebSocket disconnected — check backend is running', color: '#f5c542' }]);
+    };
+
+    return () => { ws.close(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [build.id]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [lines]);
 
-  const stop = () => { setStopped(true); onStop(); };
+  const stop = async () => {
+    if (stopping || stopped) return;
+    setStopping(true);
+    stoppedRef.current = true;
+    wsRef.current?.close();
+    try {
+      await fetch(`http://localhost:8080/api/v1/builds/${build.id}/cancel`, { method:'POST' });
+    } catch {}
+    setStopped(true);
+    setStopping(false);
+    onStop();
+  };
 
   return (
     <div>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.1em', textTransform:'uppercase' }}>Build Log — Running</span>
-        <button onClick={stop} style={{ display:'flex', alignItems:'center', gap:6,
-          padding:'5px 12px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
-          borderRadius:5, color:'#ff4455', cursor:'pointer', fontSize:12,
-          fontFamily:"'Figtree',sans-serif", fontWeight:600 }}>
-          ■ Stop Pipeline
-        </button>
+          letterSpacing:'0.1em', textTransform:'uppercase' }}>
+          {stopped ? 'Build Log — Stopped' : 'Build Log — Live'}
+        </span>
+        {!stopped && (
+          <button onClick={stop} disabled={stopping}
+            style={{ display:'flex', alignItems:'center', gap:6,
+              padding:'5px 12px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
+              borderRadius:5, color:'#ff4455', cursor: stopping ? 'wait' : 'pointer', fontSize:12,
+              fontFamily:"'Figtree',sans-serif", fontWeight:600, opacity: stopping ? 0.6 : 1 }}>
+            ■ {stopping ? 'Stopping…' : 'Stop Pipeline'}
+          </button>
+        )}
       </div>
       <div style={{ background:'#080a0f', borderRadius:8, padding:16,
-        fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2,
-        color:'#8892a4', maxHeight:260, overflowY:'auto' }}>
-        {lines.map((l,i) => <div key={i} style={{ color:l.color }}>{l.msg}</div>)}
-        {!stopped && (
+        fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:'1.8',
+        color:'#8892a4', maxHeight:340, overflowY:'auto' }}>
+        {lines.length === 0 && !stopped && (
           <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8 }}>
-            <span style={{ display:'inline-block', width:8, height:8, borderRadius:'50%',
+            <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
               background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
-            waiting…
+            Connecting to pipeline…
           </div>
         )}
-        {stopped && <div style={{ color:'#ff4455' }}>✖ Pipeline stopped by user</div>}
+        {lines.map((l,i) => <div key={i} style={{ color:l.color, whiteSpace:'pre-wrap' }}>{l.msg}</div>)}
+        {!stopped && lines.length > 0 && (
+          <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
+            <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+              background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+          </div>
+        )}
         <div ref={bottomRef}/>
       </div>
     </div>
@@ -327,14 +372,24 @@ export default function App() {
         </div>
       )}
 
-      {/* status dot */}
-      <div style={{ padding:'10px 16px', borderTop:'1px solid rgba(255,255,255,0.07)',
-        display:'flex', alignItems:'center', gap:7 }}>
-        <span style={{ width:6, height:6, borderRadius:'50%', background:'#00e5a0',
-          boxShadow:'0 0 6px #00e5a0', display:'inline-block',
-          animation:'blink 2s ease-in-out infinite' }}/>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.04em' }}>API :8080</span>
+      {/* status dot + LLM config button */}
+      <div style={{ padding:'10px 16px', borderTop:'1px solid rgba(255,255,255,0.07)' }}>
+        <button onClick={()=>{ setSel(null); setView('llm-config'); }}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 8px',
+            background: view==='llm-config' ? 'rgba(160,120,255,0.1)' : 'transparent',
+            border: view==='llm-config' ? '1px solid rgba(160,120,255,0.3)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', marginBottom:8, textAlign:'left' }}>
+          <span style={{ fontSize:13 }}>✦</span>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='llm-config' ? '#a078ff' : '#545f72', fontWeight:500 }}>Configure AI / LLM</span>
+        </button>
+        <div style={{ display:'flex', alignItems:'center', gap:7 }}>
+          <span style={{ width:6, height:6, borderRadius:'50%', background:'#00e5a0',
+            boxShadow:'0 0 6px #00e5a0', display:'inline-block',
+            animation:'blink 2s ease-in-out infinite' }}/>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+            letterSpacing:'0.04em' }}>API :8080</span>
+        </div>
       </div>
     </aside>
   );
@@ -612,9 +667,22 @@ export default function App() {
                 <div style={{ color:'#ff4455' }}>✖ Error: 3 tests failed</div>
                 <div style={{ color:'#a078ff' }}>✦ Click "AI Explain" to diagnose this failure</div>
               </> : <>
-                <RunningLog build={selBuild} onStop={()=>{
-                  setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
-                  setSelBuild({...selBuild,status:'cancelled'});
+                <RunningLog build={selBuild} onStop={async ()=>{
+                  // Refresh build status from backend
+                  try {
+                    const res = await fetch(`http://localhost:8080/api/v1/builds/${selBuild.id}`);
+                    if (res.ok) {
+                      const updated = await res.json();
+                      setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,...updated}:x));
+                      setSelBuild(s=>({...s,...updated}));
+                    } else {
+                      setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
+                      setSelBuild(s=>({...s,status:'cancelled'}));
+                    }
+                  } catch {
+                    setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
+                    setSelBuild(s=>({...s,status:'cancelled'}));
+                  }
                 }}/>
               </>}
             </div>
@@ -969,17 +1037,25 @@ jobs:
     const [name, setName] = useState('');
     const [repo, setRepo] = useState('');
     const [branch, setBranch] = useState('main');
+    const [token, setToken] = useState('');
+    const [showToken, setShowToken] = useState(false);
     const [folderId, setFolderId] = useState<string|null>(addProjToFolder);
     const nameRef = useRef<HTMLInputElement>(null);
     useEffect(() => { setTimeout(() => nameRef.current?.focus(), 50); }, []);
-    const submit = () => {
+    const submit = async () => {
       if (!name.trim()) return;
-      const p: Project = { id: Date.now().toString(), name: name.trim(), repo_url: repo,
-        provider:'github', branch: branch||'main', status:'pending', created_at: new Date().toISOString() };
+      const body = { name: name.trim(), repo_url: repo, branch: branch||'main', token };
+      let id = Date.now().toString();
+      try {
+        const res = await fetch('http://localhost:8080/api/v1/projects', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+        });
+        if (res.ok) { const d = await res.json(); id = d.id; }
+      } catch {}
+      const p: Project = { id, name: name.trim(), repo_url: repo,
+        provider:'github', branch: branch||'main', status:'active', created_at: new Date().toISOString() };
       setProjects(prev => [...prev, p]);
-      if (folderId) {
-        setFolders(fs => fs.map(f => f.id===folderId ? { ...f, projects:[...f.projects,p] } : f));
-      }
+      if (folderId) setFolders(fs => fs.map(f => f.id===folderId ? { ...f, projects:[...f.projects,p] } : f));
       setSel(p);
       setAddProj(false);
       setAddProjToFolder(null);
@@ -1044,6 +1120,27 @@ jobs:
               style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
                 borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
                 fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+
+          {/* GitHub PAT */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:5 }}>
+              <div style={{ fontSize:12, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
+                GitHub PAT <span style={{ fontStyle:'italic' }}>(private repos)</span>
+              </div>
+              <button onClick={()=>setShowToken((t:boolean)=>!t)} style={{ background:'none', border:'none',
+                cursor:'pointer', color:'#545f72', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                {showToken ? 'hide' : 'show'}
+              </button>
+            </div>
+            <input type={showToken?'text':'password'} value={token} onChange={e=>setToken(e.target.value)}
+              placeholder="ghp_xxxx — leave empty for public repos"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+            <div style={{ fontSize:11, color:'#545f72', marginTop:4, fontFamily:"'Figtree',sans-serif", lineHeight:1.5 }}>
+              Stored as GIT_TOKEN secret. Generate at GitHub → Settings → Developer settings → Personal access tokens → Fine-grained → repo read access.
+            </div>
           </div>
 
           {/* folder picker — only show if folders exist and not already pre-selected */}
@@ -1168,6 +1265,177 @@ jobs:
     );
   };
 
+  /* ── LLM Config ──────────────────────────────────────────────────────────── */
+  const LLMConfigView = () => {
+    const [provider, setProvider] = useState('anthropic');
+    const [model, setModel]       = useState('claude-sonnet-4-5');
+    const [apiKey, setApiKey]     = useState('');
+    const [ollamaURL, setOllamaURL] = useState('http://localhost:11434');
+    const [showKey, setShowKey]   = useState(false);
+    const [status, setStatus]     = useState<null|{ok:boolean;msg:string}>(null);
+    const [testing, setTesting]   = useState(false);
+    const [saving, setSaving]     = useState(false);
+
+    useEffect(() => {
+      fetch('http://localhost:8080/api/v1/settings/llm')
+        .then(r=>r.json()).then(d=>{
+          if(d.provider) setProvider(d.provider);
+          if(d.model) setModel(d.model);
+          if(d.ollama_url) setOllamaURL(d.ollama_url);
+        }).catch(()=>{});
+    }, []);
+
+    const PROVIDERS = [
+      { id:'anthropic', name:'Anthropic', models:['claude-opus-4-5','claude-sonnet-4-5','claude-haiku-4-5-20251001'] },
+      { id:'openai',    name:'OpenAI',    models:['gpt-4o','gpt-4o-mini','o1-mini'] },
+      { id:'groq',      name:'Groq',      models:['llama-3.3-70b-versatile','mixtral-8x7b-32768'] },
+      { id:'ollama',    name:'Ollama (Local)', models:['llama3.2','mistral','codellama','phi3'] },
+    ];
+
+    const save = async () => {
+      setSaving(true);
+      setStatus(null);
+      try {
+        const res = await fetch('http://localhost:8080/api/v1/settings/llm', {
+          method:'PUT', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider, model, api_key: apiKey, ollama_url: ollamaURL })
+        });
+        const d = await res.json();
+        setStatus({ ok: res.ok, msg: res.ok ? 'Configuration saved' : d.error });
+        if(res.ok && apiKey) setApiKey(''); // clear key field after save
+      } catch(e:any) { setStatus({ ok:false, msg: e.message }); }
+      setSaving(false);
+    };
+
+    const testConnection = async () => {
+      setTesting(true); setStatus(null);
+      try {
+        const res = await fetch('http://localhost:8080/api/v1/settings/llm/test', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider, model, api_key: apiKey })
+        });
+        const d = await res.json();
+        setStatus({ ok: d.ok, msg: d.ok ? `✔ Connected — "${d.response}"` : `✖ ${d.error}` });
+      } catch(e:any) { setStatus({ ok:false, msg: '✖ Cannot reach backend — is it running?' }); }
+      setTesting(false);
+    };
+
+    const prov = PROVIDERS.find(p=>p.id===provider);
+
+    return (
+      <div style={{ padding:28, maxWidth:640 }}>
+        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
+          color:'#fff', letterSpacing:'-0.03em', marginBottom:6 }}>AI / LLM Configuration</h2>
+        <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif",
+          lineHeight:1.6, marginBottom:24 }}>
+          Choose your AI provider and enter an API key. Keys are stored in the local database and never leave your machine.
+        </p>
+
+        {/* Provider selector */}
+        <Card style={{ marginBottom:14 }}>
+          <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+            fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>Provider</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+            {PROVIDERS.map(p=>(
+              <button key={p.id} onClick={()=>{ setProvider(p.id); setModel(p.models[0]); setStatus(null); }}
+                style={{ padding:'12px 14px', borderRadius:8, cursor:'pointer', textAlign:'left',
+                  fontFamily:"'Figtree',sans-serif",
+                  background: provider===p.id ? 'rgba(160,120,255,0.08)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${provider===p.id ? 'rgba(160,120,255,0.4)' : 'rgba(255,255,255,0.08)'}`,
+                  transition:'all 0.15s' }}>
+                <div style={{ fontSize:13, fontWeight:600, color: provider===p.id ? '#a078ff' : '#e8eaf0', marginBottom:2 }}>{p.name}</div>
+                <div style={{ fontSize:11, color:'#545f72' }}>{p.models.length} model{p.models.length!==1?'s':''}</div>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* Model selector */}
+        <Card style={{ marginBottom:14 }}>
+          <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+            fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>Model</div>
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            {prov?.models.map(m=>(
+              <button key={m} onClick={()=>setModel(m)}
+                style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                  padding:'10px 14px', borderRadius:7, cursor:'pointer',
+                  fontFamily:"'IBM Plex Mono',monospace",
+                  background: model===m ? 'rgba(0,212,255,0.06)' : 'transparent',
+                  border: `1px solid ${model===m ? 'rgba(0,212,255,0.25)' : 'rgba(255,255,255,0.07)'}` }}>
+                <span style={{ fontSize:12, color: model===m ? '#00d4ff' : '#8892a4' }}>{m}</span>
+                {model===m && <span style={{ fontSize:10, color:'#00d4ff' }}>selected</span>}
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* API Key / URL */}
+        <Card style={{ marginBottom:14 }}>
+          {provider === 'ollama' ? (<>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+              fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>Ollama Server URL</div>
+            <input value={ollamaURL} onChange={e=>setOllamaURL(e.target.value)}
+              placeholder="http://localhost:11434"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
+              Make sure Ollama is running locally: <code style={{ color:'#00d4ff' }}>ollama serve</code>
+            </div>
+          </>) : (<>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+              <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+                fontFamily:"'IBM Plex Mono',monospace" }}>API Key</div>
+              <button onClick={()=>setShowKey(k=>!k)} style={{ background:'none', border:'none',
+                cursor:'pointer', color:'#545f72', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                {showKey ? 'hide' : 'show'}
+              </button>
+            </div>
+            <input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)}
+              placeholder={`Enter your ${prov?.name} API key…`}
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
+              {provider==='anthropic' && <>Get your key at <span style={{color:'#00d4ff'}}>console.anthropic.com</span></>}
+              {provider==='openai' && <>Get your key at <span style={{color:'#00d4ff'}}>platform.openai.com/api-keys</span></>}
+              {provider==='groq' && <>Get your key at <span style={{color:'#00d4ff'}}>console.groq.com</span></>}
+            </div>
+          </>)}
+        </Card>
+
+        {/* Status message */}
+        {status && (
+          <div style={{ marginBottom:14, padding:'12px 16px', borderRadius:8,
+            background: status.ok ? 'rgba(0,229,160,0.08)' : 'rgba(255,68,85,0.08)',
+            border: `1px solid ${status.ok ? 'rgba(0,229,160,0.2)' : 'rgba(255,68,85,0.2)'}`,
+            fontFamily:"'Figtree',sans-serif", fontSize:13,
+            color: status.ok ? '#00e5a0' : '#ff4455' }}>
+            {status.msg}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div style={{ display:'flex', gap:10 }}>
+          <button onClick={testConnection} disabled={testing}
+            style={{ flex:1, padding:'10px 20px', background:'transparent',
+              border:'1px solid rgba(255,255,255,0.15)', borderRadius:7,
+              color: testing ? '#545f72' : '#e8eaf0', cursor: testing ? 'wait' : 'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:500 }}>
+            {testing ? 'Testing…' : 'Test Connection'}
+          </button>
+          <button onClick={save} disabled={saving}
+            style={{ flex:2, padding:'10px 20px', background:'#a078ff',
+              border:'none', borderRadius:7, color:'#fff', cursor: saving ? 'wait' : 'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700,
+              opacity: saving ? 0.7 : 1 }}>
+            {saving ? 'Saving…' : 'Save Configuration'}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   /* ── render ───────────────────────────────────────────────────────────────── */
   const main = () => {
     if (!sel) return <Welcome/>;
@@ -1175,8 +1443,9 @@ jobs:
       case 'dashboard': return <Dashboard/>;
       case 'builds':    return <Builds/>;
       case 'pipeline':  return <Pipeline/>;
-      case 'secrets':   return <Secrets/>;
-      case 'settings':  return <SettingsView/>;
+      case 'secrets':    return <Secrets/>;
+      case 'settings':   return <SettingsView/>;
+      case 'llm-config': return <LLMConfigView/>;
     }
   };
 

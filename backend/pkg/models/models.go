@@ -176,6 +176,7 @@ type AIReview struct {
 
 // LogLine is a structured log entry streamed via WebSocket
 type LogLine struct {
+	BuildID   string    `json:"build_id"`
 	JobID     string    `json:"job_id"`
 	StepID    string    `json:"step_id"`
 	Line      string    `json:"line"`

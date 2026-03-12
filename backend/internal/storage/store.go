@@ -106,6 +106,12 @@ CREATE TABLE IF NOT EXISTS llm_configs (
 	is_default INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS system_settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL DEFAULT '',
+	updated_at DATETIME NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_builds_project ON builds(project_id);
 CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_build ON jobs(build_id);
@@ -288,14 +294,11 @@ func (s *Store) SetSecret(secret *models.Secret) error {
 	return err
 }
 
-func (s *Store) GetSecret(projectID, name string) (*models.Secret, error) {
-	sec := &models.Secret{}
-	err := s.db.QueryRow(`SELECT id,project_id,name,value,created_at FROM secrets WHERE project_id=? AND name=?`, projectID, name).
-		Scan(&sec.ID, &sec.ProjectID, &sec.Name, &sec.Value, &sec.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return sec, err
+func (s *Store) GetSecret(projectID, name string) (string, error) {
+	var val string
+	err := s.db.QueryRow(`SELECT value FROM secrets WHERE project_id=? AND name=?`, projectID, name).Scan(&val)
+	if err == sql.ErrNoRows { return "", nil }
+	return val, err
 }
 
 func (s *Store) ListSecretNames(projectID string) ([]string, error) {
@@ -335,4 +338,44 @@ func (s *Store) GetDashboardStats() (*DashboardStats, error) {
 	}
 	s.db.QueryRow(`SELECT COALESCE(AVG(duration_ms),0) FROM builds WHERE status='success'`).Scan(&stats.AvgDuration)
 	return stats, nil
+}
+
+// DeleteSecret removes a secret by project + name
+func (s *Store) DeleteSecret(projectID, name string) error {
+	_, err := s.db.Exec(`DELETE FROM secrets WHERE project_id=? AND name=?`, projectID, name)
+	return err
+}
+
+// GetAllSecrets returns all secrets for a project as a key→value map (for env injection)
+func (s *Store) GetAllSecrets(projectID string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT name,value FROM secrets WHERE project_id=?`, projectID)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	m := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		rows.Scan(&k, &v)
+		m[k] = v
+	}
+	return m, nil
+}
+
+// UpdateBuildCommit stores the real commit SHA and message after cloning
+func (s *Store) UpdateBuildCommit(buildID, sha, msg string) error {
+	_, err := s.db.Exec(`UPDATE builds SET commit_sha=?, commit_message=? WHERE id=?`, sha, msg, buildID)
+	return err
+}
+
+// System settings (key-value store for LLM config etc)
+func (s *Store) GetSystemSetting(key string) (string, error) {
+	var val string
+	err := s.db.QueryRow(`SELECT value FROM system_settings WHERE key=?`, key).Scan(&val)
+	if err == sql.ErrNoRows { return "", nil }
+	return val, err
+}
+
+func (s *Store) SetSystemSetting(key, value string) error {
+	_, err := s.db.Exec(`INSERT OR REPLACE INTO system_settings (key,value,updated_at) VALUES (?,?,?)`,
+		key, value, time.Now())
+	return err
 }
