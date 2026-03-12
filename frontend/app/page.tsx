@@ -21,16 +21,8 @@ type ChatMsg = { role: 'user' | 'assistant'; content: string };
 type FolderItem = { id: string; name: string; expanded: boolean; projects: Project[] };
 
 /* ─── exact demo data ─────────────────────────────────────────────────────── */
-const DEMO: Project[] = [
-  { id:'1', name:'api-service',  repo_url:'github.com/org/api-service',  provider:'github', branch:'main', status:'success', created_at: new Date().toISOString() },
-  { id:'2', name:'web-app',      repo_url:'github.com/org/web-app',       provider:'github', branch:'main', status:'running', created_at: new Date().toISOString() },
-  { id:'3', name:'ml-pipeline',  repo_url:'github.com/org/ml-pipeline',   provider:'github', branch:'dev',  status:'failed',  created_at: new Date().toISOString() },
-];
+const DEMO: Project[] = [];
 const DEMO_BUILDS: Build[] = [
-  { id:'b1', project_id:'1', status:'success', branch:'main', commit_sha:'a3f92c1', commit_message:'feat: add rate limiting',        duration:94000,  created_at: new Date(Date.now()-120000).toISOString(),   started_at:'', finished_at:'' },
-  { id:'b2', project_id:'2', status:'running', branch:'main', commit_sha:'7d1bc84', commit_message:'fix: resolve memory leak',        duration:0,      created_at: new Date(Date.now()-45000).toISOString(),    started_at:'', finished_at:'' },
-  { id:'b3', project_id:'3', status:'failed',  branch:'dev',  commit_sha:'c9e23a7', commit_message:'chore: upgrade dependencies',     duration:62000,  created_at: new Date(Date.now()-600000).toISOString(),   started_at:'', finished_at:'' },
-  { id:'b4', project_id:'1', status:'success', branch:'main', commit_sha:'f4a110d', commit_message:'refactor: extract auth middleware',duration:88000,  created_at: new Date(Date.now()-3600000).toISOString(),  started_at:'', finished_at:'' },
 ];
 
 /* ─── status badge ────────────────────────────────────────────────────────── */
@@ -103,10 +95,7 @@ export default function App() {
   ]);
   const [input, setInput]         = useState('');
   const [loading, setLoading]     = useState(false);
-  const [folders, setFolders]     = useState<FolderItem[]>([
-    { id:'f1', name:'Production', expanded:true,  projects:[DEMO[0]] },
-    { id:'f2', name:'Staging',    expanded:false, projects:[DEMO[1]] },
-  ]);
+  const [folders, setFolders]     = useState<FolderItem[]>([]);
   const [newName, setNewName]   = useState('');
   const [newRepo, setNewRepo]   = useState('');
   const [cmdQ, setCmdQ]         = useState('');
@@ -134,6 +123,14 @@ export default function App() {
       duration:0, created_at:new Date().toISOString(), started_at:'', finished_at:'' };
     setBuilds(p=>[mock,...p]);
     try { const b = await api.triggerBuild(sel.id); setBuilds(p=>[b,...p.filter(x=>x.id!==mock.id)]); } catch {}
+  };
+
+  const deleteProject = (id: string) => {
+    setProjects(p => p.filter(x => x.id !== id));
+    setBuilds(b => b.filter(x => x.project_id !== id));
+    setFolders(f => f.map(fo => ({ ...fo, projects: fo.projects.filter(p => p.id !== id) })));
+    if (sel?.id === id) { setSel(null); setView('dashboard'); }
+    try { api.triggerBuild(id); } catch {} // best-effort API delete (no delete endpoint yet)
   };
 
   const sendChat = async () => {
@@ -263,19 +260,53 @@ export default function App() {
 
   const ProjRow = ({ project:p, depth }: { project:Project; depth:number }) => {
     const active = sel?.id===p.id;
+    const [hov, setHov] = useState(false);
+    const [confirmDel, setConfirmDel] = useState(false);
     const dotColor = p.status==='success'?'#00e5a0':p.status==='running'?'#00d4ff':p.status==='failed'?'#ff4455':'#545f72';
     return (
-      <button onClick={()=>{ setSel(p); setView('dashboard'); }} style={{
-        display:'flex', alignItems:'center', gap:8,
-        padding:`7px 8px 7px ${8+depth*16}px`, width:'100%', marginBottom:2,
-        background: active?'rgba(0,212,255,0.06)':'none',
-        border: active?'1px solid rgba(0,212,255,0.15)':'1px solid transparent',
-        borderRadius:6, cursor:'pointer', color: active?'#e8eaf0':'#8892a4',
-        fontSize:13, fontFamily:"'Figtree',sans-serif", textAlign:'left' }}>
-        <span style={{ width:6, height:6, borderRadius:'50%', background:dotColor, flexShrink:0 }}/>
-        <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
-          fontWeight: active?600:400 }}>{p.name}</span>
-      </button>
+      <div style={{ position:'relative' }}
+        onMouseEnter={()=>setHov(true)}
+        onMouseLeave={()=>{ setHov(false); setConfirmDel(false); }}>
+        <button onClick={()=>{ setSel(p); setView('dashboard'); }} style={{
+          display:'flex', alignItems:'center', gap:8,
+          padding:`7px ${hov?28:8}px 7px ${8+depth*16}px`, width:'100%', marginBottom:2,
+          background: active?'rgba(0,212,255,0.06)':'none',
+          border: active?'1px solid rgba(0,212,255,0.15)':'1px solid transparent',
+          borderRadius:6, cursor:'pointer', color: active?'#e8eaf0':'#8892a4',
+          fontSize:13, fontFamily:"'Figtree',sans-serif", textAlign:'left',
+          transition:'padding 0.1s' }}>
+          <span style={{ width:6, height:6, borderRadius:'50%', background:dotColor, flexShrink:0 }}/>
+          <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+            fontWeight: active?600:400 }}>{p.name}</span>
+        </button>
+        {hov && !confirmDel && (
+          <button onClick={e=>{ e.stopPropagation(); setConfirmDel(true); }}
+            title="Remove project"
+            style={{ position:'absolute', right:6, top:'50%', transform:'translateY(-50%)',
+              background:'none', border:'none', cursor:'pointer', color:'#545f72',
+              padding:3, lineHeight:0, borderRadius:4 }}
+            onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
+            onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+            <Trash2 size={12}/>
+          </button>
+        )}
+        {confirmDel && (
+          <div style={{ position:'absolute', right:4, top:'50%', transform:'translateY(-50%)',
+            display:'flex', alignItems:'center', gap:4, zIndex:20 }}>
+            <span style={{ fontSize:11, color:'#8892a4', fontFamily:"'Figtree',sans-serif", whiteSpace:'nowrap' }}>Remove?</span>
+            <button onClick={e=>{ e.stopPropagation(); deleteProject(p.id); }}
+              style={{ padding:'2px 8px', background:'rgba(255,68,85,0.15)',
+                border:'1px solid rgba(255,68,85,0.3)', borderRadius:4,
+                color:'#ff4455', cursor:'pointer', fontSize:11,
+                fontFamily:"'Figtree',sans-serif" }}>Yes</button>
+            <button onClick={e=>{ e.stopPropagation(); setConfirmDel(false); }}
+              style={{ padding:'2px 6px', background:'none',
+                border:'1px solid rgba(255,255,255,0.12)', borderRadius:4,
+                color:'#545f72', cursor:'pointer', fontSize:11,
+                fontFamily:"'Figtree',sans-serif" }}>No</button>
+          </div>
+        )}
+      </div>
     );
   };
 
