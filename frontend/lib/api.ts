@@ -142,3 +142,18 @@ export const api = {
     return new WebSocket(`${wsBase}/ws`);
   },
 };
+
+// ── Page aliases — used by app/page.tsx ─────────────────────────────────────
+// These map the simpler names page.tsx uses to the real API methods above.
+// Also fixes type mismatches between the two Build type definitions.
+export const pageApi = {
+  getProjects: () => request<Project[]>('/projects'),
+  getBuilds:   () => request<any[]>('/builds'),
+  triggerBuild: (projectId: string) =>
+    request<any>(`/projects/${projectId}/builds`, { method: 'POST', body: '{}' }),
+  aiChat: (message: string, projectId?: string) =>
+    request<{ response?: string; message?: string }>('/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify({ raw_messages: [{ role: 'user', content: message }], context: projectId ?? '' }),
+    }).then(r => ({ message: r.response ?? r.message ?? 'No response from AI.' })),
+};

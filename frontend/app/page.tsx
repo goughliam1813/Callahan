@@ -6,7 +6,14 @@ import {
   GitCommit, X, Send, FolderOpen, Folder, ChevronDown,
   Trash2, GitBranch, Zap, Activity, ChevronRight
 } from 'lucide-react';
-import { api, Project, Build } from '@/lib/api';
+import { pageApi as api, Project } from '@/lib/api';
+
+// Local Build type — compatible with both the API response and demo data
+type Build = {
+  id: string; project_id: string; status: string; branch: string;
+  commit_sha: string; commit_message: string; duration: number;
+  created_at: string; started_at: string; finished_at: string;
+};
 import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
 type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings';
