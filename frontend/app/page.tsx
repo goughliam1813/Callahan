@@ -89,8 +89,9 @@ export default function App() {
   const [selBuild, setSelBuild]   = useState<Build|null>(null);
   const [aiOpen, setAiOpen]       = useState(false);
   const [cmdOpen, setCmdOpen]     = useState(false);
-  const [addProj, setAddProj]     = useState(false);
-  const [addFolder, setAddFolder] = useState(false);
+  const [addProj, setAddProj]         = useState(false);
+  const [addProjToFolder, setAddProjToFolder] = useState<string|null>(null);
+  const [addFolder, setAddFolder]     = useState(false);
   const [msgs, setMsgs]           = useState<ChatMsg[]>([
     { role:'assistant', content:"Hey — I'm Callahan AI. Ask me to generate a pipeline, explain a failure, or review your code." }
   ]);
@@ -202,14 +203,30 @@ export default function App() {
 
         {folders.map(f => (
           <div key={f.id}>
-            <button onClick={()=>setFolders(fs=>fs.map(x=>x.id===f.id?{...x,expanded:!x.expanded}:x))}
-              style={{ display:'flex', alignItems:'center', gap:7, padding:'6px 8px', width:'100%',
-                background:'none', border:'none', cursor:'pointer', borderRadius:6,
-                color:'#8892a4', fontSize:13, fontFamily:"'Figtree',sans-serif" }}>
-              <ChevronDown size={11} style={{ transform:f.expanded?'none':'rotate(-90deg)', transition:'0.15s', color:'#545f72' }}/>
-              {f.expanded ? <FolderOpen size={13} style={{ color:'#00d4ff' }}/> : <Folder size={13} style={{ color:'#545f72' }}/>}
-              <span style={{ fontWeight:500, fontSize:12 }}>{f.name}</span>
-            </button>
+            <div style={{ display:'flex', alignItems:'center', position:'relative' }}
+              onMouseEnter={e=>(e.currentTarget.querySelector('.folder-add') as HTMLElement)?.style && ((e.currentTarget.querySelector('.folder-add') as HTMLElement).style.opacity='1')}
+              onMouseLeave={e=>(e.currentTarget.querySelector('.folder-add') as HTMLElement)?.style && ((e.currentTarget.querySelector('.folder-add') as HTMLElement).style.opacity='0')}>
+              <button onClick={()=>setFolders(fs=>fs.map(x=>x.id===f.id?{...x,expanded:!x.expanded}:x))}
+                style={{ flex:1, display:'flex', alignItems:'center', gap:7, padding:'6px 8px',
+                  background:'none', border:'none', cursor:'pointer', borderRadius:6,
+                  color:'#8892a4', fontSize:13, fontFamily:"'Figtree',sans-serif" }}>
+                <ChevronDown size={11} style={{ transform:f.expanded?'none':'rotate(-90deg)', transition:'0.15s', color:'#545f72' }}/>
+                {f.expanded ? <FolderOpen size={13} style={{ color:'#00d4ff' }}/> : <Folder size={13} style={{ color:'#545f72' }}/>}
+                <span style={{ fontWeight:500, fontSize:12, flex:1, textAlign:'left' }}>{f.name}</span>
+                <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9, color:'#545f72' }}>
+                  {f.projects.length}
+                </span>
+              </button>
+              <button className="folder-add"
+                onClick={()=>{ setAddProjToFolder(f.id); setAddProj(true); }}
+                title={`Add repo to ${f.name}`}
+                style={{ opacity:0, transition:'opacity 0.15s', background:'none', border:'none',
+                  cursor:'pointer', color:'#545f72', padding:'4px 6px', lineHeight:0, borderRadius:4 }}
+                onMouseEnter={e=>(e.currentTarget.style.color='#00d4ff')}
+                onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                <Plus size={12}/>
+              </button>
+            </div>
             {f.expanded && f.projects.map(p=><ProjRow key={p.id} project={p} depth={1}/>)}
           </div>
         ))}
@@ -816,55 +833,125 @@ jobs:
   const AddProject = () => {
     const [name, setName] = useState('');
     const [repo, setRepo] = useState('');
+    const [branch, setBranch] = useState('main');
+    const [folderId, setFolderId] = useState<string|null>(addProjToFolder);
     const nameRef = useRef<HTMLInputElement>(null);
     useEffect(() => { setTimeout(() => nameRef.current?.focus(), 50); }, []);
     const submit = () => {
       if (!name.trim()) return;
       const p: Project = { id: Date.now().toString(), name: name.trim(), repo_url: repo,
-        provider:'github', branch:'main', status:'pending', created_at: new Date().toISOString() };
+        provider:'github', branch: branch||'main', status:'pending', created_at: new Date().toISOString() };
       setProjects(prev => [...prev, p]);
+      if (folderId) {
+        setFolders(fs => fs.map(f => f.id===folderId ? { ...f, projects:[...f.projects,p] } : f));
+      }
       setSel(p);
       setAddProj(false);
+      setAddProjToFolder(null);
     };
+    const folderName = folders.find(f=>f.id===folderId)?.name;
     return (
       <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
         justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
-        onClick={()=>setAddProj(false)}>
+        onClick={()=>{ setAddProj(false); setAddProjToFolder(null); }}>
         <div style={{ width:480, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
           borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
           onClick={e=>e.stopPropagation()}>
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+
+          {/* header */}
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:6 }}>
             <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700,
               color:'#fff', margin:0, letterSpacing:'-0.02em' }}>Connect Repository</h3>
-            <button onClick={()=>setAddProj(false)} style={{ background:'none', border:'none',
-              cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={16}/></button>
+            <button onClick={()=>{ setAddProj(false); setAddProjToFolder(null); }}
+              style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', lineHeight:0 }}>
+              <X size={16}/>
+            </button>
           </div>
-          <div style={{ marginBottom:16 }}>
-            <div style={{ fontSize:12, color:'#545f72', marginBottom:6, fontFamily:"'Figtree',sans-serif" }}>Project Name</div>
+
+          {/* folder context hint */}
+          {folderId && (
+            <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:20,
+              padding:'6px 10px', background:'rgba(0,212,255,0.06)',
+              border:'1px solid rgba(0,212,255,0.15)', borderRadius:6 }}>
+              <FolderOpen size={12} style={{ color:'#00d4ff' }}/>
+              <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#8892a4' }}>
+                Adding to <span style={{ color:'#00d4ff', fontWeight:600 }}>{folderName}</span>
+              </span>
+            </div>
+          )}
+          {!folderId && <div style={{ marginBottom:20 }}/>}
+
+          {/* project name */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Project Name</div>
             <input ref={nameRef} value={name} onChange={e=>setName(e.target.value)}
-              onKeyDown={e=>e.key==='Enter'&&submit()}
-              placeholder="my-service"
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="my-service"
               style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
                 borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
                 fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
           </div>
-          <div style={{ marginBottom:16 }}>
-            <div style={{ fontSize:12, color:'#545f72', marginBottom:6, fontFamily:"'Figtree',sans-serif" }}>Repository URL</div>
+
+          {/* repo url */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Repository URL</div>
             <input value={repo} onChange={e=>setRepo(e.target.value)}
-              onKeyDown={e=>e.key==='Enter'&&submit()}
-              placeholder="github.com/org/repo"
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="github.com/org/repo"
               style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
                 borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
                 fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
           </div>
-          <div style={{ display:'flex', gap:10, marginTop:24 }}>
-            <button onClick={()=>setAddProj(false)} style={{ flex:1, padding:10,
-              background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
-              borderRadius:7, color:'#8892a4', cursor:'pointer',
-              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
-            <button onClick={submit} style={{ flex:1, padding:10, background:'#00d4ff',
-              color:'#000', border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
-              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Connect</button>
+
+          {/* branch */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Default Branch</div>
+            <input value={branch} onChange={e=>setBranch(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="main"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+
+          {/* folder picker — only show if folders exist and not already pre-selected */}
+          {folders.length > 0 && (
+            <div style={{ marginBottom:20 }}>
+              <div style={{ fontSize:12, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>Add to Folder</div>
+              <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
+                <button onClick={()=>setFolderId(null)}
+                  style={{ padding:'5px 12px', borderRadius:6, cursor:'pointer', fontSize:12,
+                    fontFamily:"'Figtree',sans-serif",
+                    background: folderId===null ? 'rgba(255,255,255,0.08)' : 'transparent',
+                    border: `1px solid ${folderId===null ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.1)'}`,
+                    color: folderId===null ? '#e8eaf0' : '#545f72' }}>
+                  No folder
+                </button>
+                {folders.map(f=>(
+                  <button key={f.id} onClick={()=>setFolderId(f.id)}
+                    style={{ display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
+                      borderRadius:6, cursor:'pointer', fontSize:12,
+                      fontFamily:"'Figtree',sans-serif",
+                      background: folderId===f.id ? 'rgba(0,212,255,0.08)' : 'transparent',
+                      border: `1px solid ${folderId===f.id ? 'rgba(0,212,255,0.3)' : 'rgba(255,255,255,0.1)'}`,
+                      color: folderId===f.id ? '#00d4ff' : '#545f72' }}>
+                    <Folder size={11}/>{f.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display:'flex', gap:10 }}>
+            <button onClick={()=>{ setAddProj(false); setAddProjToFolder(null); }}
+              style={{ flex:1, padding:10, background:'transparent',
+                border:'1px solid rgba(255,255,255,0.12)', borderRadius:7,
+                color:'#8892a4', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+              Cancel
+            </button>
+            <button onClick={submit}
+              style={{ flex:1, padding:10, background:'#00d4ff', color:'#000',
+                border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
+                fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+              Connect
+            </button>
           </div>
         </div>
       </div>
