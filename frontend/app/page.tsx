@@ -80,7 +80,66 @@ function Card({ children, style = {}, onClick }: { children: React.ReactNode; st
   );
 }
 
-/* ─── main app ────────────────────────────────────────────────────────────── */
+/* ─── animated running log with stop button ──────────────────────────────── */
+const STEPS = [
+  { msg:'Pipeline started',             color:'#00e5a0', delay:0    },
+  { msg:'▶ step[1] — install dependencies', color:'#00d4ff', delay:800  },
+  { msg:'  Resolving packages…',        color:'#545f72', delay:1800 },
+  { msg:'✔ Dependencies installed',     color:'#00e5a0', delay:3200 },
+  { msg:'▶ step[2] — run tests',        color:'#00d4ff', delay:4000 },
+  { msg:'  Running test suite…',        color:'#545f72', delay:5000 },
+];
+
+function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
+  const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
+  const [stopped, setStopped] = useState(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (stopped) return;
+    const timers = STEPS.map((s,i) =>
+      setTimeout(() => {
+        if (!stopped) setLines(l => [...l, { msg: s.msg, color: s.color }]);
+      }, s.delay)
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [stopped]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [lines]);
+
+  const stop = () => { setStopped(true); onStop(); };
+
+  return (
+    <div>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+          letterSpacing:'0.1em', textTransform:'uppercase' }}>Build Log — Running</span>
+        <button onClick={stop} style={{ display:'flex', alignItems:'center', gap:6,
+          padding:'5px 12px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
+          borderRadius:5, color:'#ff4455', cursor:'pointer', fontSize:12,
+          fontFamily:"'Figtree',sans-serif", fontWeight:600 }}>
+          ■ Stop Pipeline
+        </button>
+      </div>
+      <div style={{ background:'#080a0f', borderRadius:8, padding:16,
+        fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2,
+        color:'#8892a4', maxHeight:260, overflowY:'auto' }}>
+        {lines.map((l,i) => <div key={i} style={{ color:l.color }}>{l.msg}</div>)}
+        {!stopped && (
+          <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8 }}>
+            <span style={{ display:'inline-block', width:8, height:8, borderRadius:'50%',
+              background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+            waiting…
+          </div>
+        )}
+        {stopped && <div style={{ color:'#ff4455' }}>✖ Pipeline stopped by user</div>}
+        <div ref={bottomRef}/>
+      </div>
+    </div>
+  );
+}
+
+
 export default function App() {
   const [projects, setProjects]   = useState<Project[]>(DEMO);
   const [builds, setBuilds]       = useState<Build[]>(DEMO_BUILDS);
@@ -553,8 +612,10 @@ export default function App() {
                 <div style={{ color:'#ff4455' }}>✖ Error: 3 tests failed</div>
                 <div style={{ color:'#a078ff' }}>✦ Click "AI Explain" to diagnose this failure</div>
               </> : <>
-                <div style={{ color:'#00d4ff' }}>▶ Pipeline running…</div>
-                <div style={{ color:'#545f72' }}>  Fetching packages…</div>
+                <RunningLog build={selBuild} onStop={()=>{
+                  setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
+                  setSelBuild({...selBuild,status:'cancelled'});
+                }}/>
               </>}
             </div>
           </Card>
@@ -642,37 +703,81 @@ jobs:
 
   /* ── secrets ──────────────────────────────────────────────────────────────── */
   const Secrets = () => {
-    const [list] = useState([
-      { key:'ANTHROPIC_API_KEY', updated:'2 days ago' },
-      { key:'FLY_API_TOKEN', updated:'5 days ago' },
-    ]);
+    const [list, setList]   = useState<{key:string;updated:string}[]>([]);
+    const [adding, setAdding] = useState(false);
+    const [newKey, setNewKey] = useState('');
+    const [newVal, setNewVal] = useState('');
+    const keyRef = useRef<HTMLInputElement>(null);
+    useEffect(()=>{ if(adding) setTimeout(()=>keyRef.current?.focus(),50); },[adding]);
+    const save = () => {
+      if(!newKey.trim()) return;
+      setList(l=>[...l,{key:newKey.trim().toUpperCase().replace(/\s+/g,'_'), updated:'just now'}]);
+      setNewKey(''); setNewVal(''); setAdding(false);
+    };
     return (
       <div style={{ padding:28 }}>
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
           <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
             color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Secrets</h2>
-          <button style={{ display:'flex', alignItems:'center', gap:7,
+          {!adding && <button onClick={()=>setAdding(true)} style={{ display:'flex', alignItems:'center', gap:7,
             padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
             borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
-            fontFamily:"'Figtree',sans-serif" }}>
-            <Plus size={14}/> Add Secret
-          </button>
+            fontFamily:"'Figtree',sans-serif" }}><Plus size={14}/> Add Secret</button>}
         </div>
+        {adding && (
+          <Card style={{ marginBottom:12 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+              fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>New Secret</div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
+              <div>
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Key Name</div>
+                <input ref={keyRef} value={newKey} onChange={e=>setNewKey(e.target.value)}
+                  onKeyDown={e=>e.key==='Enter'&&save()} placeholder="MY_API_KEY"
+                  style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                    borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
+                    fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+              </div>
+              <div>
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Value</div>
+                <input type="password" value={newVal} onChange={e=>setNewVal(e.target.value)}
+                  onKeyDown={e=>e.key==='Enter'&&save()} placeholder="sk-..."
+                  style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                    borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
+                    fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+              </div>
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>{setAdding(false);setNewKey('');setNewVal('');}}
+                style={{ padding:'8px 16px', background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:6, color:'#8892a4', cursor:'pointer', fontSize:12,
+                  fontFamily:"'Figtree',sans-serif" }}>Cancel</button>
+              <button onClick={save} style={{ padding:'8px 16px', background:'#00d4ff', color:'#000',
+                border:'none', borderRadius:6, fontWeight:700, cursor:'pointer',
+                fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Save Secret</button>
+            </div>
+          </Card>
+        )}
         <Card>
-          {list.map((s,i)=>(
+          {list.length===0 ? (
+            <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72',
+              fontSize:13, fontFamily:"'Figtree',sans-serif" }}>
+              No secrets yet — click Add Secret to store API keys and tokens
+            </div>
+          ) : list.map((s,i)=>(
             <div key={s.key} style={{ display:'flex', alignItems:'center', gap:14, padding:'14px 0',
-              borderBottom: i<list.length-1?'1px solid rgba(255,255,255,0.07)':'none' }}>
+              borderBottom:i<list.length-1?'1px solid rgba(255,255,255,0.07)':'none' }}>
               <Lock size={14} style={{ color:'#545f72' }}/>
               <div style={{ flex:1 }}>
-                <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13,
-                  color:'#fff', marginBottom:2 }}>{s.key}</div>
-                <div style={{ fontSize:11, color:'#545f72',
-                  fontFamily:"'Figtree',sans-serif" }}>Updated {s.updated}</div>
+                <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:'#fff', marginBottom:2 }}>{s.key}</div>
+                <div style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>Updated {s.updated}</div>
               </div>
-              <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
-                color:'#545f72' }}>••••••••</span>
-              <button style={{ background:'none', border:'none', cursor:'pointer',
-                color:'#545f72', padding:4, lineHeight:0 }}><Trash2 size={13}/></button>
+              <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>••••••••</span>
+              <button onClick={()=>setList(l=>l.filter(x=>x.key!==s.key))}
+                style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4, lineHeight:0 }}
+                onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
+                onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                <Trash2 size={13}/>
+              </button>
             </div>
           ))}
         </Card>
@@ -680,37 +785,67 @@ jobs:
     );
   };
 
-  /* ── settings ─────────────────────────────────────────────────────────────── */
-  const SettingsView = () => (
-    <div style={{ padding:28 }}>
-      <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
-        color:'#fff', letterSpacing:'-0.03em', marginBottom:24 }}>Settings</h2>
-      <Card style={{ marginBottom:12 }}>
-        <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:18 }}>Project</div>
-        {[{l:'Name',v:sel?.name},{l:'Repository',v:sel?.repo_url},{l:'Branch',v:sel?.branch}].map(f=>(
-          <div key={f.l} style={{ marginBottom:14 }}>
-            <div style={{ fontSize:12, color:'#545f72', marginBottom:5,
-              fontFamily:"'Figtree',sans-serif" }}>{f.l}</div>
-            <input defaultValue={f.v} style={{ width:'100%', background:'#080a0f',
-              border:'1px solid rgba(255,255,255,0.12)', borderRadius:6, padding:'9px 12px',
-              color:'#e8eaf0', fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
-          </div>
-        ))}
-        <button style={{ padding:'9px 20px', background:'#00d4ff', color:'#000',
-          border:'none', borderRadius:7, fontWeight:700, fontSize:13, cursor:'pointer',
-          fontFamily:"'Figtree',sans-serif" }}>Save Changes</button>
-      </Card>
-      <Card>
-        <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:14 }}>Danger Zone</div>
-        <button style={{ padding:'9px 20px', background:'rgba(255,68,85,0.1)',
-          color:'#ff4455', border:'1px solid rgba(255,68,85,0.2)',
-          borderRadius:7, fontSize:13, cursor:'pointer',
-          fontFamily:"'Figtree',sans-serif" }}>Delete Project</button>
-      </Card>
-    </div>
-  );
+  const SettingsView = () => {
+    const [name,   setName]   = useState(sel?.name     ?? '');
+    const [repo,   setRepo]   = useState(sel?.repo_url ?? '');
+    const [branch, setBranch] = useState(sel?.branch   ?? 'main');
+    const [saved,  setSaved]  = useState(false);
+    const [confirmDel, setConfirmDel] = useState(false);
+    const save = () => {
+      if(!sel) return;
+      setProjects(p=>p.map(x=>x.id===sel.id?{...x,name,repo_url:repo,branch}:x));
+      setSel(s=>s?{...s,name,repo_url:repo,branch}:s);
+      setSaved(true); setTimeout(()=>setSaved(false),2000);
+    };
+    return (
+      <div style={{ padding:28 }}>
+        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
+          color:'#fff', letterSpacing:'-0.03em', marginBottom:24 }}>Settings</h2>
+        <Card style={{ marginBottom:12 }}>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+            letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:18 }}>Project</div>
+          {([['Project Name',name,setName],['Repository URL',repo,setRepo],['Default Branch',branch,setBranch]] as [string,string,(v:string)=>void][]).map(([l,v,s])=>(
+            <div key={l} style={{ marginBottom:14 }}>
+              <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{l}</div>
+              <input value={v} onChange={e=>s(e.target.value)}
+                style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
+                  fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+            </div>
+          ))}
+          <button onClick={save} style={{ padding:'9px 20px',
+            background:saved?'#00e5a0':'#00d4ff', color:'#000', border:'none',
+            borderRadius:7, fontWeight:700, fontSize:13, cursor:'pointer',
+            fontFamily:"'Figtree',sans-serif", transition:'background 0.2s' }}>
+            {saved ? '✔ Saved' : 'Save Changes'}
+          </button>
+        </Card>
+        <Card>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+            letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:12 }}>Danger Zone</div>
+          <p style={{ fontSize:13, color:'#8892a4', marginBottom:14, lineHeight:1.6,
+            fontFamily:"'Figtree',sans-serif" }}>
+            Permanently removes this project and all build history. This cannot be undone.
+          </p>
+          {!confirmDel
+            ? <button onClick={()=>setConfirmDel(true)} style={{ padding:'9px 20px',
+                background:'rgba(255,68,85,0.1)', color:'#ff4455',
+                border:'1px solid rgba(255,68,85,0.2)', borderRadius:7, fontSize:13,
+                cursor:'pointer', fontFamily:"'Figtree',sans-serif" }}>Delete Project</button>
+            : <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                <span style={{ fontSize:13, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>Are you sure?</span>
+                <button onClick={()=>sel&&deleteProject(sel.id)} style={{ padding:'9px 18px',
+                  background:'#ff4455', color:'#fff', border:'none', borderRadius:7,
+                  fontSize:13, fontWeight:700, cursor:'pointer', fontFamily:"'Figtree',sans-serif" }}>Yes, Delete</button>
+                <button onClick={()=>setConfirmDel(false)} style={{ padding:'9px 18px',
+                  background:'transparent', border:'1px solid rgba(255,255,255,0.12)', borderRadius:7,
+                  color:'#8892a4', fontSize:13, cursor:'pointer', fontFamily:"'Figtree',sans-serif" }}>Cancel</button>
+              </div>
+          }
+        </Card>
+      </div>
+    );
+  };
 
   /* ── AI panel ─────────────────────────────────────────────────────────────── */
   const AiPanel = () => (
