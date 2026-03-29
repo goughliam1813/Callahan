@@ -40,9 +40,12 @@ type LogWriter func(jobID, stepID, stream, line string)
 type Executor struct {
 	logWriter LogWriter
 	mu        sync.Mutex
+	stepLogs  map[string]*strings.Builder // collects logs per stepID
 }
 
-func NewExecutor(lw LogWriter) *Executor { return &Executor{logWriter: lw} }
+func NewExecutor(lw LogWriter) *Executor {
+	return &Executor{logWriter: lw, stepLogs: make(map[string]*strings.Builder)}
+}
 
 type JobResult struct {
 	JobID    string
@@ -75,11 +78,25 @@ func (e *Executor) ExecuteJob(ctx context.Context, buildID, jobName string, job 
 		if name == "" { name = fmt.Sprintf("Step %d", i+1) }
 
 		s := &models.Step{ID: stepID, JobID: jobID, Name: name, Status: "running", Command: step.Run}
+
+		// Start collecting logs for this step
+		e.mu.Lock()
+		e.stepLogs[stepID] = &strings.Builder{}
+		e.mu.Unlock()
+
 		e.log(jobID, stepID, "stdout", fmt.Sprintf("│ ▶  %s", name))
 
 		stepStart := time.Now()
 		exitCode := e.executeStep(ctx, jobID, stepID, step, workDir, env)
 		s.Duration = time.Since(stepStart).Milliseconds()
+
+		// Collect the accumulated log
+		e.mu.Lock()
+		if sb, ok := e.stepLogs[stepID]; ok {
+			s.Log = sb.String()
+			delete(e.stepLogs, stepID)
+		}
+		e.mu.Unlock()
 
 		if exitCode != 0 {
 			s.Status = "failed"
@@ -184,6 +201,15 @@ func (e *Executor) runCommand(ctx context.Context, jobID, stepID, script, workDi
 
 func (e *Executor) log(jobID, stepID, stream, line string) {
 	if e.logWriter != nil { e.logWriter(jobID, stepID, stream, line) }
+	// Also capture into per-step log if we're collecting for this step
+	if stepID != "" {
+		e.mu.Lock()
+		if sb, ok := e.stepLogs[stepID]; ok {
+			sb.WriteString(line)
+			sb.WriteString("\n")
+		}
+		e.mu.Unlock()
+	}
 }
 
 // CloneRepo clones a git repo into workDir using optional PAT auth
@@ -286,4 +312,114 @@ func DetectLanguageFromFiles(files []string) (string, string) {
 		}
 	}
 	return "unknown", "unknown"
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// AI Pipeline Helpers — used by handlers.go for post-build AI review & security scan
+// ──────────────────────────────────────────────────────────────────────────────
+
+// GetGitDiff returns the diff of the latest commit in workDir.
+// Falls back to listing changed files if diff is empty (shallow clone).
+func GetGitDiff(workDir string) string {
+	// Try diff of HEAD against HEAD~1
+	out, err := exec.Command("git", "-C", workDir, "diff", "HEAD~1", "HEAD").Output()
+	if err == nil && len(out) > 0 {
+		return string(out)
+	}
+	// Shallow clone fallback: show the full diff of HEAD commit
+	out, _ = exec.Command("git", "-C", workDir, "diff-tree", "--no-commit-id", "-r", "-p", "HEAD").Output()
+	if len(out) > 0 {
+		return string(out)
+	}
+	// Last resort: list changed files
+	out, _ = exec.Command("git", "-C", workDir, "diff-tree", "--no-commit-id", "-r", "--name-only", "HEAD").Output()
+	return string(out)
+}
+
+// CollectSourceFiles reads key source files from workDir for AI review.
+// It returns a combined string of filename + content, capped at maxBytes total.
+func CollectSourceFiles(workDir string, maxBytes int) string {
+	if maxBytes <= 0 { maxBytes = 15000 }
+
+	// Source file extensions worth reviewing
+	exts := map[string]bool{
+		".go": true, ".py": true, ".js": true, ".ts": true, ".tsx": true, ".jsx": true,
+		".java": true, ".rs": true, ".rb": true, ".c": true, ".cpp": true, ".cs": true,
+		".php": true, ".swift": true, ".kt": true, ".scala": true,
+		".yaml": true, ".yml": true, ".toml": true, ".json": true,
+		".sh": true, ".bash": true, ".dockerfile": true,
+	}
+	// Directories to skip
+	skipDirs := map[string]bool{
+		".git": true, "node_modules": true, "vendor": true, ".next": true,
+		"__pycache__": true, "dist": true, "build": true, "target": true,
+		".callahan": true, "coverage": true,
+	}
+
+	var sb strings.Builder
+	totalBytes := 0
+
+	filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil { return nil }
+		if info.IsDir() {
+			if skipDirs[info.Name()] { return filepath.SkipDir }
+			return nil
+		}
+		if totalBytes >= maxBytes { return filepath.SkipAll }
+
+		ext := strings.ToLower(filepath.Ext(info.Name()))
+		// Also match Dockerfile, Makefile etc
+		baseName := strings.ToLower(info.Name())
+		if !exts[ext] && baseName != "dockerfile" && baseName != "makefile" {
+			return nil
+		}
+		// Skip huge files
+		if info.Size() > 50000 { return nil }
+
+		relPath, _ := filepath.Rel(workDir, path)
+		data, readErr := os.ReadFile(path)
+		if readErr != nil { return nil }
+
+		entry := fmt.Sprintf("\n--- %s ---\n%s\n", relPath, string(data))
+		if totalBytes+len(entry) > maxBytes {
+			// Truncate this file to fit
+			remaining := maxBytes - totalBytes
+			if remaining > 200 {
+				entry = entry[:remaining] + "\n[truncated]\n"
+			} else {
+				return filepath.SkipAll
+			}
+		}
+		sb.WriteString(entry)
+		totalBytes += len(entry)
+		return nil
+	})
+
+	return sb.String()
+}
+
+// RunSecurityScanner attempts to run trivy or semgrep in workDir.
+// Returns (scannerName, jsonOutput, error).
+// If neither tool is installed, returns ("", "", nil) — caller should fall back to AI-only.
+func RunSecurityScanner(ctx context.Context, workDir string) (scanner, output string, err error) {
+	// Try trivy first
+	if _, lookErr := exec.LookPath("trivy"); lookErr == nil {
+		cmd := exec.CommandContext(ctx, "trivy", "fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM", "--scanners", "vuln,secret,misconfig", workDir)
+		out, runErr := cmd.CombinedOutput()
+		if runErr == nil || len(out) > 0 {
+			return "trivy", string(out), nil
+		}
+	}
+
+	// Try semgrep
+	if _, lookErr := exec.LookPath("semgrep"); lookErr == nil {
+		cmd := exec.CommandContext(ctx, "semgrep", "--json", "--config", "auto", workDir)
+		out, runErr := cmd.CombinedOutput()
+		if runErr == nil || len(out) > 0 {
+			return "semgrep", string(out), nil
+		}
+	}
+
+	// Neither installed
+	return "", "", nil
 }

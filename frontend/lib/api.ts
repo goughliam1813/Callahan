@@ -149,11 +149,15 @@ export const api = {
 export const pageApi = {
   getProjects: () => request<Project[]>('/projects'),
   getBuilds:   () => request<any[]>('/builds'),
-  triggerBuild: (projectId: string) =>
-    request<any>(`/projects/${projectId}/builds`, { method: 'POST', body: '{}' }),
+  getProjectBuilds: (projectId: string) => request<any[]>(`/projects/${projectId}/builds`),
+  triggerBuild: (projectId: string, artifactVersionId?: string) =>
+    request<any>(`/projects/${projectId}/builds`, {
+      method: 'POST',
+      body: JSON.stringify({ artifact_version_id: artifactVersionId ?? '' }),
+    }),
   aiChat: (message: string, projectId?: string) =>
     request<{ response?: string; message?: string }>('/ai/chat', {
       method: 'POST',
-      body: JSON.stringify({ raw_messages: [{ role: 'user', content: message }], context: projectId ?? '' }),
+      body: JSON.stringify({ raw_messages: [{ role: 'user', content: message }], context: '', project_id: projectId ?? '' }),
     }).then(r => ({ message: r.response ?? r.message ?? 'No response from AI.' })),
 };

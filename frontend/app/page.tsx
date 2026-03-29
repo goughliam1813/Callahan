@@ -7,14 +7,15 @@ import {
   Trash2, GitBranch, Zap, Activity, ChevronRight
 } from 'lucide-react';
 import { pageApi as api, Project } from '@/lib/api';
+import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
 // Local Build type — compatible with both the API response and demo data
 type Build = {
   id: string; project_id: string; status: string; branch: string;
-  commit_sha: string; commit_message: string; duration: number;
+  commit_sha: string; commit_message: string;
+  duration: number; duration_ms: number; number: number;
   created_at: string; started_at: string; finished_at: string;
 };
-import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
 type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config';
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
@@ -80,110 +81,240 @@ function Card({ children, style = {}, onClick }: { children: React.ReactNode; st
   );
 }
 
-/* ─── real live build log via WebSocket ──────────────────────────────────── */
-function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
-  const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
-  const [stopped, setStopped] = useState(false);
-  const [stopping, setStopping] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WebSocket|null>(null);
-  const stoppedRef = useRef(false);
+ /* ─── real live build log via WebSocket ──────────────────────────────────── */
+ function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
+   const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
+   const [stopped, setStopped] = useState(false);
+   const [stopping, setStopping] = useState(false);
+   const [elapsed, setElapsed] = useState(0);
+   const [currentStep, setCurrentStep] = useState('Connecting…');
+   const bottomRef = useRef<HTMLDivElement>(null);
+   const wsRef = useRef<WebSocket|null>(null);
+   const stoppedRef = useRef(false);
+   const startRef = useRef(Date.now());
 
-  useEffect(() => {
-    if (stoppedRef.current) return;
-    // Connect WebSocket
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
-    wsRef.current = ws;
+   // Elapsed timer
+   useEffect(() => {
+     const t = setInterval(() => {
+       if (!stoppedRef.current) setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
+     }, 1000);
+     return () => clearInterval(t);
+   }, []);
 
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === 'log' && msg.payload.build_id === build.id) {
-          const { line, stream } = msg.payload;
-          const color = stream === 'stderr' ? '#ff4455'
-            : line.startsWith('✔') || line.startsWith('└─ Job completed') ? '#00e5a0'
-            : line.startsWith('✖') || line.startsWith('└─ Job FAILED') ? '#ff4455'
-            : line.startsWith('▶') || line.startsWith('│ ▶') || line.startsWith('┌') || line.startsWith('╔') || line.startsWith('╚') ? '#00d4ff'
-            : line.startsWith('│ ✔') ? '#00e5a0'
-            : line.startsWith('│ ✖') ? '#ff4455'
-            : line.startsWith('  [AI]') ? '#a078ff'
-            : '#8892a4';
-          setLines(l => [...l, { msg: line, color }]);
-        }
-        if (msg.type === 'build_status' && msg.payload.build_id === build.id) {
-          const s = msg.payload.status;
-          if (s === 'success' || s === 'failed' || s === 'cancelled') {
-            onStop(); // signal parent to refresh build status
-          }
-        }
-      } catch {}
-    };
+   useEffect(() => {
+     if (stoppedRef.current) return;
+     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+     const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
+     wsRef.current = ws;
 
-    ws.onerror = () => {
-      if (!stoppedRef.current)
-        setLines(l => [...l, { msg: '  WebSocket disconnected — check backend is running', color: '#f5c542' }]);
-    };
+     ws.onmessage = (ev) => {
+       try {
+         const msg = JSON.parse(ev.data);
+         if (msg.type === 'log' && msg.payload.build_id === build.id) {
+           const { line, stream } = msg.payload;
+           const color = stream === 'stderr' ? '#ff4455'
+             : line.startsWith('✔') || line.startsWith('└─ Job completed') ? '#00e5a0'
+             : line.startsWith('✖') || line.startsWith('└─ Job FAILED') ? '#ff4455'
+             : line.startsWith('▶') || line.startsWith('│ ▶') || line.startsWith('┌') || line.startsWith('╔') || line.startsWith('╚') ? '#00d4ff'
+             : line.startsWith('│ ✔') ? '#00e5a0'
+             : line.startsWith('│ ✖') ? '#ff4455'
+             : line.startsWith('  [AI]') || line.includes('🤖') ? '#a078ff'
+            : line.includes('🛡') || line.includes('[CRITICAL]') || line.includes('[HIGH]') ? '#ff4455'
+            : line.includes('[MEDIUM]') ? '#f5c542'
+            : line.includes('[LOW]') || line.includes('[INFO]') ? '#545f72'
+            : line.includes('💡') ? '#a078ff'
+            : line.includes('🔍') || line.startsWith('  Summary:') ? '#00d4ff'
+            : line.includes('🏷') ? '#a078ff'
+             : line.startsWith('  ⏳') ? '#f5c542'
+             : '#8892a4';
+           setLines(l => [...l, { msg: line, color }]);
+           // Track current step name
+           if (line.includes('│ ▶')) {
+             setCurrentStep(line.replace('│ ▶', '').trim());
+           } else if (line.includes('┌─ Job:')) {
+             setCurrentStep(line.replace('┌─ Job:', '').trim());
+           } else if (line.startsWith('Cloning')) {
+             setCurrentStep('Cloning repository…');
+           }
+         }
+         if (msg.type === 'build_status' && msg.payload.build_id === build.id) {
+           const s = msg.payload.status;
+           if (s === 'success' || s === 'failed' || s === 'cancelled') {
+             stoppedRef.current = true;
+             setStopped(true);
+             onStop();
+           }
+         }
+       } catch {}
+     };
 
-    return () => { ws.close(); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [build.id]);
+    let hasConnected = false;
+    ws.onopen = () => { hasConnected = true; };
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [lines]);
+    ws.onerror = () => {};
+    ws.onclose = () => {};
 
-  const stop = async () => {
-    if (stopping || stopped) return;
-    setStopping(true);
-    stoppedRef.current = true;
-    wsRef.current?.close();
-    try {
-      await fetch(`http://localhost:8080/api/v1/builds/${build.id}/cancel`, { method:'POST' });
-    } catch {}
-    setStopped(true);
-    setStopping(false);
-    onStop();
-  };
+     return () => { ws.close(); };
+   // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [build.id]);
 
+   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth', block:'nearest' }); }, [lines]);
+
+   const stop = async () => {
+     if (stopping || stopped) return;
+     setStopping(true);
+     stoppedRef.current = true;
+     wsRef.current?.close();
+     try {
+       await fetch(`http://localhost:8080/api/v1/builds/${build.id}/cancel`, { method:'POST' });
+     } catch {}
+     setStopped(true);
+     setStopping(false);
+     onStop();
+   };
+
+   const fmt = (s: number) => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+
+   return (
+     <div>
+       {/* Status bar */}
+       {!stopped && (
+         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+           padding:'8px 12px', background:'rgba(0,212,255,0.05)',
+           border:'1px solid rgba(0,212,255,0.15)', borderRadius:7, marginBottom:10 }}>
+           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite', flexShrink:0 }}/>
+             <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#e8eaf0', fontWeight:500 }}>
+               {currentStep}
+             </span>
+           </div>
+           <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+             <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#00d4ff' }}>
+               {fmt(elapsed)}
+             </span>
+             <button onClick={stop} disabled={stopping}
+               style={{ display:'flex', alignItems:'center', gap:5,
+                 padding:'4px 10px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
+                 borderRadius:5, color:'#ff4455', cursor: stopping ? 'wait' : 'pointer', fontSize:11,
+                 fontFamily:"'Figtree',sans-serif", fontWeight:600, opacity: stopping ? 0.6 : 1 }}>
+               ■ {stopping ? 'Stopping…' : 'Stop'}
+             </button>
+           </div>
+         </div>
+       )}
+
+       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:8 }}>
+         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+           letterSpacing:'0.1em', textTransform:'uppercase' }}>
+           {stopped ? 'Build Log' : 'Build Log — Live'}
+         </span>
+         {stopped && (
+           <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>
+             {fmt(elapsed)} total
+           </span>
+         )}
+       </div>
+
+       <div style={{ background:'#080a0f', borderRadius:8, padding:16,
+         fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:'1.8',
+         color:'#8892a4', maxHeight:340, overflowY:'auto' }}>
+         {lines.length === 0 && !stopped && (
+           <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+             Connecting to pipeline…
+           </div>
+         )}
+         {lines.map((l,i) => <div key={i} style={{ color:l.color, whiteSpace:'pre-wrap' }}>{l.msg}</div>)}
+         {!stopped && lines.length > 0 && (
+           <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+           </div>
+         )}
+         <div ref={bottomRef}/>
+       </div>
+     </div>
+   );
+ }
+
+/* ─── module-level helpers (must be outside App to avoid hooks-in-loop) ─────── */
+function parseTestResults(log: string) {
+  const results: {name:string; status:'pass'|'fail'|'skip'; duration:string}[] = [];
+  for (const line of log.split('\n')) {
+    const pass = line.match(/--- PASS: (\S+) \((.+?)\)/);
+    const fail = line.match(/--- FAIL: (\S+) \((.+?)\)/);
+    const skip = line.match(/--- SKIP: (\S+) \((.+?)\)/);
+    if (pass) results.push({ name: pass[1], status: 'pass', duration: pass[2] });
+    else if (fail) results.push({ name: fail[1], status: 'fail', duration: fail[2] });
+    else if (skip) results.push({ name: skip[1], status: 'skip', duration: skip[2] });
+  }
+  return results;
+}
+function stepStatusColor(s: string) {
+  return s==='success'?'#00e5a0':s==='failed'?'#ff4455':s==='running'?'#00d4ff':'#545f72';
+}
+function stepStatusIcon(s: string) {
+  return s==='success'?'✔':s==='failed'?'✖':s==='running'?'▶':s==='cancelled'?'■':'○';
+}
+function StepRow({ step }: { step: any }) {
+  const [logOpen, setLogOpen] = useState(true);
+  const stepTests = parseTestResults(step.log||'');
+  const stepPassed = stepTests.filter(t=>t.status==='pass').length;
+  const stepFailed = stepTests.filter(t=>t.status==='fail').length;
   return (
-    <div>
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.1em', textTransform:'uppercase' }}>
-          {stopped ? 'Build Log — Stopped' : 'Build Log — Live'}
+    <div style={{ borderRadius:7, overflow:'hidden',
+      border:`1px solid ${step.status==='failed'?'rgba(255,68,85,0.25)':'rgba(255,255,255,0.07)'}`,
+      background:step.status==='failed'?'rgba(255,68,85,0.04)':'rgba(255,255,255,0.02)' }}>
+      <div onClick={()=>setLogOpen(o=>!o)}
+        style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 14px', cursor:'pointer' }}>
+        <span style={{ fontSize:12, color:stepStatusColor(step.status), fontWeight:700, width:14 }}>
+          {stepStatusIcon(step.status)}
         </span>
-        {!stopped && (
-          <button onClick={stop} disabled={stopping}
-            style={{ display:'flex', alignItems:'center', gap:6,
-              padding:'5px 12px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
-              borderRadius:5, color:'#ff4455', cursor: stopping ? 'wait' : 'pointer', fontSize:12,
-              fontFamily:"'Figtree',sans-serif", fontWeight:600, opacity: stopping ? 0.6 : 1 }}>
-            ■ {stopping ? 'Stopping…' : 'Stop Pipeline'}
-          </button>
-        )}
-      </div>
-      <div style={{ background:'#080a0f', borderRadius:8, padding:16,
-        fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:'1.8',
-        color:'#8892a4', maxHeight:340, overflowY:'auto' }}>
-        {lines.length === 0 && !stopped && (
-          <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8 }}>
-            <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
-              background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
-            Connecting to pipeline…
+        <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:13,
+          color:step.status==='failed'?'#ff8888':'#e8eaf0', flex:1, fontWeight:500 }}>
+          {step.name}
+        </span>
+        {stepTests.length > 0 && (
+          <div style={{ display:'flex', gap:6, fontFamily:"'IBM Plex Mono',monospace", fontSize:10 }}>
+            {stepPassed>0 && <span style={{ color:'#00e5a0' }}>✔ {stepPassed}</span>}
+            {stepFailed>0 && <span style={{ color:'#ff4455' }}>✖ {stepFailed}</span>}
           </div>
         )}
-        {lines.map((l,i) => <div key={i} style={{ color:l.color, whiteSpace:'pre-wrap' }}>{l.msg}</div>)}
-        {!stopped && lines.length > 0 && (
-          <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
-            <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
-              background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
-          </div>
-        )}
-        <div ref={bottomRef}/>
+        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
+          {step.duration_ms ? `${(step.duration_ms/1000).toFixed(1)}s` : ''}
+        </span>
+        <ChevronDown size={12} style={{ color:'#545f72',
+          transform:logOpen?'none':'rotate(-90deg)', transition:'0.15s' }}/>
       </div>
+      {logOpen && step.log && (
+        <div style={{ borderTop:'1px solid rgba(255,255,255,0.06)' }}>
+          {stepTests.length > 0 && (
+            <div style={{ padding:'8px 14px', borderBottom:'1px solid rgba(255,255,255,0.06)',
+              display:'flex', flexDirection:'column', gap:3 }}>
+              {stepTests.map((t,ti)=>(
+                <div key={ti} style={{ display:'flex', alignItems:'center', gap:8,
+                  fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>
+                  <span style={{ color:t.status==='pass'?'#00e5a0':t.status==='fail'?'#ff4455':'#545f72', width:10 }}>
+                    {t.status==='pass'?'✔':t.status==='fail'?'✖':'⊘'}
+                  </span>
+                  <span style={{ color:t.status==='fail'?'#ff8888':'#8892a4', flex:1 }}>{t.name}</span>
+                  <span style={{ color:'#545f72' }}>{t.duration}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <pre style={{ margin:0, padding:'12px 14px', fontFamily:"'IBM Plex Mono',monospace",
+            fontSize:11, lineHeight:1.7, color:'#8892a4', overflowX:'auto',
+            maxHeight:240, overflowY:'auto', whiteSpace:'pre-wrap', wordBreak:'break-all' }}>
+            {step.log}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
-
 
 export default function App() {
   const [projects, setProjects]   = useState<Project[]>(DEMO);
@@ -215,25 +346,152 @@ export default function App() {
   }, []);
   useEffect(() => { if (cmdOpen) setTimeout(()=>cmdRef.current?.focus(),50); }, [cmdOpen]);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
-  useEffect(() => { api.getProjects().then(setProjects).catch(()=>{}); api.getBuilds().then(setBuilds).catch(()=>{}); }, []);
+  useEffect(() => { api.getProjects().then(setProjects).catch(()=>{}); }, []);
+
+  // Fetch builds when project changes
+  useEffect(() => {
+    if (!sel) return;
+    fetch(`http://localhost:8080/api/v1/projects/${sel.id}/builds`)
+      .then(r=>r.json()).then(d=>{ if(Array.isArray(d)) setBuilds(b=>[...d,...b.filter(x=>x.project_id!==sel.id)]); })
+      .catch(()=>{});
+  }, [sel?.id]);
+
+  // Poll running builds every 3s
+  useEffect(() => {
+    const running = builds.filter(b=>b.status==='running');
+    if (!running.length) return;
+    const id = setInterval(async () => {
+      for (const b of running) {
+        try {
+          const res = await fetch(`http://localhost:8080/api/v1/builds/${b.id}`);
+          if (!res.ok) continue;
+          const updated = await res.json();
+          setBuilds(prev=>prev.map(x=>x.id===b.id?{...x,...updated}:x));
+          if (selBuild?.id===b.id) setSelBuild(s=>s?{...s,...updated}:s);
+        } catch {}
+      }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [builds.map(b=>b.id+b.status).join(',')]);
 
   const projBuilds = sel ? builds.filter(b=>b.project_id===sel.id) : builds;
+  const [runModal, setRunModal] = useState(false);
 
-  const triggerBuild = async () => {
+  const triggerBuild = async (artifactVersionId?: string) => {
     if (!sel) return;
-    const mock: Build = { id:`b-${Date.now()}`, project_id:sel.id, status:'running', branch:sel.branch,
-      commit_sha: Math.random().toString(36).slice(2,9), commit_message:'Manual trigger',
-      duration:0, created_at:new Date().toISOString(), started_at:'', finished_at:'' };
+    const mock: Build = {
+      id:`b-${Date.now()}`, project_id:sel.id, status:'running', branch:sel.branch,
+      commit_sha:Math.random().toString(36).slice(2,9),
+      commit_message: artifactVersionId ? `Deploy version ${artifactVersionId}` : 'Manual trigger',
+      duration:0, duration_ms:0, number:0,
+      created_at:new Date().toISOString(), started_at:'', finished_at:''
+    };
     setBuilds(p=>[mock,...p]);
-    try { const b = await api.triggerBuild(sel.id); setBuilds(p=>[b,...p.filter(x=>x.id!==mock.id)]); } catch {}
+    setSelBuild(mock);
+    setView('builds');
+    try {
+      const b = await api.triggerBuild(sel.id, artifactVersionId);
+      setBuilds(p=>[b,...p.filter(x=>x.id!==mock.id)]);
+      setSelBuild(b);
+    } catch {}
   };
 
-  const deleteProject = (id: string) => {
+  const sendAiMessage = async (msg: string) => {
+    setAiOpen(true);
+    setMsgs(m=>[...m,{role:'user',content:msg}]);
+    setLoading(true);
+    try {
+      const r = await api.aiChat(msg, sel?.id);
+      setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
+    } catch {
+      setMsgs(m=>[...m,{role:'assistant',content:'Backend offline — run `go run ./cmd/callahan` then try again.'}]);
+    }
+    setLoading(false);
+  };
+
+  function RunBuildModal() {
+    const [versions, setVersions] = useState<any[]>([]);
+    const [selVersion, setSelVersion] = useState('');
+    const [loadingV, setLoadingV] = useState(true);
+    useEffect(() => {
+      fetch('http://localhost:8080/api/v1/versions')
+        .then(r=>r.json()).then(d=>{ setVersions(Array.isArray(d)?d:[]); setLoadingV(false); })
+        .catch(()=>setLoadingV(false));
+    }, []);
+    const run = () => { setRunModal(false); triggerBuild(selVersion||undefined); };
+    return (
+      <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
+        justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
+        onClick={()=>setRunModal(false)}>
+        <div style={{ width:460, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
+          onClick={e=>e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700, color:'#fff', margin:0 }}>
+              Run Pipeline
+            </h3>
+            <button onClick={()=>setRunModal(false)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72' }}>
+              <X size={16}/>
+            </button>
+          </div>
+          <div style={{ marginBottom:20 }}>
+            <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'DM Mono',monospace" }}>
+              Pin to a version <em style={{ fontStyle:'italic' }}>(optional — for deploy pipelines)</em>
+            </div>
+            {loadingV ? (
+              <div style={{ color:'#545f72', fontSize:13 }}>Loading versions…</div>
+            ) : versions.length === 0 ? (
+              <div style={{ color:'#545f72', fontSize:12, fontFamily:"'IBM Plex Mono',monospace" }}>
+                No versions available — run a CI build first
+              </div>
+            ) : (
+              <div style={{ display:'flex', flexDirection:'column', gap:5, maxHeight:260, overflowY:'auto' }}>
+                <div onClick={()=>setSelVersion('')}
+                  style={{ padding:'9px 14px', borderRadius:7, cursor:'pointer',
+                    background:selVersion===''?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
+                    border:`1px solid ${selVersion===''?'rgba(0,212,255,0.25)':'rgba(255,255,255,0.07)'}` }}>
+                  <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12,
+                    color:selVersion===''?'#00d4ff':'#8892a4' }}>latest commit (no version pin)</span>
+                </div>
+                {versions.map((v:any)=>(
+                  <div key={v.id} onClick={()=>setSelVersion(v.id)}
+                    style={{ display:'flex', alignItems:'center', gap:10, padding:'9px 14px', borderRadius:7, cursor:'pointer',
+                      background:selVersion===v.id?'rgba(160,120,255,0.08)':'rgba(255,255,255,0.02)',
+                      border:`1px solid ${selVersion===v.id?'rgba(160,120,255,0.3)':'rgba(255,255,255,0.07)'}` }}>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, fontWeight:700,
+                      color:selVersion===v.id?'#a078ff':'#fff' }}>{v.tag}</span>
+                    <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:11, color:'#545f72', flex:1 }}>{v.project_name}</span>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>
+                      {new Date(v.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ display:'flex', gap:10 }}>
+            <button onClick={()=>setRunModal(false)} style={{ flex:1, padding:10, background:'transparent',
+              border:'1px solid rgba(255,255,255,0.12)', borderRadius:7, color:'#8892a4', cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+            <button onClick={run} style={{ flex:1, padding:10, background:'#00d4ff', color:'#000',
+              border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+              <Play size={12} fill="#000" style={{ display:'inline', marginRight:6 }}/>
+              Run{selVersion?' with version':''}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const deleteProject = async (id: string) => {
+    try { await api.deleteProject(id); } catch {}
     setProjects(p => p.filter(x => x.id !== id));
     setBuilds(b => b.filter(x => x.project_id !== id));
     setFolders(f => f.map(fo => ({ ...fo, projects: fo.projects.filter(p => p.id !== id) })));
     if (sel?.id === id) { setSel(null); setView('dashboard'); }
-    try { api.triggerBuild(id); } catch {} // best-effort API delete (no delete endpoint yet)
+     // best-effort API delete (no delete endpoint yet)
   };
 
   /* ── sidebar ─────────────────────────────────────────────────────────────── */
@@ -478,7 +736,7 @@ export default function App() {
           <Command size={12}/> ⌘K
         </button>
         {sel && (
-          <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:6,
+          <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:6,
             padding:'7px 14px', background:'#00d4ff', color:'#000', border:'none',
             borderRadius:6, fontSize:12, fontWeight:700, cursor:'pointer',
             fontFamily:"'Figtree',sans-serif" }}>
@@ -554,7 +812,7 @@ export default function App() {
           <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:26, fontWeight:800,
             color:'#fff', letterSpacing:'-0.03em', margin:0 }}>{sel?.name}</h2>
         </div>
-        <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:8,
+        <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'10px 22px', background:'#00d4ff', color:'#000', border:'none',
           borderRadius:8, fontSize:13, fontWeight:700, cursor:'pointer',
           fontFamily:"'Figtree',sans-serif" }}>
@@ -613,12 +871,42 @@ export default function App() {
   );
 
   /* ── builds ───────────────────────────────────────────────────────────────── */
-  const Builds = () => (
+  function Builds() {
+    const [jobs, setJobs] = useState<any[]>([]);
+    const [steps, setSteps] = useState({} as Record<string, any[]>);
+    const [expanded, setExpanded] = useState({} as Record<string, boolean>);
+
+    useEffect(() => {
+      if (!selBuild || selBuild.status === 'running') return;
+      const load = async () => {
+        try {
+          const res = await fetch(`http://localhost:8080/api/v1/builds/${selBuild.id}/jobs`);
+          const js = await res.json();
+          if (!Array.isArray(js)) return;
+          setJobs(js);
+          const allExpanded = {} as Record<string, boolean>;
+          const allSteps = {} as Record<string, any[]>;
+          for (const job of js) {
+            allExpanded[job.id] = true;
+            const sr = await fetch(`http://localhost:8080/api/v1/jobs/${job.id}/steps`);
+            const ss = await sr.json();
+            allSteps[job.id] = Array.isArray(ss) ? ss : [];
+          }
+          setSteps(allSteps);
+          setExpanded(allExpanded);
+        } catch {}
+      };
+      load();
+    }, [selBuild?.id, selBuild?.status]);
+
+    const dur = (b: Build) => b.duration_ms || b.duration;
+
+    return (
     <div style={{ padding:28 }}>
       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
         <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
           color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Builds</h2>
-        <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:7,
+        <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:7,
           padding:'9px 20px', background:'#00d4ff', color:'#000', border:'none',
           borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
           fontFamily:"'Figtree',sans-serif" }}>
@@ -627,78 +915,209 @@ export default function App() {
       </div>
 
       {selBuild ? (
-        <div>
-          <button onClick={()=>setSelBuild(null)} style={{ display:'flex', alignItems:'center', gap:6,
-            background:'none', border:'none', color:'#8892a4', cursor:'pointer', fontSize:13,
-            marginBottom:16, padding:0, fontFamily:"'Figtree',sans-serif" }}>
-            ← Back
-          </button>
-          <Card style={{ marginBottom:12 }}>
-            <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:16 }}>
-              {[
-                { l:'Status',   n:<Badge status={selBuild.status}/> },
-                { l:'Branch',   n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00d4ff' }}>{selBuild.branch}</span> },
-                { l:'Commit',   n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#8892a4' }}>{selBuild.commit_sha?.slice(0,7)}</span> },
-                { l:'Duration', n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#8892a4' }}>{selBuild.duration?formatDuration(selBuild.duration):'Running…'}</span> },
-              ].map(m=>(
-                <div key={m.l}>
-                  <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-                    letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:8 }}>{m.l}</div>
-                  {m.n}
+        <div style={{ display:'flex', gap:16, alignItems:'flex-start' }}>
+
+          {/* ── Left: build history sidebar ── */}
+          <div style={{ width:176, flexShrink:0 }}>
+            <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+              letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:10, paddingLeft:4 }}>
+              Build History
+            </div>
+            <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+              {projBuilds.map(b => {
+                const active = b.id === selBuild.id;
+                const col = b.status==='success'?'#00e5a0':b.status==='failed'?'#ff4455':b.status==='running'?'#00d4ff':'#545f72';
+                return (
+                  <div key={b.id} onClick={()=>{ setSelBuild(b); setJobs([]); setSteps({}); }}
+                    style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 10px', borderRadius:6, cursor:'pointer',
+                      background:active?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
+                      border:`1px solid ${active?'rgba(0,212,255,0.2)':'rgba(255,255,255,0.06)'}` }}>
+                    <span style={{ width:7, height:7, borderRadius:'50%', background:col, flexShrink:0,
+                      boxShadow:b.status==='running'?`0 0 6px ${col}`:'none' }}/>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                        color:active?'#00d4ff':'#e8eaf0', fontWeight:active?700:400 }}>
+                        #{b.number || b.id.slice(0,4)}
+                      </div>
+                      <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9,
+                        color:'#545f72', marginTop:1 }}>{timeAgo(b.created_at)}</div>
+                    </div>
+                    {dur(b) ? (
+                      <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9,
+                        color:'#545f72', flexShrink:0 }}>{formatDuration(dur(b))}</div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+            <button onClick={()=>{ setSelBuild(null); setJobs([]); setSteps({}); }}
+              style={{ marginTop:12, width:'100%', padding:'7px', background:'transparent',
+                border:'1px solid rgba(255,255,255,0.08)', borderRadius:6, color:'#545f72',
+                cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+              ← All Builds
+            </button>
+          </div>
+
+          {/* ── Right: build detail ── */}
+          <div style={{ flex:1, minWidth:0 }}>
+            <Card style={{ marginBottom:12 }}>
+              <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:16 }}>
+                {[
+                  { l:'Status',   n:<Badge status={selBuild.status}/> },
+                  { l:'Branch',   n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00d4ff' }}>{selBuild.branch}</span> },
+                  { l:'Commit',   n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#8892a4' }}>{selBuild.commit_sha?.slice(0,7)||'—'}</span> },
+                  { l:'Duration', n:<span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#8892a4' }}>{dur(selBuild)?formatDuration(dur(selBuild)):'—'}</span> },
+                ].map(m=>(
+                  <div key={m.l}>
+                    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+                      letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:8 }}>{m.l}</div>
+                    {m.n}
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize:13, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{selBuild.commit_message}</div>
+            </Card>
+
+            {/* Running build — live log */}
+            {selBuild.status === 'running' && (
+              <Card style={{ marginBottom:12 }}>
+                <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+                  <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+                    letterSpacing:'0.1em', textTransform:'uppercase' }}>Live Log</span>
+                  <button onClick={async () => {
+                    if (!selBuild) return;
+                    setAiOpen(true); setLoading(true);
+                    let logText = '';
+                    try {
+                      const jr = await fetch(`http://localhost:8080/api/v1/builds/${selBuild.id}/jobs`);
+                      const js = await jr.json();
+                      for (const job of (Array.isArray(js)?js:[])) {
+                        const sr = await fetch(`http://localhost:8080/api/v1/jobs/${job.id}/steps`);
+                        const ss = await sr.json();
+                        for (const step of (Array.isArray(ss)?ss:[])) {
+                          logText += `[${step.name}] ${step.status}\n${step.log||''}\n`;
+                        }
+                      }
+                    } catch { logText = 'Could not retrieve logs'; }
+                    setMsgs(m=>[...m,{role:'user',content:`Explain this build failure for "${sel?.name}":\n\n${logText||'No log output available.'}`}]);
+                    try {
+                      const r = await fetch('http://localhost:8080/api/v1/ai/explain-build', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({ build_id: selBuild.id, logs: logText, pipeline: '' }),
+                      });
+                      const d = await r.json();
+                      setMsgs(m=>[...m,{role:'assistant',content:d.explanation||'No explanation returned.'}]);
+                    } catch { setMsgs(m=>[...m,{role:'assistant',content:'Backend offline.'}]); }
+                    setLoading(false);
+                  }} style={{ display:'flex', alignItems:'center', gap:6, padding:'5px 12px',
+                    background:'rgba(160,120,255,0.08)', border:'1px solid rgba(160,120,255,0.2)',
+                    borderRadius:5, color:'#a078ff', cursor:'pointer', fontSize:12,
+                    fontFamily:"'Figtree',sans-serif" }}>
+                    <Sparkles size={12}/> AI Explain
+                  </button>
                 </div>
-              ))}
-            </div>
-            <div style={{ fontSize:14, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{selBuild.commit_message}</div>
-          </Card>
-          <Card>
-            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-              <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-                letterSpacing:'0.1em', textTransform:'uppercase' }}>Build Log</span>
-              <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:6,
-                padding:'5px 12px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
-                borderRadius:5, color:'#00d4ff', cursor:'pointer', fontSize:12,
-                fontFamily:"'Figtree',sans-serif" }}>
-                <Sparkles size={12}/> AI Explain
-              </button>
-            </div>
-            <div style={{ background:'#080a0f', borderRadius:8, padding:16,
-              fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2, color:'#8892a4' }}>
-              {selBuild.status==='success' ? <>
-                <div style={{ color:'#00e5a0' }}>✔ Pipeline started</div>
-                <div style={{ color:'#00d4ff' }}>▶ step[1] — install dependencies</div>
-                <div style={{ color:'#00e5a0' }}>✔ npm ci completed (12.3s, cached)</div>
-                <div style={{ color:'#00d4ff' }}>▶ step[2] — run tests</div>
-                <div style={{ color:'#00e5a0' }}>✔ 142 passed, 0 failed (8.1s)</div>
-                <div style={{ color:'#00d4ff' }}>▶ step[3] — build</div>
-                <div style={{ color:'#00e5a0' }}>✔ Build complete — pipeline success</div>
-              </> : selBuild.status==='failed' ? <>
-                <div style={{ color:'#00e5a0' }}>✔ Pipeline started</div>
-                <div style={{ color:'#00d4ff' }}>▶ step[1] — install</div>
-                <div style={{ color:'#00e5a0' }}>✔ npm ci (11.2s)</div>
-                <div style={{ color:'#00d4ff' }}>▶ step[2] — run tests</div>
-                <div style={{ color:'#ff4455' }}>✖ Error: 3 tests failed</div>
-                <div style={{ color:'#a078ff' }}>✦ Click "AI Explain" to diagnose this failure</div>
-              </> : <>
                 <RunningLog build={selBuild} onStop={async ()=>{
-                  // Refresh build status from backend
                   try {
                     const res = await fetch(`http://localhost:8080/api/v1/builds/${selBuild.id}`);
                     if (res.ok) {
                       const updated = await res.json();
                       setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,...updated}:x));
-                      setSelBuild(s=>({...s,...updated}));
+                      setSelBuild(s=>s?{...s,...updated}:s);
                     } else {
                       setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
-                      setSelBuild(s=>({...s,status:'cancelled'}));
+                      setSelBuild(s=>s?{...s,status:'cancelled'}:s);
                     }
                   } catch {
                     setBuilds(b=>b.map(x=>x.id===selBuild.id?{...x,status:'cancelled'}:x));
-                    setSelBuild(s=>({...s,status:'cancelled'}));
+                    setSelBuild(s=>s?{...s,status:'cancelled'}:s);
                   }
                 }}/>
-              </>}
-            </div>
-          </Card>
+              </Card>
+            )}
+
+            {/* Completed build — step breakdown */}
+            {selBuild.status !== 'running' && (
+              <div>
+                {selBuild.status === 'failed' && (
+                  <div style={{ marginBottom:12, display:'flex', justifyContent:'flex-end' }}>
+                    <button onClick={async () => {
+                      if (!selBuild) return;
+                      setAiOpen(true); setLoading(true);
+                      let logText = '';
+                      for (const job of jobs) {
+                        for (const step of (steps[job.id]||[])) {
+                          logText += `[${step.name}] ${step.status}\n${step.log||''}\n`;
+                        }
+                      }
+                      setMsgs(m=>[...m,{role:'user',content:`Explain this build failure for "${sel?.name}":\n\n${logText||'No logs.'}`}]);
+                      try {
+                        const r = await fetch('http://localhost:8080/api/v1/ai/explain-build', {
+                          method:'POST', headers:{'Content-Type':'application/json'},
+                          body: JSON.stringify({ build_id: selBuild.id, logs: logText, pipeline: '' }),
+                        });
+                        const d = await r.json();
+                        setMsgs(m=>[...m,{role:'assistant',content:d.explanation||'No explanation returned.'}]);
+                      } catch { setMsgs(m=>[...m,{role:'assistant',content:'Backend offline.'}]); }
+                      setLoading(false);
+                    }} style={{ display:'flex', alignItems:'center', gap:6, padding:'7px 14px',
+                      background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
+                      borderRadius:7, color:'#a078ff', cursor:'pointer', fontSize:12,
+                      fontFamily:"'Figtree',sans-serif", fontWeight:600 }}>
+                      <Sparkles size={13}/> AI Explain Failure
+                    </button>
+                  </div>
+                )}
+
+                {jobs.length === 0 && (
+                  <Card>
+                    <div style={{ textAlign:'center', padding:'24px 0', color:'#545f72',
+                      fontSize:13, fontFamily:"'Figtree',sans-serif" }}>
+                      No step data — trigger a new build to see results
+                    </div>
+                  </Card>
+                )}
+
+                {jobs.map(job => {
+                  const jobSteps = steps[job.id] || [];
+                  const isExpanded = expanded[job.id] !== false;
+                  const testResults = jobSteps.flatMap(s => parseTestResults(s.log||''));
+                  const passed = testResults.filter(t=>t.status==='pass').length;
+                  const failed = testResults.filter(t=>t.status==='fail').length;
+                  const skipped = testResults.filter(t=>t.status==='skip').length;
+                  return (
+                    <Card key={job.id} style={{ marginBottom:10 }}>
+                      <div onClick={()=>setExpanded(e=>({...e,[job.id]:!isExpanded}))}
+                        style={{ display:'flex', alignItems:'center', gap:12, cursor:'pointer',
+                          marginBottom:isExpanded?14:0 }}>
+                        <span style={{ fontSize:14, color:stepStatusColor(job.status), fontWeight:700 }}>
+                          {stepStatusIcon(job.status)}
+                        </span>
+                        <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:14,
+                          fontWeight:700, color:'#fff', flex:1 }}>{job.name}</span>
+                        {testResults.length > 0 && (
+                          <div style={{ display:'flex', gap:8, fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>
+                            {passed>0 && <span style={{ color:'#00e5a0' }}>✔ {passed} passed</span>}
+                            {failed>0 && <span style={{ color:'#ff4455' }}>✖ {failed} failed</span>}
+                            {skipped>0 && <span style={{ color:'#545f72' }}>⊘ {skipped} skipped</span>}
+                          </div>
+                        )}
+                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
+                          {job.duration_ms?`${(job.duration_ms/1000).toFixed(1)}s`:''}
+                        </span>
+                        <ChevronDown size={13} style={{ color:'#545f72',
+                          transform:isExpanded?'none':'rotate(-90deg)', transition:'0.15s' }}/>
+                      </div>
+                      {isExpanded && (
+                        <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+                          {jobSteps.map(step => <StepRow key={step.id} step={step}/>)}
+                        </div>
+                      )}
+                    </Card>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       ) : (
         <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
@@ -712,13 +1131,14 @@ export default function App() {
                     fontFamily:"'Figtree',sans-serif" }}>{b.commit_message}</div>
                   <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72',
                     display:'flex', gap:12 }}>
+                    <span>#{b.number||''}</span>
                     <span>{b.commit_sha?.slice(0,7)}</span>
                     <span>{b.branch}</span>
                     <span>{timeAgo(b.created_at)}</span>
                   </div>
                 </div>
                 <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#545f72', flexShrink:0 }}>
-                  {b.duration?formatDuration(b.duration):'—'}
+                  {dur(b)?formatDuration(dur(b)):'—'}
                 </div>
                 <ChevronRight size={14} style={{ color:'#545f72' }}/>
               </div>
@@ -727,46 +1147,59 @@ export default function App() {
         </div>
       )}
     </div>
-  );
+    ); }
 
   /* ── pipeline ─────────────────────────────────────────────────────────────── */
-  const Pipeline = () => {
-    const [yaml, setYaml] = useState(
-`name: ${sel?.name??'my-pipeline'}
-on: [push, pull_request]
+  function Pipeline() {
+    const [yaml, setYaml] = useState('');
+    const [saving, setSaving] = useState(false);
+    const [saveMsg, setSaveMsg] = useState('');
 
-jobs:
-  build:
-    runs-on: callahan:latest
-    steps:
-      - name: Install
-        run: npm ci
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`)
+        .then(r=>r.json())
+        .then(d=>{ if(d.content) setYaml(d.content); })
+        .catch(()=>{});
+    }, [sel?.id]);
 
-      - name: Test
-        run: npm test
+    const save = async () => {
+      if (!sel || !yaml) return;
+      setSaving(true);
+      setSaveMsg('');
+      try {
+        const res = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: yaml }),
+        });
+        const d = await res.json();
+        setSaveMsg(res.ok ? (d.message || '✔ Saved') : ('✖ ' + (d.error || 'Save failed')));
+      } catch { setSaveMsg('✖ Backend offline'); }
+      setSaving(false);
+      setTimeout(() => setSaveMsg(''), 4000);
+    };
 
-      - name: Build
-        run: npm run build
-
-    ai:
-      review: true
-      explain-failures: true
-      security-scan: true`);
     return (
       <div style={{ padding:28 }}>
         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
           <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
             color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Pipeline</h2>
-          <div style={{ display:'flex', gap:8 }}>
-            <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:7,
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            {saveMsg && (
+              <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+                color: saveMsg.startsWith('✖') ? '#ff4455' : '#00e5a0' }}>{saveMsg}</span>
+            )}
+            <button onClick={()=>sendAiMessage(`Generate a Callahanfile.yaml pipeline for my ${sel?.language??'Go'} project called ${sel?.name??'my-project'}. Return only the YAML, no explanation.`)} style={{ display:'flex', alignItems:'center', gap:7,
               padding:'9px 16px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
               borderRadius:7, color:'#00d4ff', cursor:'pointer', fontSize:13,
               fontFamily:"'Figtree',sans-serif" }}>
               <Sparkles size={13}/> Generate with AI
             </button>
-            <button style={{ padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
-              borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
-              fontFamily:"'Figtree',sans-serif" }}>Save</button>
+            <button onClick={save} disabled={saving} style={{ padding:'9px 18px',
+              background: saving ? '#111620' : '#00d4ff', color: saving ? '#545f72' : '#000', border:'none',
+              borderRadius:7, fontSize:13, fontWeight:700, cursor: saving ? 'wait' : 'pointer',
+              fontFamily:"'Figtree',sans-serif" }}>{saving ? 'Saving…' : 'Save'}</button>
           </div>
         </div>
         <Card>
@@ -782,7 +1215,7 @@ jobs:
   };
 
   /* ── secrets ──────────────────────────────────────────────────────────────── */
-  const Secrets = () => {
+  function Secrets() {
     const [list, setList]   = useState<{key:string;updated:string}[]>([]);
     const [adding, setAdding] = useState(false);
     const [newKey, setNewKey] = useState('');
@@ -928,7 +1361,7 @@ jobs:
   };
 
   /* ── AI panel ─────────────────────────────────────────────────────────────── */
-  const AiPanel = () => {
+  function AiPanel() {
     const [localInput, setLocalInput] = useState('');
     const inputRef = useRef<HTMLInputElement>(null);
 
@@ -1028,7 +1461,7 @@ jobs:
   };
 
   /* ── command palette ──────────────────────────────────────────────────────── */
-  const CmdPalette = () => {
+  function CmdPalette() {
     const cmds = [
       { label:'Connect Repository',  icon:<Plus size={14}/>,      fn:()=>{setAddProj(true);setCmdOpen(false);} },
       { label:'Run Build',           icon:<Play size={14}/>,      fn:()=>{if(sel){triggerBuild();}setCmdOpen(false);} },
@@ -1072,7 +1505,7 @@ jobs:
   };
 
   /* ── add project modal ────────────────────────────────────────────────────── */
-  const AddProject = () => {
+  function AddProject() {
     const [name, setName] = useState('');
     const [repo, setRepo] = useState('');
     const [branch, setBranch] = useState('main');
@@ -1230,7 +1663,7 @@ jobs:
   };
 
   /* ── add folder modal ────────────────────────────────────────────────────── */
-  const AddFolderModal = () => {
+  function AddFolderModal() {
     const [name, setName] = useState('');
     const [assignProj, setAssignProj] = useState<string[]>([]);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -1305,7 +1738,7 @@ jobs:
   };
 
   /* ── LLM Config ──────────────────────────────────────────────────────────── */
-  const LLMConfigView = () => {
+  function LLMConfigView() {
     const [provider, setProvider] = useState('anthropic');
     const [model, setModel]       = useState('claude-sonnet-4-5');
     const [apiKey, setApiKey]     = useState('');
@@ -1516,6 +1949,7 @@ jobs:
         {cmdOpen    && <CmdPalette/>}
         {addProj    && <AddProject/>}
         {addFolder  && <AddFolderModal/>}
+        {runModal   && <RunBuildModal/>}
       </div>
     </>
   );
