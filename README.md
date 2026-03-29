@@ -20,7 +20,7 @@ Callahan is an open-source CI/CD platform that runs entirely on your machine. Th
 ```
 ✓ First pipeline running in under 5 minutes
 ✓ No Kubernetes, no cloud bill, no plugin hell
-✓ AI agents built-in: code review, test generation, build debugging
+✓ AI agents built-in: code review, security scanning, build debugging
 ✓ Works with GitHub, GitLab, Bitbucket, Gitea, and any self-hosted Git
 ```
 
@@ -30,59 +30,54 @@ Callahan is an open-source CI/CD platform that runs entirely on your machine. Th
 
 | Feature | Description |
 |---------|-------------|
-| **Serverless execution** | Every job runs in a fresh ephemeral container. Cold start < 2s. |
+| **Local-first execution** | Runs directly on your machine — no agents, no VMs. Docker container mode coming soon. |
 | **AI Pipeline Architect** | Describe your pipeline in plain English — Callahan writes the YAML. |
 | **AI Build Debugger** | Chat with your failing build: "Why did step 3 fail?" |
-| **AI Code Reviewer** | Automatic review comments on every PR across all Git providers. |
-| **Security built-in** | Trivy, Semgrep, gitleaks, OWASP Dependency-Check — zero config. |
+| **AI Code Reviewer** | Automatic AI code review on every build, shown as expandable job cards with findings and fix suggestions. |
+| **Security built-in** | AI-powered security scanning on every build. Supports Trivy and Semgrep if installed. |
 | **Any LLM** | OpenAI, Anthropic Claude, Google Gemini, Groq, Ollama (local), and more. |
 | **Project folders** | Organise repos into folders in the sidebar. |
-| **Beautiful UI** | Modern, cream-toned dashboard. Light mode. Command palette (⌘K). |
+| **Beautiful UI** | Modern dark dashboard with Jenkins-style build history, expandable job cards, and command palette (⌘K). |
 | **Single binary** | Go backend + SQLite. No external database or message queue. |
 
 ---
 
 ## 🚀 Quick Start
 
-### Option A — Docker (recommended)
-
-```bash
-# 1. Install
-curl -fsSL https://getcallahan.dev/install.sh | sh
-
-# 2. Start
-cd callahan && ./start.sh docker
-
-# 3. Open
-open http://localhost:8080
-```
-
-Requires: Docker Desktop running on your machine.
-
----
-
-### Option B — Native (Go + Node)
+### Option A — From source (recommended)
 
 ```bash
 # Prerequisites: Go 1.22+, Node.js 18+
-git clone https://github.com/callahan-ci/callahan.git
-cd callahan
+git clone https://github.com/goughliam1813/Callahan.git
+cd Callahan
 
-# Start backend
-cd backend && go mod tidy && go run ./cmd/callahan &
+# Terminal 1 — Backend
+cd backend && go mod tidy && go run ./cmd/callahan
 
-# Start frontend
-cd ../frontend && npm install && npm run dev
+# Terminal 2 — Frontend
+cd frontend && npm install && npm run dev
 ```
 
 Open **http://localhost:3000**
 
 ---
 
-### Option C — One-liner (curl installer)
+### Option B — Docker Compose
 
 ```bash
-curl -fsSL https://getcallahan.dev | sh
+git clone https://github.com/goughliam1813/Callahan.git
+cd Callahan
+docker compose up --build
+```
+
+Open **http://localhost:8080**
+
+---
+
+### Option C — One-liner
+
+```bash
+git clone https://github.com/goughliam1813/Callahan.git && cd Callahan/backend && go run ./cmd/callahan
 ```
 
 ---
@@ -156,17 +151,16 @@ Generate a full `Callahanfile.yaml` from natural language:
 Open any failed build → click **AI Explain**. The agent reads your logs and explains what went wrong in plain English with specific fix suggestions.
 
 ### Code Reviewer
-Automatically posts review comments to GitHub/GitLab PRs on every run. Configure in your `Callahanfile.yaml`:
+Runs an AI code review on every successful build. Results appear as expandable job cards with severity, findings, and fix suggestions. Enable in your `Callahanfile.yaml`:
 
 ```yaml
 ai:
   review: true
-  provider: anthropic
-  model: claude-3-5-sonnet-20241022
+  security-scan: true
 ```
 
 ### Security Analyst
-Trivy + Semgrep findings are automatically explained in plain English. Critical issues block the pipeline; Callahan suggests remediation steps.
+AI-powered source code security analysis on every build. Uses Trivy and Semgrep if installed, or runs AI-only scanning out of the box. Findings are shown as expandable job cards with severity ratings and fix suggestions.
 
 ---
 
@@ -175,50 +169,40 @@ Trivy + Semgrep findings are automatically explained in plain English. Critical 
 Callahan uses a GitHub Actions-compatible YAML format with AI extensions:
 
 ```yaml
-name: My App Pipeline
-on: [push, pull_request]
+name: my-app
+on:
+  push:
+    branches: [main]
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: local
     steps:
-      - uses: actions/checkout@v4
       - name: Install
         run: npm ci
       - name: Test
         run: npm test
-      - name: AI Code Review    # ← Callahan AI extension
-        ai:
-          agent: reviewer
-          provider: anthropic
-
-  security:
-    needs: test
+  build:
+    runs-on: local
+    needs: [test]
     steps:
-      - name: Scan
-        uses: callahan/trivy-scan@v1
-      - name: AI Triage         # ← explains vulnerabilities
-        ai:
-          agent: security-analyst
+      - name: Build
+        run: npm run build
 
-  deploy:
-    needs: security
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Deploy to Vercel
-        uses: callahan/deploy-vercel@v1
+ai:
+  review: true           # AI code review after every build
+  security-scan: true     # AI security analysis after every build
 ```
-
-Full syntax reference: [docs/callahanfile.md](docs/callahanfile.md)
 
 ---
 
 ## 🌐 Git Provider Setup
 
 ### GitHub
-1. Go to **Settings → AI & Integrations**
-2. Add a GitHub Personal Access Token (scope: `repo`, `read:org`)
-3. Configure webhook URL: `http://your-host:8080/api/v1/webhook/github`
+1. Click **+** in the sidebar to add a project
+2. Paste your GitHub repo URL
+3. Add a Personal Access Token (scope: `repo`) — stored as a project secret called `GIT_TOKEN`
+4. Click **Connect** — Callahan auto-detects your language
 
 ### GitLab / Bitbucket / Gitea
 Same flow — Callahan auto-detects the provider from the repo URL.
@@ -244,8 +228,8 @@ Same flow — Callahan auto-detects the provider from the repo URL.
 │                     │                               │
 │         ┌───────────▼───────────┐                   │
 │         │  Pipeline Executor    │                   │
-│         │  (Ephemeral containers│                   │
-│         │   via Docker API)     │                   │
+│         │  (Local execution,    │                   │
+│         │   Docker coming soon) │                   │
 │         └───────────────────────┘                   │
 └─────────────────────────────────────────────────────┘
 ```
@@ -307,5 +291,5 @@ MIT — see [LICENSE](LICENSE). Free for personal and commercial use.
 ---
 
 <div align="center">
-  Built with ❤️ by the Callahan community · <a href="https://getcallahan.dev">getcallahan.dev</a>
+  Built with ❤️ by the Callahan community · <a href="https://callahanci.com">callahanci.com</a>
 </div>
