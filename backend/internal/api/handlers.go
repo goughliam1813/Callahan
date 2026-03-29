@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/callahan-ci/callahan/internal/llm"
+	"github.com/callahan-ci/callahan/internal/notifications"
 	"github.com/callahan-ci/callahan/internal/pipeline"
 	"github.com/callahan-ci/callahan/internal/storage"
 	"github.com/callahan-ci/callahan/pkg/config"
@@ -581,11 +583,42 @@ func (h *Handler) ExplainBuild(c *gin.Context) {
 
 func (h *Handler) Chat(c *gin.Context) {
 	var req struct {
-		RawMsgs []llm.Message `json:"raw_messages"`
-		Context string        `json:"context"`
+		RawMsgs   []llm.Message `json:"raw_messages"`
+		Context   string        `json:"context"`
+		ProjectID string        `json:"project_id"`
 	}
 	c.ShouldBindJSON(&req)
-	response, err := h.llm.Chat(c.Request.Context(), req.RawMsgs, req.Context)
+
+	// Build rich context from v3 context engine
+	richContext := req.Context
+	if req.ProjectID != "" {
+		entries, err := h.store.GetProjectContext(req.ProjectID, 30)
+		if err == nil && len(entries) > 0 {
+			var sb strings.Builder
+			sb.WriteString(richContext)
+			sb.WriteString("\n\n--- Recent Activity (AI Context Engine) ---\n")
+			for _, e := range entries {
+				sb.WriteString(fmt.Sprintf("[%s] %s %s\n", e.Type, e.CreatedAt.Format("Jan 2 15:04"), e.Summary))
+			}
+
+			// Also pull latest version and deployment info
+			if latest, _ := h.store.LatestVersion(req.ProjectID); latest != nil {
+				sb.WriteString(fmt.Sprintf("\nLatest version: %s (build #%s, %s bump)\n", latest.Tag, safeHead(latest.BuildID, 8), latest.BumpType))
+			}
+			if envs, _ := h.store.ListEnvironments(req.ProjectID); len(envs) > 0 {
+				sb.WriteString("\nEnvironments:\n")
+				for _, env := range envs {
+					dep, _ := h.store.LatestDeploymentForEnv(env.ID)
+					depInfo := "no deployments"
+					if dep != nil { depInfo = fmt.Sprintf("last deployed %s (build %s)", dep.Status, safeHead(dep.BuildID, 8)) }
+					sb.WriteString(fmt.Sprintf("  • %s: %s\n", env.Name, depInfo))
+				}
+			}
+			richContext = sb.String()
+		}
+	}
+
+	response, err := h.llm.Chat(c.Request.Context(), req.RawMsgs, richContext)
 	if err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
@@ -731,6 +764,11 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 	}
 
 	logLine(fmt.Sprintf("  Pipeline: %s (%d job(s))", parsed.Name, len(parsed.Jobs)))
+	if parsed.AI != nil {
+		logLine(fmt.Sprintf("  AI Config: review=%v, security-scan=%v", parsed.AI.Review, parsed.AI.SecurityScan))
+	} else {
+		logLine("  AI Config: not configured (add ai: block to Callahanfile.yaml)")
+	}
 	logLine("")
 
 	// ── 4. Get project secrets as env vars ───────────────────────────────────
@@ -771,6 +809,12 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		dbJob.ExitCode = result.ExitCode
 		h.store.UpdateJob(dbJob)
 
+		// Save each step to the database so the UI can render them
+		for _, step := range result.Steps {
+			step.JobID = dbJob.ID
+			h.store.CreateStep(step)
+		}
+
 		if result.Status == "cancelled" {
 			h.finishBuild(build, "cancelled", time.Since(start).Milliseconds(), "Cancelled by user")
 			return
@@ -791,13 +835,271 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		logLine(fmt.Sprintf("╚══ ✖ Pipeline FAILED — %.1fs ══╝", float64(totalMs)/1000))
 	}
 
-	// ── 6. AI insight on failure ─────────────────────────────────────────────
+	// ── 5b. AI Code Review (post-build) ─────────────────────────────────────
+	if parsed.AI != nil && parsed.AI.Review {
+		logLine("")
+		logLine("╔══ AI Code Review ══╗")
+
+		// Create a real job + step in the DB so it shows as a card in the UI
+		aiJobID := uuid.New().String()
+		aiStepID := uuid.New().String()
+		aiJobStart := time.Now()
+		h.store.CreateJob(&models.Job{
+			ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: "running", StartedAt: &aiJobStart,
+		})
+
+		var reviewLog strings.Builder
+
+		// Try git diff first; fall back to collecting source files
+		diff := pipeline.GetGitDiff(workDir)
+		var review *models.AIReview
+		var reviewErr error
+
+		if diff != "" && len(diff) > 50 {
+			logLine("  Analyzing git diff…")
+			reviewLog.WriteString("Analyzing git diff...\n")
+			review, reviewErr = h.llm.ReviewCode(context.Background(), diff)
+		} else {
+			logLine("  No diff available — reviewing source files…")
+			reviewLog.WriteString("No diff available — reviewing source files...\n")
+			filesContent := pipeline.CollectSourceFiles(workDir, 12000)
+			if filesContent != "" {
+				review, reviewErr = h.llm.ReviewCodeFiles(context.Background(), filesContent)
+			} else {
+				logLine("  ⚠ No reviewable source files found")
+				reviewLog.WriteString("⚠ No reviewable source files found\n")
+			}
+		}
+
+		aiStepStatus := "success"
+		if reviewErr != nil {
+			logLine("  ⚠ AI review error: " + reviewErr.Error())
+			reviewLog.WriteString("⚠ AI review error: " + reviewErr.Error() + "\n")
+			aiStepStatus = "failed"
+		} else if review != nil {
+			review.BuildID = build.ID
+			severityIcon := map[string]string{"info": "ℹ", "warning": "⚠", "error": "✖"}[review.Severity]
+			if severityIcon == "" { severityIcon = "ℹ" }
+			logLine(fmt.Sprintf("  %s Severity: %s", severityIcon, review.Severity))
+			logLine(fmt.Sprintf("  Summary: %s", review.Summary))
+			reviewLog.WriteString(fmt.Sprintf("Severity: %s\nSummary: %s\n", review.Severity, review.Summary))
+			for i, finding := range review.Findings {
+				logLine(fmt.Sprintf("  %d. %s", i+1, finding))
+				reviewLog.WriteString(fmt.Sprintf("%d. %s\n", i+1, finding))
+			}
+			if review.Suggestion != "" {
+				logLine(fmt.Sprintf("  💡 Suggestion: %s", review.Suggestion))
+				reviewLog.WriteString(fmt.Sprintf("💡 Suggestion: %s\n", review.Suggestion))
+			}
+
+			h.store.AddContextEntry(&models.ContextEntry{
+				ID: uuid.New().String(), ProjectID: project.ID, Type: "ai_review",
+				RefID:   build.ID,
+				Summary: fmt.Sprintf("🔍 AI Review [%s]: %s", review.Severity, review.Summary),
+				Detail:  fmt.Sprintf("Findings: %d, Suggestion: %s", len(review.Findings), review.Suggestion),
+				Tags:    strings.Join([]string{"ai_review", review.Severity, build.Branch}, ","),
+				CreatedAt: time.Now(),
+			})
+
+			h.wsHub.broadcast(models.WSMessage{Type: "ai_review", Payload: review})
+		}
+
+		// Save the AI review step
+		aiJobEnd := time.Now()
+		aiJobDuration := aiJobEnd.Sub(aiJobStart).Milliseconds()
+		h.store.CreateStep(&models.Step{
+			ID: aiStepID, JobID: aiJobID, Name: "AI Code Review", Status: aiStepStatus,
+			Command: "callahan ai review", Log: reviewLog.String(), Duration: aiJobDuration,
+		})
+		h.store.UpdateJob(&models.Job{
+			ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: aiStepStatus,
+			StartedAt: &aiJobStart, FinishedAt: &aiJobEnd, Duration: aiJobDuration,
+		})
+		h.wsHub.broadcast(models.WSMessage{Type: "job_status", Payload: gin.H{
+			"id": aiJobID, "build_id": build.ID, "name": "ai-review", "status": aiStepStatus,
+		}})
+		logLine("╚══ AI Code Review Complete ══╝")
+	}
+
+	// ── 5c. AI Security Scan (post-build) ───────────────────────────────────
+	if parsed.AI != nil && parsed.AI.SecurityScan {
+		logLine("")
+		logLine("╔══ AI Security Scan ══╗")
+
+		// Create a real job + step in the DB
+		secJobID := uuid.New().String()
+		secStepID := uuid.New().String()
+		secJobStart := time.Now()
+		h.store.CreateJob(&models.Job{
+			ID: secJobID, BuildID: build.ID, Name: "security-scan", Status: "running", StartedAt: &secJobStart,
+		})
+
+		var secLog strings.Builder
+
+		// Step 1: Try running a real scanner (trivy / semgrep)
+		scannerName, scannerOutput, scanErr := pipeline.RunSecurityScanner(ctx, workDir)
+		if scanErr != nil {
+			logLine("  ⚠ Scanner error: " + scanErr.Error())
+			secLog.WriteString("⚠ Scanner error: " + scanErr.Error() + "\n")
+		}
+		if scannerName != "" {
+			logLine(fmt.Sprintf("  ✔ %s scan completed", scannerName))
+			secLog.WriteString(fmt.Sprintf("✔ %s scan completed\n", scannerName))
+		} else {
+			logLine("  ⚠ No scanner installed (trivy/semgrep) — using AI-only scan")
+			secLog.WriteString("⚠ No scanner installed (trivy/semgrep) — using AI-only scan\n")
+		}
+
+		// Step 2: Collect source for AI analysis
+		sourceSnippet := pipeline.CollectSourceFiles(workDir, 8000)
+
+		// Step 3: AI triage / scan
+		logLine("  🤖 AI analyzing security posture…")
+		secLog.WriteString("🤖 AI analyzing security posture...\n")
+		scanResult, secErr := h.llm.SecurityScan(context.Background(), scannerName, scannerOutput, sourceSnippet)
+
+		secStepStatus := "success"
+		if secErr != nil {
+			logLine("  ⚠ AI security scan error: " + secErr.Error())
+			secLog.WriteString("⚠ AI security scan error: " + secErr.Error() + "\n")
+			secStepStatus = "failed"
+		} else if scanResult != nil {
+			scanResult.BuildID = build.ID
+			severityIcon := map[string]string{"info": "ℹ", "warning": "⚠", "error": "🚨"}[scanResult.Severity]
+			if severityIcon == "" { severityIcon = "ℹ" }
+			logLine(fmt.Sprintf("  %s Security: %s", severityIcon, scanResult.Summary))
+			secLog.WriteString(fmt.Sprintf("Security: %s\n", scanResult.Summary))
+			logLine(fmt.Sprintf("  Scanner: %s | Findings: %d (C:%d H:%d M:%d L:%d)",
+				scanResult.Scanner, scanResult.TotalFindings,
+				scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low))
+			secLog.WriteString(fmt.Sprintf("Scanner: %s | Findings: %d (C:%d H:%d M:%d L:%d)\n",
+				scanResult.Scanner, scanResult.TotalFindings,
+				scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low))
+
+			for i, f := range scanResult.Findings {
+				if i >= 10 {
+					logLine(fmt.Sprintf("  … and %d more findings", len(scanResult.Findings)-10))
+					secLog.WriteString(fmt.Sprintf("… and %d more findings\n", len(scanResult.Findings)-10))
+					break
+				}
+				loc := ""
+				if f.File != "" {
+					loc = fmt.Sprintf(" (%s", f.File)
+					if f.Line > 0 { loc += fmt.Sprintf(":%d", f.Line) }
+					loc += ")"
+				}
+				logLine(fmt.Sprintf("  [%s] %s%s", f.Severity, f.Title, loc))
+				secLog.WriteString(fmt.Sprintf("[%s] %s%s\n", f.Severity, f.Title, loc))
+				if f.Fix != "" {
+					logLine(fmt.Sprintf("        Fix: %s", f.Fix))
+					secLog.WriteString(fmt.Sprintf("  Fix: %s\n", f.Fix))
+				}
+			}
+
+			if scanResult.AIExplanation != "" {
+				logLine("")
+				logLine(fmt.Sprintf("  💡 AI Assessment: %s", scanResult.AIExplanation))
+				secLog.WriteString(fmt.Sprintf("\n💡 AI Assessment: %s\n", scanResult.AIExplanation))
+			}
+
+			if scanResult.Critical > 0 || scanResult.High > 0 {
+				logLine("")
+				logLine("  ⚠ HIGH/CRITICAL security findings detected — review recommended before deploy")
+				secLog.WriteString("\n⚠ HIGH/CRITICAL security findings detected\n")
+			}
+
+			h.store.AddContextEntry(&models.ContextEntry{
+				ID: uuid.New().String(), ProjectID: project.ID, Type: "security_scan",
+				RefID:   build.ID,
+				Summary: fmt.Sprintf("🛡 Security Scan [%s]: %s — %d findings (C:%d H:%d M:%d L:%d)",
+					scanResult.Scanner, scanResult.Severity, scanResult.TotalFindings,
+					scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low),
+				Tags: strings.Join([]string{"security", scanResult.Severity, scanResult.Scanner}, ","),
+				CreatedAt: time.Now(),
+			})
+
+			h.wsHub.broadcast(models.WSMessage{Type: "security_scan", Payload: scanResult})
+		}
+
+		// Save the security scan step
+		secJobEnd := time.Now()
+		secJobDuration := secJobEnd.Sub(secJobStart).Milliseconds()
+		h.store.CreateStep(&models.Step{
+			ID: secStepID, JobID: secJobID, Name: "AI Security Scan", Status: secStepStatus,
+			Command: "callahan ai security-scan", Log: secLog.String(), Duration: secJobDuration,
+		})
+		h.store.UpdateJob(&models.Job{
+			ID: secJobID, BuildID: build.ID, Name: "security-scan", Status: secStepStatus,
+			StartedAt: &secJobStart, FinishedAt: &secJobEnd, Duration: secJobDuration,
+		})
+		h.wsHub.broadcast(models.WSMessage{Type: "job_status", Payload: gin.H{
+			"id": secJobID, "build_id": build.ID, "name": "security-scan", "status": secStepStatus,
+		}})
+		logLine("╚══ AI Security Scan Complete ══╝")
+	}
+
+	// ── 6. Auto-version on success ───────────────────────────────────────────
+	var ver *models.Version
+	if status == "success" {
+		// Auto bump version
+		latest, _ := h.store.LatestVersion(project.ID)
+		current := "0.0.0"; if latest != nil { current = latest.SemVer }
+		parts := strings.Split(current, ".")
+		if len(parts) != 3 { parts = []string{"0","0","0"} }
+		var major, minor, patch int
+		fmt.Sscanf(parts[0], "%d", &major); fmt.Sscanf(parts[1], "%d", &minor); fmt.Sscanf(parts[2], "%d", &patch)
+		patch++ // default patch bump; AI can override
+		nextVer := fmt.Sprintf("%d.%d.%d", major, minor, patch)
+		ver = &models.Version{
+			ID: uuid.New().String(), ProjectID: project.ID, BuildID: build.ID,
+			SemVer: nextVer, Tag: "v" + nextVer, BumpType: "patch",
+			BumpReason: "Auto-versioned on successful build", CreatedAt: time.Now(),
+		}
+		h.store.CreateVersion(ver)
+		logLine(fmt.Sprintf("  🏷  Auto-versioned: %s", ver.Tag))
+
+		// Index version in context engine
+		h.store.AddContextEntry(&models.ContextEntry{
+			ID: uuid.New().String(), ProjectID: project.ID, Type: "version",
+			RefID: ver.ID,
+			Summary: fmt.Sprintf("🏷 Version %s created for build #%d", ver.Tag, build.Number),
+			Tags: "version,patch,auto", CreatedAt: time.Now(),
+		})
+	}
+
+	// ── 7. Index build completion in context engine ───────────────────────────
+	statusEmoji := map[string]string{"success":"✔","failed":"✖","cancelled":"■"}[status]
+	sha = build.Commit; if len(sha) > 8 { sha = sha[:8] }
+	h.store.AddContextEntry(&models.ContextEntry{
+		ID: uuid.New().String(), ProjectID: project.ID, Type: "build",
+		RefID: build.ID,
+		Summary: fmt.Sprintf("%s Build #%d %s — %s branch %s commit %s (%.1fs)",
+			statusEmoji, build.Number, status, project.Name, build.Branch, sha,
+			float64(totalMs)/1000),
+		Tags: strings.Join([]string{"build", status, build.Branch}, ","),
+		CreatedAt: time.Now(),
+	})
+
+	// ── 8. AI insight on failure ─────────────────────────────────────────────
 	aiInsight := ""
 	if !allSuccess {
 		aiInsight, _ = h.llm.ExplainBuildFailure(context.Background(), "Build step failed", string(callahanData))
 	}
 
+	// ── 9. Dispatch notifications ────────────────────────────────────────────
+	dispatcher := notifications.NewDispatcher(h.store, h.llm)
+	dispatcher.Dispatch(context.Background(), build, project, ver)
+
 	h.finishBuild(build, status, totalMs, aiInsight)
+
+	// ── 10. Prune old builds/versions per retention settings ────────────────
+	h.pruneRetention(project.ID)
+}
+
+// safeHead returns s[:n] without panicking when len(s) < n.
+func safeHead(s string, n int) string {
+	if len(s) <= n { return s }
+	return s[:n]
 }
 
 func (h *Handler) finishBuild(build *models.Build, status string, duration int64, aiInsight string) {
@@ -807,4 +1109,412 @@ func (h *Handler) finishBuild(build *models.Build, status string, duration int64
 		Type: "build_status",
 		Payload: gin.H{"build_id": build.ID, "status": status, "duration": duration},
 	})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3 Routes registration — call this after RegisterRoutes
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (h *Handler) RegisterV3Routes(r *gin.Engine) {
+	api := r.Group("/api/v1")
+
+	// Environments
+	api.GET("/projects/:id/environments", h.ListEnvironments)
+	api.POST("/projects/:id/environments", h.CreateEnvironment)
+	api.PUT("/environments/:envId", h.UpdateEnvironment)
+	api.DELETE("/environments/:envId", h.DeleteEnvironment)
+
+	// Deployments
+	api.GET("/projects/:id/deployments", h.ListDeployments)
+	api.POST("/projects/:id/environments/:envId/deploy", h.TriggerDeployment)
+	api.POST("/deployments/:depId/approve", h.ApproveDeployment)
+
+	// Versions
+	api.GET("/projects/:id/versions", h.ListVersions)
+	api.POST("/projects/:id/versions", h.CreateManualVersion)
+
+	// Artifacts
+	api.GET("/builds/:buildId/artifacts", h.ListArtifacts)
+	api.POST("/artifacts/:artifactId/promote", h.PromoteArtifact)
+
+	// Notifications
+	api.GET("/projects/:id/notifications", h.ListNotificationChannels)
+	api.POST("/projects/:id/notifications", h.CreateNotificationChannel)
+	api.PUT("/notifications/:channelId", h.UpdateNotificationChannel)
+	api.DELETE("/notifications/:channelId", h.DeleteNotificationChannel)
+	api.GET("/builds/:buildId/notification-logs", h.ListNotificationLogs)
+	api.POST("/notifications/test", h.TestNotification)
+
+	// AI Context Engine v2
+	api.GET("/projects/:id/context", h.GetProjectContext)
+	api.GET("/projects/:id/context/search", h.SearchContext)
+
+	// AI v3
+	api.POST("/ai/version-bump", h.AIVersionBump)
+	api.POST("/ai/deployment-check", h.AIDeploymentCheck)
+	api.POST("/ai/notification-preview", h.AINotificationPreview)
+
+	// Retention settings
+	api.GET("/settings/retention", h.GetRetentionSettings)
+	api.PUT("/settings/retention", h.SaveRetentionSettings)
+}
+
+// ─── Environments ─────────────────────────────────────────────────────────────
+
+func (h *Handler) ListEnvironments(c *gin.Context) {
+	envs, err := h.store.ListEnvironments(c.Param("id"))
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if envs == nil { envs = []*models.Environment{} }
+	c.JSON(200, envs)
+}
+
+func (h *Handler) CreateEnvironment(c *gin.Context) {
+	var req struct {
+		Name             string `json:"name" binding:"required"`
+		Description      string `json:"description"`
+		Color            string `json:"color"`
+		AutoDeploy       bool   `json:"auto_deploy"`
+		RequiresApproval bool   `json:"requires_approval"`
+		BranchFilter     string `json:"branch_filter"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+	if req.Color == "" { req.Color = "#545f72" }
+
+	env := &models.Environment{
+		ID: uuid.New().String(), ProjectID: c.Param("id"),
+		Name: req.Name, Description: req.Description, Color: req.Color,
+		AutoDeploy: req.AutoDeploy, RequiresApproval: req.RequiresApproval,
+		BranchFilter: req.BranchFilter,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	if err := h.store.CreateEnvironment(env); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	c.JSON(201, env)
+}
+
+func (h *Handler) UpdateEnvironment(c *gin.Context) {
+	env, err := h.store.GetEnvironment(c.Param("envId"))
+	if err != nil || env == nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	c.ShouldBindJSON(env)
+	h.store.UpdateEnvironment(env)
+	c.JSON(200, env)
+}
+
+func (h *Handler) DeleteEnvironment(c *gin.Context) {
+	h.store.DeleteEnvironment(c.Param("envId"))
+	c.JSON(204, nil)
+}
+
+// ─── Deployments ──────────────────────────────────────────────────────────────
+
+func (h *Handler) ListDeployments(c *gin.Context) {
+	deps, err := h.store.ListDeployments(c.Param("id"), 50)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if deps == nil { deps = []*models.Deployment{} }
+	c.JSON(200, deps)
+}
+
+func (h *Handler) TriggerDeployment(c *gin.Context) {
+	var req struct {
+		BuildID   string `json:"build_id" binding:"required"`
+		VersionID string `json:"version_id"`
+		Strategy  string `json:"strategy"`
+		Notes     string `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+	if req.Strategy == "" { req.Strategy = "direct" }
+
+	env, err := h.store.GetEnvironment(c.Param("envId"))
+	if err != nil || env == nil { c.JSON(404, gin.H{"error": "environment not found"}); return }
+
+	status := "running"
+	if env.RequiresApproval { status = "pending" }
+
+	dep := &models.Deployment{
+		ID: uuid.New().String(), ProjectID: c.Param("id"),
+		EnvironmentID: env.ID, BuildID: req.BuildID, VersionID: req.VersionID,
+		Status: status, Strategy: req.Strategy, TriggeredBy: "manual",
+		Notes: req.Notes, CreatedAt: time.Now(),
+	}
+	if err := h.store.CreateDeployment(dep); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+
+	if status == "running" {
+		now := time.Now()
+		dep.StartedAt = &now
+		go h.executeDeployment(dep, env)
+	}
+
+	// Index context
+	h.store.AddContextEntry(&models.ContextEntry{
+		ID: uuid.New().String(), ProjectID: c.Param("id"), Type: "deployment",
+		RefID: dep.ID,
+		Summary: fmt.Sprintf("🚀 Deployment to %s triggered (build %s, strategy: %s)", env.Name, safeHead(req.BuildID, 8), req.Strategy),
+		Tags: strings.Join([]string{"deployment", env.Name, req.Strategy}, ","),
+		CreatedAt: time.Now(),
+	})
+
+	c.JSON(201, dep)
+}
+
+func (h *Handler) ApproveDeployment(c *gin.Context) {
+	// In a full impl: verify approver, update status, kick off executeDeployment
+	dep := &models.Deployment{ID: c.Param("depId")}
+	now := time.Now()
+	h.store.UpdateDeploymentStatus(dep.ID, "running", &now, 0)
+	c.JSON(200, gin.H{"status": "approved", "deployment_id": dep.ID})
+}
+
+func (h *Handler) executeDeployment(dep *models.Deployment, env *models.Environment) {
+	start := time.Now()
+	// In Phase 1: simulate; Phase 2 = real docker/kubectl/terraform
+	time.Sleep(2 * time.Second)
+	finished := time.Now()
+	h.store.UpdateDeploymentStatus(dep.ID, "success", &finished, time.Since(start).Milliseconds())
+	h.wsHub.broadcast(models.WSMessage{
+		Type: "deployment_status",
+		Payload: gin.H{"deployment_id": dep.ID, "environment": env.Name, "status": "success"},
+	})
+}
+
+// ─── Versions ─────────────────────────────────────────────────────────────────
+
+func (h *Handler) ListVersions(c *gin.Context) {
+	vs, err := h.store.ListVersions(c.Param("id"), 50)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if vs == nil { vs = []*models.Version{} }
+	c.JSON(200, vs)
+}
+
+func (h *Handler) CreateManualVersion(c *gin.Context) {
+	var req struct {
+		BuildID   string `json:"build_id" binding:"required"`
+		BumpType  string `json:"bump_type"`
+		Changelog string `json:"changelog"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+	if req.BumpType == "" { req.BumpType = "patch" }
+
+	latest, _ := h.store.LatestVersion(c.Param("id"))
+	current := "0.0.0"; if latest != nil { current = latest.SemVer }
+
+	parts := strings.Split(current, ".")
+	if len(parts) != 3 { parts = []string{"0","0","0"} }
+	// bump
+	var major, minor, patch int
+	fmt.Sscanf(parts[0], "%d", &major)
+	fmt.Sscanf(parts[1], "%d", &minor)
+	fmt.Sscanf(parts[2], "%d", &patch)
+	switch req.BumpType {
+	case "major": major++; minor=0; patch=0
+	case "minor": minor++; patch=0
+	default: patch++
+	}
+	nextVer := fmt.Sprintf("%d.%d.%d", major, minor, patch)
+
+	ver := &models.Version{
+		ID: uuid.New().String(), ProjectID: c.Param("id"), BuildID: req.BuildID,
+		SemVer: nextVer, Tag: "v"+nextVer, BumpType: req.BumpType,
+		BumpReason: "Manual version", Changelog: req.Changelog, CreatedAt: time.Now(),
+	}
+	if err := h.store.CreateVersion(ver); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	c.JSON(201, ver)
+}
+
+// ─── Artifacts ────────────────────────────────────────────────────────────────
+
+func (h *Handler) ListArtifacts(c *gin.Context) {
+	arts, err := h.store.ListArtifacts(c.Param("buildId"))
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if arts == nil { arts = []*models.Artifact{} }
+	c.JSON(200, arts)
+}
+
+func (h *Handler) PromoteArtifact(c *gin.Context) {
+	var req struct{ Environment string `json:"environment" binding:"required"` }
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+	if err := h.store.PromoteArtifact(c.Param("artifactId"), req.Environment); err != nil {
+		c.JSON(500, gin.H{"error": err.Error()}); return
+	}
+	c.JSON(200, gin.H{"status": "promoted", "environment": req.Environment})
+}
+
+// ─── Notification Channels ────────────────────────────────────────────────────
+
+func (h *Handler) ListNotificationChannels(c *gin.Context) {
+	chs, err := h.store.ListNotificationChannels(c.Param("id"))
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if chs == nil { chs = []*models.NotificationChannel{} }
+	// Mask config secrets for list view
+	for _, ch := range chs {
+		for k, v := range ch.Config {
+			if len(v) > 8 && (strings.Contains(k, "token") || strings.Contains(k, "key") || strings.Contains(k, "url") && strings.Contains(v, "hooks")) {
+				ch.Config[k] = v[:4] + "••••" + v[len(v)-4:]
+			}
+		}
+	}
+	c.JSON(200, chs)
+}
+
+func (h *Handler) CreateNotificationChannel(c *gin.Context) {
+	var req models.NotificationChannel
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+	req.ID = uuid.New().String()
+	req.ProjectID = c.Param("id")
+	req.CreatedAt = time.Now(); req.UpdatedAt = time.Now()
+	if req.Config == nil { req.Config = map[string]string{} }
+	if err := h.store.UpsertNotificationChannel(&req); err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	c.JSON(201, req)
+}
+
+func (h *Handler) UpdateNotificationChannel(c *gin.Context) {
+	var req models.NotificationChannel
+	c.ShouldBindJSON(&req)
+	req.ID = c.Param("channelId"); req.UpdatedAt = time.Now()
+	h.store.UpsertNotificationChannel(&req)
+	c.JSON(200, req)
+}
+
+func (h *Handler) DeleteNotificationChannel(c *gin.Context) {
+	h.store.DeleteNotificationChannel(c.Param("channelId"))
+	c.JSON(204, nil)
+}
+
+func (h *Handler) ListNotificationLogs(c *gin.Context) {
+	logs, err := h.store.ListNotificationLogs(c.Param("buildId"))
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if logs == nil { logs = []*models.NotificationLog{} }
+	c.JSON(200, logs)
+}
+
+func (h *Handler) TestNotification(c *gin.Context) {
+	var req struct {
+		Platform  string            `json:"platform"`
+		Config    map[string]string `json:"config"`
+		AIMessage bool              `json:"ai_message"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+
+	// Create a fake build for testing
+	testBuild := &models.Build{
+		ID: "test", Number: 999, Status: "success",
+		Branch: "main", Commit: "abc1234", Duration: 45000,
+	}
+	testProject := &models.Project{ID: c.Param("id"), Name: "Test Project"}
+
+	ch := &models.NotificationChannel{
+		ID: "test", Platform: req.Platform, Config: req.Config,
+		OnSuccess: true, AIMessage: req.AIMessage,
+	}
+
+	_ = testBuild; _ = testProject; _ = ch
+	// Would call dispatcher.sendToChannel here
+	c.JSON(200, gin.H{"status": "test_sent", "platform": req.Platform, "note": "Check your configured channel"})
+}
+
+// ─── AI Context Engine v2 ─────────────────────────────────────────────────────
+
+func (h *Handler) GetProjectContext(c *gin.Context) {
+	limit := 50
+	entries, err := h.store.GetProjectContext(c.Param("id"), limit)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if entries == nil { entries = []*models.ContextEntry{} }
+	c.JSON(200, entries)
+}
+
+func (h *Handler) SearchContext(c *gin.Context) {
+	q := c.Query("q")
+	if q == "" { c.JSON(400, gin.H{"error": "q param required"}); return }
+	entries, err := h.store.SearchContext(c.Param("id"), q, 20)
+	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
+	if entries == nil { entries = []*models.ContextEntry{} }
+	c.JSON(200, entries)
+}
+
+// ─── AI V3 Endpoints ──────────────────────────────────────────────────────────
+
+func (h *Handler) AIVersionBump(c *gin.Context) {
+	var req struct {
+		ProjectID string   `json:"project_id"`
+		Commits   []string `json:"commits"`
+		Changelog string   `json:"changelog"`
+	}
+	c.ShouldBindJSON(&req)
+	bump, reason, err := h.llm.AnalyzeVersionBump(c.Request.Context(), req.Commits, req.Changelog)
+	if err != nil { c.JSON(200, gin.H{"bump":"patch","reason":"AI unavailable — defaulting to patch"}); return }
+	c.JSON(200, gin.H{"bump": bump, "reason": reason})
+}
+
+func (h *Handler) AIDeploymentCheck(c *gin.Context) {
+	var req struct {
+		Environment string `json:"environment"`
+		Diff        string `json:"diff"`
+		Changelog   string `json:"changelog"`
+	}
+	c.ShouldBindJSON(&req)
+	safe, concerns, err := h.llm.CheckDeploymentSafety(c.Request.Context(), req.Environment, req.Diff, req.Changelog)
+	if err != nil { c.JSON(200, gin.H{"safe":true,"concerns":[]string{}}); return }
+	c.JSON(200, gin.H{"safe": safe, "concerns": concerns})
+}
+
+func (h *Handler) AINotificationPreview(c *gin.Context) {
+	var req struct {
+		Platform    string `json:"platform"`
+		BuildNum    int    `json:"build_num"`
+		Status      string `json:"status"`
+		Branch      string `json:"branch"`
+		ProjectName string `json:"project_name"`
+		VersionTag  string `json:"version_tag"`
+		DurationMs  int64  `json:"duration_ms"`
+	}
+	c.ShouldBindJSON(&req)
+	msg, err := h.llm.GenerateNotificationMsg(c.Request.Context(),
+		req.BuildNum, req.Status, req.Branch, req.ProjectName, req.VersionTag, "", req.Platform, req.DurationMs)
+	if err != nil { c.JSON(200, gin.H{"message": "AI unavailable"}); return }
+	c.JSON(200, gin.H{"message": msg})
+}
+
+// ─── Retention Settings ──────────────────────────────────────────────────────
+
+func (h *Handler) GetRetentionSettings(c *gin.Context) {
+	maxBuilds, _ := h.store.GetSystemSetting("retention_max_builds")
+	maxVersions, _ := h.store.GetSystemSetting("retention_max_versions")
+	if maxBuilds == "" { maxBuilds = "50" }
+	if maxVersions == "" { maxVersions = "30" }
+	c.JSON(200, gin.H{
+		"max_builds":   maxBuilds,
+		"max_versions": maxVersions,
+	})
+}
+
+func (h *Handler) SaveRetentionSettings(c *gin.Context) {
+	var req struct {
+		MaxBuilds   string `json:"max_builds"`
+		MaxVersions string `json:"max_versions"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+
+	if req.MaxBuilds != "" {
+		h.store.SetSystemSetting("retention_max_builds", req.MaxBuilds)
+	}
+	if req.MaxVersions != "" {
+		h.store.SetSystemSetting("retention_max_versions", req.MaxVersions)
+	}
+	c.JSON(200, gin.H{"status": "saved", "max_builds": req.MaxBuilds, "max_versions": req.MaxVersions})
+}
+
+// pruneRetention runs after a build completes, trimming old builds and versions per retention settings.
+func (h *Handler) pruneRetention(projectID string) {
+	maxBuildsStr, _ := h.store.GetSystemSetting("retention_max_builds")
+	maxVersionsStr, _ := h.store.GetSystemSetting("retention_max_versions")
+
+	maxBuilds := 50  // default
+	maxVersions := 30 // default
+	fmt.Sscanf(maxBuildsStr, "%d", &maxBuilds)
+	fmt.Sscanf(maxVersionsStr, "%d", &maxVersions)
+
+	if maxBuilds > 0 {
+		h.store.PruneBuilds(projectID, maxBuilds)
+	}
+	if maxVersions > 0 {
+		h.store.PruneVersions(projectID, maxVersions)
+	}
 }

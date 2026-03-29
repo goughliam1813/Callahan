@@ -70,6 +70,13 @@ type Pipeline struct {
 	On       PipelineTrigger   `yaml:"on" json:"on"`
 	Env      map[string]string `yaml:"env" json:"env"`
 	Jobs     map[string]PipelineJob `yaml:"jobs" json:"jobs"`
+	AI       *PipelineAIConfig `yaml:"ai" json:"ai,omitempty"`
+}
+
+// PipelineAIConfig holds the top-level ai: block from Callahanfile.yaml
+type PipelineAIConfig struct {
+	Review       bool `yaml:"review" json:"review"`
+	SecurityScan bool `yaml:"security-scan" json:"security_scan"`
 }
 
 type PipelineTrigger struct {
@@ -174,6 +181,32 @@ type AIReview struct {
 	AutoFix    bool     `json:"auto_fix_available"`
 }
 
+// SecurityScanResult holds AI-triaged security findings
+type SecurityScanResult struct {
+	BuildID      string              `json:"build_id"`
+	Scanner      string              `json:"scanner"` // trivy, semgrep, ai-only
+	Severity     string              `json:"severity"` // info, warning, error
+	Summary      string              `json:"summary"`
+	TotalFindings int                `json:"total_findings"`
+	Critical     int                 `json:"critical"`
+	High         int                 `json:"high"`
+	Medium       int                 `json:"medium"`
+	Low          int                 `json:"low"`
+	Findings     []SecurityFinding   `json:"findings"`
+	AIExplanation string             `json:"ai_explanation"`
+}
+
+// SecurityFinding is a single vulnerability or issue found by a scanner
+type SecurityFinding struct {
+	ID          string `json:"id"`
+	Severity    string `json:"severity"` // CRITICAL, HIGH, MEDIUM, LOW
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	File        string `json:"file,omitempty"`
+	Line        int    `json:"line,omitempty"`
+	Fix         string `json:"fix,omitempty"`
+}
+
 // LogLine is a structured log entry streamed via WebSocket
 type LogLine struct {
 	BuildID   string    `json:"build_id"`
@@ -188,4 +221,120 @@ type LogLine struct {
 type WSMessage struct {
 	Type    string      `json:"type"` // log, status, ai_insight
 	Payload interface{} `json:"payload"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Environments
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Environment struct {
+	ID          string            `json:"id" db:"id"`
+	ProjectID   string            `json:"project_id" db:"project_id"`
+	Name        string            `json:"name" db:"name"`   // dev, test, staging, prod
+	Description string            `json:"description" db:"description"`
+	Color       string            `json:"color" db:"color"` // UI color hint
+	AutoDeploy  bool              `json:"auto_deploy" db:"auto_deploy"`
+	RequiresApproval bool         `json:"requires_approval" db:"requires_approval"`
+	ApprovedBy  string            `json:"approved_by,omitempty" db:"approved_by"`
+	BranchFilter string           `json:"branch_filter" db:"branch_filter"` // e.g. "main", "feature/*"
+	EnvVars     map[string]string `json:"env_vars,omitempty"`
+	CreatedAt   time.Time         `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at" db:"updated_at"`
+}
+
+type Deployment struct {
+	ID            string     `json:"id" db:"id"`
+	ProjectID     string     `json:"project_id" db:"project_id"`
+	EnvironmentID string     `json:"environment_id" db:"environment_id"`
+	BuildID       string     `json:"build_id" db:"build_id"`
+	VersionID     string     `json:"version_id" db:"version_id"`
+	Status        string     `json:"status" db:"status"` // pending, running, success, failed, rolled_back
+	Strategy      string     `json:"strategy" db:"strategy"` // direct, blue_green, canary
+	TriggeredBy   string     `json:"triggered_by" db:"triggered_by"`
+	ApprovedBy    string     `json:"approved_by,omitempty" db:"approved_by"`
+	StartedAt     *time.Time `json:"started_at,omitempty" db:"started_at"`
+	FinishedAt    *time.Time `json:"finished_at,omitempty" db:"finished_at"`
+	Duration      int64      `json:"duration_ms" db:"duration_ms"`
+	Notes         string     `json:"notes,omitempty" db:"notes"`
+	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Versioning & Artifacts
+// ─────────────────────────────────────────────────────────────────────────────
+
+type Version struct {
+	ID          string            `json:"id" db:"id"`
+	ProjectID   string            `json:"project_id" db:"project_id"`
+	BuildID     string            `json:"build_id" db:"build_id"`
+	SemVer      string            `json:"semver" db:"semver"`       // e.g. "1.4.2"
+	Tag         string            `json:"tag" db:"tag"`             // e.g. "v1.4.2"
+	BumpType    string            `json:"bump_type" db:"bump_type"` // patch, minor, major
+	BumpReason  string            `json:"bump_reason" db:"bump_reason"`
+	GitTagged   bool              `json:"git_tagged" db:"git_tagged"`
+	Changelog   string            `json:"changelog,omitempty" db:"changelog"`
+	AIAnalysis  string            `json:"ai_analysis,omitempty" db:"ai_analysis"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	CreatedAt   time.Time         `json:"created_at" db:"created_at"`
+}
+
+type Artifact struct {
+	ID          string     `json:"id" db:"id"`
+	ProjectID   string     `json:"project_id" db:"project_id"`
+	BuildID     string     `json:"build_id" db:"build_id"`
+	VersionID   string     `json:"version_id,omitempty" db:"version_id"`
+	Name        string     `json:"name" db:"name"`
+	Type        string     `json:"type" db:"type"`   // docker, npm, binary, archive, report
+	Path        string     `json:"path" db:"path"`   // local path
+	URL         string     `json:"url,omitempty" db:"url"`     // S3/remote URL if mirrored
+	Size        int64      `json:"size_bytes" db:"size_bytes"`
+	Checksum    string     `json:"checksum" db:"checksum"`
+	Environment string     `json:"environment,omitempty" db:"environment"` // which env it was promoted to
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: Notifications
+// ─────────────────────────────────────────────────────────────────────────────
+
+type NotificationChannel struct {
+	ID        string            `json:"id" db:"id"`
+	ProjectID string            `json:"project_id" db:"project_id"` // empty = global
+	Platform  string            `json:"platform" db:"platform"` // slack, teams, jira, azuredevops, email, discord, webhook
+	Name      string            `json:"name" db:"name"`
+	Enabled   bool              `json:"enabled" db:"enabled"`
+	Config    map[string]string `json:"config"` // webhook_url, token, channel, project_key, etc.
+	OnSuccess bool              `json:"on_success" db:"on_success"`
+	OnFailure bool              `json:"on_failure" db:"on_failure"`
+	OnCancel  bool              `json:"on_cancel" db:"on_cancel"`
+	AIMessage bool              `json:"ai_message" db:"ai_message"` // use AI to generate message
+	CreatedAt time.Time         `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time         `json:"updated_at" db:"updated_at"`
+}
+
+type NotificationLog struct {
+	ID          string    `json:"id" db:"id"`
+	ChannelID   string    `json:"channel_id" db:"channel_id"`
+	BuildID     string    `json:"build_id" db:"build_id"`
+	Platform    string    `json:"platform" db:"platform"`
+	Status      string    `json:"status" db:"status"` // sent, failed, skipped
+	Payload     string    `json:"payload,omitempty" db:"payload"` // JSON of what was sent
+	Response    string    `json:"response,omitempty" db:"response"`
+	Error       string    `json:"error,omitempty" db:"error"`
+	SentAt      time.Time `json:"sent_at" db:"sent_at"`
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// V3: AI Context Engine entries
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ContextEntry struct {
+	ID        string    `json:"id" db:"id"`
+	ProjectID string    `json:"project_id" db:"project_id"`
+	Type      string    `json:"type" db:"type"` // build, notification, version, deployment, error
+	RefID     string    `json:"ref_id" db:"ref_id"` // build_id / version_id / deployment_id
+	Summary   string    `json:"summary" db:"summary"` // human-readable one-liner
+	Detail    string    `json:"detail,omitempty" db:"detail"` // full JSON blob
+	Tags      string    `json:"tags,omitempty" db:"tags"` // comma-separated
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
 }
