@@ -215,7 +215,7 @@ func (e *Executor) log(jobID, stepID, stream, line string) {
 // CloneRepo clones a git repo into workDir using optional PAT auth
 func CloneRepo(ctx context.Context, repoURL, branch, token, workDir string, logFn func(string)) error {
 	cloneURL := repoURL
-	if token != "" { cloneURL = injectToken(repoURL, token) }
+	if token != "" { cloneURL = InjectToken(repoURL, token) }
 
 	logFn(fmt.Sprintf("Cloning %s @ %s", repoURL, branch))
 	cmd := exec.CommandContext(ctx, "git", "clone",
@@ -247,7 +247,7 @@ func FindCallahanfile(workDir string) (string, []byte) {
 	return "", nil
 }
 
-func injectToken(rawURL, token string) string {
+func InjectToken(rawURL, token string) string {
 	rawURL = strings.TrimPrefix(rawURL, "https://")
 	rawURL = strings.TrimPrefix(rawURL, "http://")
 	rawURL = strings.TrimPrefix(rawURL, "git@github.com:")

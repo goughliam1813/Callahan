@@ -66,17 +66,29 @@ type Step struct {
 
 // Pipeline is the parsed Callahanfile.yaml
 type Pipeline struct {
-	Name     string            `yaml:"name" json:"name"`
-	On       PipelineTrigger   `yaml:"on" json:"on"`
-	Env      map[string]string `yaml:"env" json:"env"`
+	Name     string                 `yaml:"name" json:"name"`
+	On       PipelineTrigger        `yaml:"on" json:"on"`
+	Env      map[string]string      `yaml:"env" json:"env"`
 	Jobs     map[string]PipelineJob `yaml:"jobs" json:"jobs"`
-	AI       *PipelineAIConfig `yaml:"ai" json:"ai,omitempty"`
+	AI       *PipelineAIConfig      `yaml:"ai" json:"ai,omitempty"`
+	Deploy   []DeployStage          `yaml:"deploy" json:"deploy,omitempty"`
 }
 
 // PipelineAIConfig holds the top-level ai: block from Callahanfile.yaml
 type PipelineAIConfig struct {
 	Review       bool `yaml:"review" json:"review"`
 	SecurityScan bool `yaml:"security-scan" json:"security_scan"`
+}
+
+// DeployStage represents one environment in the CD daisy chain
+type DeployStage struct {
+	Name             string   `yaml:"name" json:"name"`                                         // environment name: dev, test, staging, prod
+	Auto             bool     `yaml:"auto" json:"auto"`                                         // true = auto-deploy on previous stage success
+	Gate             string   `yaml:"gate" json:"gate,omitempty"`                                // "manual" or "auto" (default auto if Auto=true)
+	RequiresApproval bool     `yaml:"requires_approval" json:"requires_approval,omitempty"`      // needs explicit approval click
+	Steps            []PipelineStep `yaml:"steps" json:"steps,omitempty"`                        // optional deploy steps to run
+	Notify           []string `yaml:"notify" json:"notify,omitempty"`                            // e.g. ["slack:#deployments", "email:ops@co.com"]
+	BranchFilter     string   `yaml:"branch_filter" json:"branch_filter,omitempty"`              // only deploy from this branch
 }
 
 type PipelineTrigger struct {
