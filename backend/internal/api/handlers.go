@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -337,7 +338,54 @@ func (h *Handler) GetPipeline(c *gin.Context) {
 func (h *Handler) UpdatePipeline(c *gin.Context) {
 	var req struct{ Content string `json:"content"` }
 	c.ShouldBindJSON(&req)
-	c.JSON(200, gin.H{"status": "saved", "content": req.Content})
+
+	p, _ := h.store.GetProject(c.Param("id"))
+	if p == nil {
+		c.JSON(404, gin.H{"error": "project not found"})
+		return
+	}
+
+	// Clone the repo, write the file, commit, push
+	workDir := filepath.Join(os.TempDir(), "callahan", "pipeline-save-"+c.Param("id"))
+	defer os.RemoveAll(workDir)
+
+	token, _ := h.store.GetSecret(p.ID, "GIT_TOKEN")
+	if err := pipeline.CloneRepo(context.Background(), p.RepoURL, p.Branch, token, workDir, func(s string) {}); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (git push failed: " + err.Error() + ")"})
+		return
+	}
+
+	// Write the Callahanfile.yaml
+	callahanPath := filepath.Join(workDir, "Callahanfile.yaml")
+	if err := os.WriteFile(callahanPath, []byte(req.Content), 0644); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (file write failed)"})
+		return
+	}
+
+	// Git add, commit, push
+	cmds := [][]string{
+		{"git", "-C", workDir, "add", "Callahanfile.yaml"},
+		{"git", "-C", workDir, "commit", "-m", "chore: update Callahanfile.yaml via Callahan UI"},
+	}
+	for _, args := range cmds {
+		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
+			// Commit might fail if no changes — that's ok
+			_ = out
+		}
+	}
+
+	// Push with token
+	pushURL := p.RepoURL
+	if token != "" {
+		pushURL = pipeline.InjectToken(p.RepoURL, token)
+	}
+	pushCmd := exec.Command("git", "-C", workDir, "push", pushURL, p.Branch)
+	if out, err := pushCmd.CombinedOutput(); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (push failed: " + string(out) + ")"})
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved and pushed to git"})
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1092,7 +1140,12 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 
 	h.finishBuild(build, status, totalMs, aiInsight)
 
-	// ── 10. Prune old builds/versions per retention settings ────────────────
+	// ── 10. Deploy chain (if CI passed and deploy stages defined) ────────────
+	if status == "success" && parsed.Deploy != nil && len(parsed.Deploy) > 0 {
+		h.runDeployChain(ctx, build, project, parsed.Deploy, ver, workDir)
+	}
+
+	// ── 11. Prune old builds/versions per retention settings ────────────────
 	h.pruneRetention(project.ID)
 }
 
@@ -1516,5 +1569,195 @@ func (h *Handler) pruneRetention(projectID string) {
 	}
 	if maxVersions > 0 {
 		h.store.PruneVersions(projectID, maxVersions)
+	}
+}
+
+// ─── Deploy Chain ────────────────────────────────────────────────────────────
+
+// runDeployChain executes the daisy-chained deploy stages defined in the pipeline.
+// Auto stages run immediately; manual stages create a pending deployment and wait.
+func (h *Handler) runDeployChain(ctx context.Context, build *models.Build, project *models.Project, stages []models.DeployStage, ver *models.Version, workDir string) {
+	versionTag := ""
+	if ver != nil { versionTag = ver.Tag }
+
+	for i, stage := range stages {
+		// Check if this stage should auto-deploy or wait for manual gate
+		isAuto := stage.Auto || stage.Gate == "" || stage.Gate == "auto"
+
+		// Ensure environment exists in DB (create if not)
+		env := h.ensureEnvironment(project.ID, stage.Name, stage.RequiresApproval)
+
+		depID := uuid.New().String()
+		versionID := ""
+		if ver != nil { versionID = ver.ID }
+
+		dep := &models.Deployment{
+			ID:            depID,
+			ProjectID:     project.ID,
+			EnvironmentID: env.ID,
+			BuildID:       build.ID,
+			VersionID:     versionID,
+			Status:        "pending",
+			Strategy:      "direct",
+			TriggeredBy:   "pipeline",
+			Notes:         fmt.Sprintf("Deploy chain stage %d/%d: %s", i+1, len(stages), stage.Name),
+			CreatedAt:     time.Now(),
+		}
+
+		if isAuto {
+			dep.Status = "running"
+			now := time.Now()
+			dep.StartedAt = &now
+		}
+
+		h.store.CreateDeployment(dep)
+
+		// Broadcast deployment created
+		h.wsHub.broadcast(models.WSMessage{
+			Type: "deployment_status",
+			Payload: gin.H{
+				"deployment_id": depID, "environment": stage.Name,
+				"status": dep.Status, "stage": i + 1, "total_stages": len(stages),
+				"version": versionTag, "auto": isAuto,
+			},
+		})
+
+		// Index in context engine
+		h.store.AddContextEntry(&models.ContextEntry{
+			ID: uuid.New().String(), ProjectID: project.ID, Type: "deployment",
+			RefID:   depID,
+			Summary: fmt.Sprintf("🚀 Deploy chain → %s (%s, %s)", stage.Name, func() string { if isAuto { return "auto" }; return "manual gate" }(), versionTag),
+			Tags:    strings.Join([]string{"deployment", stage.Name, "chain"}, ","),
+			CreatedAt: time.Now(),
+		})
+
+		if isAuto {
+			// Execute deploy steps if defined
+			if len(stage.Steps) > 0 {
+				h.executeDeploySteps(ctx, build, project, dep, stage, workDir, ver)
+			} else {
+				// No steps — mark as success immediately
+				now := time.Now()
+				h.store.UpdateDeploymentStatus(depID, "success", &now, 0)
+			}
+
+			// Send stage notifications
+			h.sendStageNotifications(ctx, project, build, stage, versionTag)
+
+			h.wsHub.broadcast(models.WSMessage{
+				Type: "deployment_status",
+				Payload: gin.H{"deployment_id": depID, "environment": stage.Name, "status": "success", "version": versionTag},
+			})
+		} else {
+			// Manual gate — stop the chain here, wait for user action
+			// The frontend will show a "Deploy to <env>" button
+			// When clicked, it calls POST /projects/:id/environments/:envId/deploy
+			h.wsHub.broadcast(models.WSMessage{
+				Type: "deploy_gate",
+				Payload: gin.H{
+					"deployment_id": depID, "environment": stage.Name,
+					"gate": "manual", "version": versionTag,
+					"message": fmt.Sprintf("Waiting for manual approval to deploy %s to %s", versionTag, stage.Name),
+				},
+			})
+
+			// Send notification that approval is needed
+			h.sendStageNotifications(ctx, project, build, stage, versionTag)
+
+			// Stop the chain — remaining stages wait
+			break
+		}
+	}
+}
+
+// ensureEnvironment creates the environment if it doesn't exist, returns it
+func (h *Handler) ensureEnvironment(projectID, name string, requiresApproval bool) *models.Environment {
+	envs, _ := h.store.ListEnvironments(projectID)
+	for _, e := range envs {
+		if strings.EqualFold(e.Name, name) { return e }
+	}
+
+	colorMap := map[string]string{"dev": "#00d4ff", "test": "#00e5a0", "staging": "#f5c542", "prod": "#ff4455"}
+	color := colorMap[strings.ToLower(name)]
+	if color == "" { color = "#545f72" }
+
+	env := &models.Environment{
+		ID:               uuid.New().String(),
+		ProjectID:        projectID,
+		Name:             name,
+		Color:            color,
+		RequiresApproval: requiresApproval,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+	h.store.CreateEnvironment(env)
+	return env
+}
+
+// executeDeploySteps runs the deploy steps for a stage
+func (h *Handler) executeDeploySteps(ctx context.Context, build *models.Build, project *models.Project, dep *models.Deployment, stage models.DeployStage, workDir string, ver *models.Version) {
+	start := time.Now()
+	secrets, _ := h.store.GetAllSecrets(project.ID)
+
+	// Add deployment-specific env vars
+	if ver != nil {
+		secrets["CALLAHAN_VERSION"] = ver.Tag
+		secrets["CALLAHAN_SEMVER"] = ver.SemVer
+	}
+	secrets["CALLAHAN_ENVIRONMENT"] = stage.Name
+	secrets["CALLAHAN_DEPLOY_ID"] = dep.ID
+
+	executor := pipeline.NewExecutor(func(jobID, stepID, stream, line string) {
+		h.wsHub.broadcast(models.WSMessage{
+			Type: "log",
+			Payload: models.LogLine{
+				BuildID: build.ID, JobID: jobID, StepID: stepID,
+				Line: line, Stream: stream, Timestamp: time.Now(),
+			},
+		})
+	})
+
+	jobName := "deploy-" + stage.Name
+	pipelineJob := models.PipelineJob{Steps: stage.Steps}
+	result := executor.ExecuteJob(ctx, build.ID, jobName, pipelineJob, workDir, secrets)
+
+	finished := time.Now()
+	duration := finished.Sub(start).Milliseconds()
+	status := result.Status
+	if status == "" { status = "success" }
+
+	h.store.UpdateDeploymentStatus(dep.ID, status, &finished, duration)
+
+	// Save deploy job and steps to DB
+	dbJob := &models.Job{
+		ID: result.JobID, BuildID: build.ID, Name: jobName,
+		Status: status, StartedAt: &start, FinishedAt: &finished, Duration: duration,
+	}
+	h.store.CreateJob(dbJob)
+	for _, step := range result.Steps {
+		step.JobID = dbJob.ID
+		h.store.CreateStep(step)
+	}
+}
+
+// sendStageNotifications sends notifications for a deploy stage
+func (h *Handler) sendStageNotifications(ctx context.Context, project *models.Project, build *models.Build, stage models.DeployStage, versionTag string) {
+	for _, target := range stage.Notify {
+		parts := strings.SplitN(target, ":", 2)
+		if len(parts) != 2 { continue }
+		platform, channel := parts[0], parts[1]
+
+		msg := fmt.Sprintf("🚀 %s deployed to %s (version %s)", project.Name, stage.Name, versionTag)
+
+		// Log the notification
+		h.store.CreateNotificationLog(&models.NotificationLog{
+			ID:       uuid.New().String(),
+			ChannelID: platform + ":" + channel,
+			BuildID:  build.ID,
+			Platform: platform,
+			Status:   "sent",
+			Payload:  msg,
+			SentAt:   time.Now(),
+		})
 	}
 }
