@@ -17,7 +17,7 @@ type Build = {
   created_at: string; started_at: string; finished_at: string;
 };
 
-type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config';
+type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config' | 'environments' | 'notifications' | 'versions';
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
 type FolderItem = { id: string; name: string; expanded: boolean; projects: Project[] };
 
@@ -630,6 +630,40 @@ export default function App() {
             color: view==='secrets' ? '#00d4ff' : '#545f72', fontWeight:500 }}>Secrets</span>
         </button>
 
+
+        {/* Environments */}
+        <button onClick={()=>setView('environments')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='environments' ? 'rgba(0,229,160,0.06)' : 'transparent',
+            border: view==='environments' ? '1px solid rgba(0,229,160,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Globe size={13} color={view==='environments' ? '#00e5a0' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='environments' ? '#00e5a0' : '#545f72', fontWeight:500 }}>Environments</span>
+        </button>
+
+        {/* Notifications */}
+        <button onClick={()=>setView('notifications')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='notifications' ? 'rgba(245,197,66,0.06)' : 'transparent',
+            border: view==='notifications' ? '1px solid rgba(245,197,66,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Bell size={13} color={view==='notifications' ? '#f5c542' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='notifications' ? '#f5c542' : '#545f72', fontWeight:500 }}>Notifications</span>
+        </button>
+
+        {/* Versions */}
+        <button onClick={()=>setView('versions')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='versions' ? 'rgba(160,120,255,0.06)' : 'transparent',
+            border: view==='versions' ? '1px solid rgba(160,120,255,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Tag size={13} color={view==='versions' ? '#a078ff' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='versions' ? '#a078ff' : '#545f72', fontWeight:500 }}>Versions</span>
+        </button>
+
         {/* Settings */}
         <button onClick={()=>setView('settings')}
           style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
@@ -818,6 +852,23 @@ export default function App() {
           fontFamily:"'Figtree',sans-serif" }}>
           <Play size={14} fill="#000"/> Run Build
         </button>
+      </div>
+
+      {/* v3 quick-access */}
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10, marginBottom:20 }}>
+        {[
+          { label:'Environments', desc:'Deploy to dev, test, staging, prod', color:'#00e5a0', icon:<Globe size={15}/>, view:'environments' as View },
+          { label:'Notifications', desc:'Slack, Teams, Jira, Azure DevOps', color:'#f5c542', icon:<Bell size={15}/>, view:'notifications' as View },
+          { label:'Versions', desc:'SemVer timeline + git tags', color:'#a078ff', icon:<Tag size={15}/>, view:'versions' as View },
+        ].map(item=>(
+          <Card key={item.label} onClick={()=>setView(item.view)} style={{ cursor:'pointer' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6 }}>
+              <span style={{ color:item.color }}>{item.icon}</span>
+              <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700, color:'#fff' }}>{item.label}</span>
+            </div>
+            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:11, color:'#545f72', lineHeight:1.5 }}>{item.desc}</div>
+          </Card>
+        ))}
       </div>
 
       {/* stat cards */}
@@ -1174,7 +1225,7 @@ export default function App() {
           body: JSON.stringify({ content: yaml }),
         });
         const d = await res.json();
-        setSaveMsg(res.ok ? (d.message || '✔ Saved') : ('✖ ' + (d.error || 'Save failed')));
+        setSaveMsg(res.ok ? (d.message || '✔ Saved to git') : ('✖ ' + (d.error || 'Save failed')));
       } catch { setSaveMsg('✖ Backend offline'); }
       setSaving(false);
       setTimeout(() => setSaveMsg(''), 4000);
@@ -1304,10 +1355,29 @@ export default function App() {
     const [branch, setBranch] = useState(sel?.branch   ?? 'main');
     const [saved,  setSaved]  = useState(false);
     const [confirmDel, setConfirmDel] = useState(false);
+    const [maxBuilds, setMaxBuilds] = useState('50');
+    const [maxVersions, setMaxVersions] = useState('30');
+    const [retSaved, setRetSaved] = useState(false);
+
+    useEffect(() => {
+      fetch('http://localhost:8080/api/v1/settings/retention')
+        .then(r=>r.json())
+        .then(d=>{ setMaxBuilds(d.max_builds||'50'); setMaxVersions(d.max_versions||'30'); })
+        .catch(()=>{});
+    }, []);
+
+    const saveRetention = () => {
+      fetch('http://localhost:8080/api/v1/settings/retention', {
+        method:'PUT', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ max_builds: maxBuilds, max_versions: maxVersions })
+      }).then(()=>{ setRetSaved(true); setTimeout(()=>setRetSaved(false),2000); }).catch(()=>{});
+    };
+
     const save = () => {
       if(!sel) return;
       setProjects(p=>p.map(x=>x.id===sel.id?{...x,name,repo_url:repo,branch}:x));
       setSel(s=>s?{...s,name,repo_url:repo,branch}:s);
+      api.updateProject(sel.id, { name, repo_url: repo, branch } as any).catch(()=>{});
       setSaved(true); setTimeout(()=>setSaved(false),2000);
     };
     return (
@@ -1331,6 +1401,36 @@ export default function App() {
             borderRadius:7, fontWeight:700, fontSize:13, cursor:'pointer',
             fontFamily:"'Figtree',sans-serif", transition:'background 0.2s' }}>
             {saved ? '✔ Saved' : 'Save Changes'}
+          </button>
+        </Card>
+        <Card style={{ marginBottom:12 }}>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+            letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:18 }}>Retention</div>
+          <p style={{ fontSize:13, color:'#8892a4', marginBottom:16, lineHeight:1.6,
+            fontFamily:"'Figtree',sans-serif" }}>
+            Control how many builds and versions are kept per project. Older items are automatically pruned after each build.
+          </p>
+          <div style={{ display:'flex', gap:16, marginBottom:16 }}>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Max Builds per Project</div>
+              <input type="number" min="5" max="500" value={maxBuilds} onChange={e=>setMaxBuilds(e.target.value)}
+                style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
+                  fontFamily:"'IBM Plex Mono',monospace", fontSize:13, outline:'none' }}/>
+            </div>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Max Versions per Project</div>
+              <input type="number" min="5" max="200" value={maxVersions} onChange={e=>setMaxVersions(e.target.value)}
+                style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
+                  fontFamily:"'IBM Plex Mono',monospace", fontSize:13, outline:'none' }}/>
+            </div>
+          </div>
+          <button onClick={saveRetention} style={{ padding:'9px 20px',
+            background:retSaved?'#00e5a0':'#00d4ff', color:'#000', border:'none',
+            borderRadius:7, fontWeight:700, fontSize:13, cursor:'pointer',
+            fontFamily:"'Figtree',sans-serif", transition:'background 0.2s' }}>
+            {retSaved ? '✔ Saved' : 'Save Retention'}
           </button>
         </Card>
         <Card>
@@ -1359,6 +1459,565 @@ export default function App() {
       </div>
     );
   };
+
+
+  /* ── environments ──────────────────────────────────────────────────────── */
+  const EnvironmentsView = () => {
+    const [envs, setEnvs] = useState<any[]>([]);
+    const [deployments, setDeployments] = useState<any[]>([]);
+    const [showAdd, setShowAdd] = useState(false);
+    const [newEnv, setNewEnv] = useState({ name:'', description:'', color:'#00e5a0', auto_deploy:false, requires_approval:false, branch_filter:'' });
+    const [deploying, setDeploying] = useState<string|null>(null);
+    const [guardResult, setGuardResult] = useState<{safe:boolean;concerns:string[]}|null>(null);
+
+    const ENV_COLORS: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455' };
+
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`).then(r=>r.json()).then(d=>setEnvs(Array.isArray(d)?d:[])).catch(()=>{});
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id]);
+
+    const createEnv = async () => {
+      if (!sel || !newEnv.name) return;
+      const color = ENV_COLORS[newEnv.name.toLowerCase()] || newEnv.color;
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({...newEnv, color})
+      });
+      if (r.ok) { const d = await r.json(); setEnvs(e=>[...e,d]); setShowAdd(false); setNewEnv({name:'',description:'',color:'#00e5a0',auto_deploy:false,requires_approval:false,branch_filter:''}); }
+    };
+
+    const deleteEnv = async (id: string) => {
+      await fetch(`http://localhost:8080/api/v1/environments/${id}`, {method:'DELETE'});
+      setEnvs(e=>e.filter(x=>x.id!==id));
+    };
+
+    const deploy = async (envId: string, envName: string) => {
+      if (!sel) return;
+      setDeploying(envId);
+      // AI guardrail check first
+      const guard = await fetch('http://localhost:8080/api/v1/ai/deployment-check', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ environment: envName, diff:'', changelog:'' })
+      });
+      if (guard.ok) { const g = await guard.json(); setGuardResult(g); if(!g.safe) { setDeploying(null); return; } }
+
+      const lastBuild = builds[0];
+      if (!lastBuild) { setDeploying(null); return; }
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${envId}/deploy`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ build_id: lastBuild.id, strategy:'direct', notes:'Manual deploy from UI' })
+      });
+      if (r.ok) { const d = await r.json(); setDeployments(ds=>[d,...ds]); }
+      setDeploying(null); setGuardResult(null);
+    };
+
+    const lastDepForEnv = (envId: string) => deployments.find(d=>d.environment_id===envId);
+
+    return (
+      <div style={{ padding:28, maxWidth:820 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+          <div>
+            <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Environments</h2>
+            <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif", margin:'4px 0 0' }}>
+              {sel ? `Deployment targets for ${sel.name}` : 'Select a project to manage environments'}
+            </p>
+          </div>
+          <button onClick={()=>setShowAdd(s=>!s)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 16px', background:'rgba(0,229,160,0.1)', border:'1px solid rgba(0,229,160,0.25)',
+            borderRadius:7, color:'#00e5a0', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+            <Plus size={14}/> New Environment
+          </button>
+        </div>
+
+        {/* Add env form */}
+        {showAdd && (
+          <Card style={{ marginBottom:20 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>New Environment</div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
+              {[['Environment Name','name','e.g. staging'],['Branch Filter','branch_filter','e.g. main, feature/*']].map(([label,field,ph])=>(
+                <div key={field}>
+                  <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{label}</div>
+                  <input value={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.value}))}
+                    placeholder={ph} style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)',
+                      borderRadius:6, padding:'8px 12px', color:'#e8eaf0', fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:'flex', gap:16, marginBottom:14 }}>
+              {[['auto_deploy','Auto-deploy on green build'],['requires_approval','Require manual approval']].map(([field,label])=>(
+                <label key={field} style={{ display:'flex', alignItems:'center', gap:7, cursor:'pointer' }}>
+                  <input type="checkbox" checked={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.checked}))}/>
+                  <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{label}</span>
+                </label>
+              ))}
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>setShowAdd(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+              <button onClick={createEnv} style={{ flex:2, padding:'8px', background:'#00e5a0', border:'none', borderRadius:6, color:'#000', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>Create Environment</button>
+            </div>
+          </Card>
+        )}
+
+        {/* Guardrail warning */}
+        {guardResult && !guardResult.safe && (
+          <div style={{ marginBottom:16, padding:16, background:'rgba(255,68,85,0.08)', border:'1px solid rgba(255,68,85,0.25)', borderRadius:8 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8, color:'#ff4455', fontWeight:700, fontFamily:"'Figtree',sans-serif" }}>
+              <AlertTriangle size={15}/> AI Deployment Guardrail — Concerns Detected
+            </div>
+            {guardResult.concerns.map((c,i)=>(
+              <div key={i} style={{ fontSize:12, color:'#ff8888', fontFamily:"'Figtree',sans-serif", marginLeft:23 }}>• {c}</div>
+            ))}
+            <button onClick={()=>setGuardResult(null)} style={{ marginTop:10, padding:'6px 14px', background:'transparent', border:'1px solid rgba(255,68,85,0.3)', borderRadius:6, color:'#ff4455', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Dismiss</button>
+          </div>
+        )}
+
+        {/* Quick create buttons */}
+        {envs.length === 0 && !showAdd && (
+          <div style={{ marginBottom:20 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:10, fontFamily:"'Figtree',sans-serif" }}>Quick create standard environments:</div>
+            <div style={{ display:'flex', gap:8 }}>
+              {['dev','test','staging','prod'].map(name=>(
+                <button key={name} onClick={async ()=>{
+                  if(!sel) return;
+                  const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`,{
+                    method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({name,color:ENV_COLORS[name],auto_deploy:name!=='prod',requires_approval:name==='prod'})
+                  });
+                  if(r.ok){const d=await r.json();setEnvs(e=>[...e,d]);}
+                }} style={{ padding:'8px 16px', borderRadius:6, cursor:'pointer',
+                  background:`${ENV_COLORS[name]}15`, border:`1px solid ${ENV_COLORS[name]}40`,
+                  color:ENV_COLORS[name], fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
+                  + {name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Environment cards */}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+          {envs.map(env=>{
+            const dep = lastDepForEnv(env.id);
+            const isDeploying = deploying === env.id;
+            return (
+              <Card key={env.id} style={{ borderLeft:`3px solid ${env.color}` }}>
+                <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:12 }}>
+                  <div>
+                    <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
+                      <span style={{ width:8, height:8, borderRadius:'50%', background:env.color, display:'inline-block' }}/>
+                      <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>{env.name}</span>
+                      {env.requires_approval && <span style={{ fontSize:10, padding:'2px 6px', background:'rgba(245,197,66,0.1)', border:'1px solid rgba(245,197,66,0.2)', borderRadius:4, color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
+                      {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 6px', background:'rgba(0,229,160,0.1)', border:'1px solid rgba(0,229,160,0.2)', borderRadius:4, color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
+                    </div>
+                    {env.branch_filter && <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>branch: {env.branch_filter}</div>}
+                  </div>
+                  <button onClick={()=>deleteEnv(env.id)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:2, lineHeight:0 }}><Trash2 size={13}/></button>
+                </div>
+
+                {dep && (
+                  <div style={{ padding:'8px 10px', background:'rgba(255,255,255,0.03)', borderRadius:6, marginBottom:12, fontSize:12, fontFamily:"'IBM Plex Mono',monospace" }}>
+                    <div style={{ color: dep.status==='success'?'#00e5a0':dep.status==='failed'?'#ff4455':'#f5c542', marginBottom:3 }}>
+                      {dep.status==='success'?'✔':dep.status==='failed'?'✖':'⏳'} Last: {dep.status} · {dep.strategy}
+                    </div>
+                    <div style={{ color:'#545f72' }}>build: {dep.build_id?.slice(0,8)}{dep.version_id?' · '+dep.version_id:''}</div>
+                  </div>
+                )}
+                {!dep && <div style={{ color:'#545f72', fontSize:12, fontFamily:"'Figtree',sans-serif", marginBottom:12 }}>No deployments yet</div>}
+
+                <div style={{ display:'flex', gap:8 }}>
+                  <button onClick={()=>deploy(env.id, env.name)} disabled={isDeploying||!sel||builds.length===0}
+                    style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:6,
+                      padding:'8px', background: isDeploying?'rgba(0,229,160,0.05)':'rgba(0,229,160,0.1)',
+                      border:`1px solid ${env.color}40`, borderRadius:6,
+                      color: isDeploying?'#545f72':env.color, cursor: isDeploying?'wait':'pointer',
+                      fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
+                    {isDeploying ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Deploying…</> : <><Rocket size={12}/> Deploy</>}
+                  </button>
+                  {dep?.status==='success' && (
+                    <button style={{ padding:'8px 12px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:12 }}>
+                      <RotateCcw size={12}/>
+                    </button>
+                  )}
+                </div>
+              </Card>
+            );
+          })}
+        </div>
+
+        {/* Deployment history */}
+        {deployments.length > 0 && (
+          <div style={{ marginTop:28 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:700, color:'#e8eaf0', marginBottom:14 }}>Deployment History</h3>
+            <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+              {deployments.slice(0,10).map(d=>(
+                <div key={d.id} style={{ display:'flex', alignItems:'center', gap:12, padding:'10px 14px',
+                  background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.06)', borderRadius:7,
+                  fontFamily:"'IBM Plex Mono',monospace", fontSize:12 }}>
+                  <span style={{ color:d.status==='success'?'#00e5a0':d.status==='failed'?'#ff4455':'#f5c542' }}>
+                    {d.status==='success'?'✔':d.status==='failed'?'✖':'⏳'}
+                  </span>
+                  <span style={{ color:'#8892a4', flex:1 }}>build {d.build_id?.slice(0,8)} → {d.environment_id?.slice(0,8)}</span>
+                  <span style={{ color:'#545f72' }}>{d.strategy}</span>
+                  <span style={{ color:'#545f72' }}>{new Date(d.created_at).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /* ── Notifications View ───────────────────────────────────────────────────── */
+
+
+  /* ── notifications ─────────────────────────────────────────────────────── */
+  const NotificationsView = () => {
+    const [channels, setChannels] = useState<any[]>([]);
+    const [showAdd, setShowAdd] = useState(false);
+    const [platform, setPlatform] = useState('slack');
+    const [chName, setChName] = useState('');
+    const [webhookURL, setWebhookURL] = useState('');
+    const [onSuccess, setOnSuccess] = useState(true);
+    const [onFailure, setOnFailure] = useState(true);
+    const [onCancel, setOnCancel] = useState(false);
+    const [aiMsg, setAiMsg] = useState(false);
+    const [preview, setPreview] = useState('');
+    const [previewing, setPreviewing] = useState(false);
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`).then(r=>r.json()).then(d=>setChannels(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id]);
+
+    const PLATFORMS = [
+      { id:'slack', name:'Slack', color:'#e01e5a', desc:'Channel webhook messages with rich build status' },
+      { id:'teams', name:'Microsoft Teams', color:'#6264a7', desc:'Adaptive cards with status, PR link, actions' },
+      { id:'jira', name:'Jira', color:'#0052cc', desc:'Auto-comment on linked issues with build status' },
+      { id:'azuredevops', name:'Azure DevOps', color:'#0078d4', desc:'Update work items with build links and comments' },
+      { id:'discord', name:'Discord', color:'#5865f2', desc:'Embedded messages with color-coded status' },
+      { id:'webhook', name:'Custom Webhook', color:'#545f72', desc:'POST JSON payload to any URL' },
+    ];
+
+    const generatePreview = async () => {
+      if (!sel) return;
+      setPreviewing(true);
+      try {
+        const r = await fetch('http://localhost:8080/api/v1/ai/notification-preview', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, build_num:42, status:'success', branch:'main',
+            project_name: sel.name, version_tag:'v1.2.3', duration_ms:45000 })
+        });
+        if(r.ok){ const d=await r.json(); setPreview(d.message||''); }
+      } catch{}
+      setPreviewing(false);
+    };
+
+    const save = async () => {
+      if (!sel || !chName) return;
+      setSaving(true);
+      const config: Record<string,string> = {};
+      if (platform==='slack'||platform==='teams'||platform==='discord') config.webhook_url = webhookURL;
+      else if (platform==='webhook') config.url = webhookURL;
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ platform, name:chName, enabled:true, config, on_success:onSuccess, on_failure:onFailure, on_cancel:onCancel, ai_message:aiMsg })
+      });
+      if(r.ok){ const d=await r.json(); setChannels(c=>[...c,d]); setShowAdd(false); setChName(''); setWebhookURL(''); }
+      setSaving(false);
+    };
+
+    const del = async (id: string) => {
+      await fetch(`http://localhost:8080/api/v1/notifications/${id}`, {method:'DELETE'});
+      setChannels(c=>c.filter(x=>x.id!==id));
+    };
+
+    const pInfo = PLATFORMS.find(p=>p.id===platform);
+
+    return (
+      <div style={{ padding:28, maxWidth:720 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+          <div>
+            <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Notifications</h2>
+            <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif", margin:'4px 0 0' }}>Post-pipeline notifications to your team channels</p>
+          </div>
+          <button onClick={()=>setShowAdd(s=>!s)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 16px', background:'rgba(245,197,66,0.1)', border:'1px solid rgba(245,197,66,0.25)',
+            borderRadius:7, color:'#f5c542', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+            <Plus size={14}/> Add Channel
+          </button>
+        </div>
+
+        {/* Add channel form */}
+        {showAdd && (
+          <Card style={{ marginBottom:20 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>New Notification Channel</div>
+
+            {/* Platform picker */}
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:6, marginBottom:16 }}>
+              {PLATFORMS.map(p=>(
+                <button key={p.id} onClick={()=>setPlatform(p.id)}
+                  style={{ padding:'8px 10px', borderRadius:7, cursor:'pointer', textAlign:'left',
+                    background: platform===p.id?`${p.color}15`:'transparent',
+                    border:`1px solid ${platform===p.id?p.color+'50':'rgba(255,255,255,0.08)'}` }}>
+                  <div style={{ fontSize:12, fontWeight:600, color: platform===p.id?p.color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{p.name}</div>
+                </button>
+              ))}
+            </div>
+
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:14, fontFamily:"'Figtree',sans-serif" }}>{pInfo?.desc}</div>
+
+            {[['Channel Name','text',chName,(v:string)=>setChName(v),'e.g. #builds'],
+              ['Webhook URL','password',webhookURL,(v:string)=>setWebhookURL(v),'https://hooks.slack.com/…']].map(([label,type,val,setter,ph])=>(
+              <div key={String(label)} style={{ marginBottom:12 }}>
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{String(label)}</div>
+                <input type={String(type)} value={String(val)} onChange={e=>(setter as Function)(e.target.value)} placeholder={String(ph)}
+                  style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6,
+                    padding:'8px 12px', color:'#e8eaf0', fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+              </div>
+            ))}
+
+            <div style={{ display:'flex', gap:16, marginBottom:14 }}>
+              {[['on_success','On success',onSuccess,setOnSuccess],['on_failure','On failure',onFailure,setOnFailure],
+                ['on_cancel','On cancel',onCancel,setOnCancel],['ai_message','AI-written message',aiMsg,setAiMsg]].map(([k,label,val,setter])=>(
+                <label key={String(k)} style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer' }}>
+                  <input type="checkbox" checked={Boolean(val)} onChange={e=>(setter as Function)(e.target.checked)}/>
+                  <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{String(label)}</span>
+                </label>
+              ))}
+            </div>
+
+            {/* AI Preview */}
+            <div style={{ marginBottom:14 }}>
+              <button onClick={generatePreview} disabled={previewing} style={{ padding:'6px 14px',
+                background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
+                borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif",
+                display:'flex', alignItems:'center', gap:6 }}>
+                {previewing ? <Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> : <Sparkles size={12}/>}
+                {previewing ? 'Generating…' : 'AI Message Preview'}
+              </button>
+              {preview && (
+                <div style={{ marginTop:8, padding:'10px 14px', background:'rgba(255,255,255,0.03)',
+                  border:'1px solid rgba(255,255,255,0.08)', borderRadius:6,
+                  fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#e8eaf0', whiteSpace:'pre-wrap' }}>
+                  {preview}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>setShowAdd(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+              <button onClick={save} disabled={saving} style={{ flex:2, padding:'8px', background:'#f5c542', border:'none', borderRadius:6, color:'#000', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
+                {saving ? 'Saving…' : 'Save Channel'}
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {/* Channel list */}
+        {channels.length === 0 && !showAdd ? (
+          <div style={{ textAlign:'center', padding:'48px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
+            <Bell size={32} style={{ opacity:0.3, marginBottom:12 }}/>
+            <div style={{ fontSize:14 }}>No notification channels yet</div>
+            <div style={{ fontSize:12, marginTop:4 }}>Add Slack, Teams, Jira, or Azure DevOps to get post-build notifications</div>
+          </div>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+            {channels.map(ch=>{
+              const pDef = PLATFORMS.find(p=>p.id===ch.platform);
+              return (
+                <Card key={ch.id}>
+                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+                      <div style={{ width:36, height:36, borderRadius:8, background:`${pDef?.color||'#545f72'}20`,
+                        display:'flex', alignItems:'center', justifyContent:'center',
+                        border:`1px solid ${pDef?.color||'#545f72'}40` }}>
+                        <Bell size={15} color={pDef?.color||'#545f72'}/>
+                      </div>
+                      <div>
+                        <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:600, color:'#fff' }}>{ch.name}</div>
+                        <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
+                          {ch.platform} · {[ch.on_success&&'✔ success',ch.on_failure&&'✖ fail',ch.ai_message&&'✦ AI'].filter(Boolean).join(' · ')}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                      <span style={{ width:7, height:7, borderRadius:'50%', background: ch.enabled?'#00e5a0':'#545f72', display:'inline-block' }}/>
+                      <button onClick={()=>del(ch.id)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', lineHeight:0 }}><Trash2 size={13}/></button>
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /* ── Versions View ────────────────────────────────────────────────────────── */
+
+
+  /* ── versions ──────────────────────────────────────────────────────────── */
+  const VersionsView = () => {
+    const [versions, setVersions] = useState<any[]>([]);
+    const [showManual, setShowManual] = useState(false);
+    const [bumpType, setBumpType] = useState('patch');
+    const [changelog, setChangelog] = useState('');
+    const [aiAdvice, setAiAdvice] = useState<{bump:string;reason:string}|null>(null);
+    const [advising, setAdvising] = useState(false);
+
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/versions`).then(r=>r.json()).then(d=>setVersions(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id]);
+
+    const askAI = async () => {
+      if(!sel) return;
+      setAdvising(true);
+      try {
+        const r = await fetch('http://localhost:8080/api/v1/ai/version-bump', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ project_id:sel.id, commits:[], changelog })
+        });
+        if(r.ok){ const d=await r.json(); setAiAdvice(d); setBumpType(d.bump||'patch'); }
+      } catch{}
+      setAdvising(false);
+    };
+
+    const createVersion = async () => {
+      if(!sel||builds.length===0) return;
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/versions`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ build_id:builds[0].id, bump_type:bumpType, changelog })
+      });
+      if(r.ok){ const d=await r.json(); setVersions(v=>[d,...v]); setShowManual(false); }
+    };
+
+    const BUMP_COLORS: Record<string,string> = { major:'#ff4455', minor:'#f5c542', patch:'#00e5a0' };
+
+    return (
+      <div style={{ padding:28, maxWidth:720 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+          <div>
+            <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Version History</h2>
+            <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif", margin:'4px 0 0' }}>Semantic versions auto-created on every successful build</p>
+          </div>
+          <button onClick={()=>setShowManual(s=>!s)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 16px', background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
+            borderRadius:7, color:'#a078ff', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+            <Tag size={14}/> Manual Version
+          </button>
+        </div>
+
+        {/* Manual version form */}
+        {showManual && (
+          <Card style={{ marginBottom:20 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>Create Version</div>
+
+            <div style={{ marginBottom:14 }}>
+              <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>Bump Type</div>
+              <div style={{ display:'flex', gap:8 }}>
+                {['patch','minor','major'].map(t=>(
+                  <button key={t} onClick={()=>setBumpType(t)} style={{ flex:1, padding:'8px', borderRadius:6, cursor:'pointer',
+                    background: bumpType===t?`${BUMP_COLORS[t]}15`:'transparent',
+                    border:`1px solid ${bumpType===t?BUMP_COLORS[t]+'50':'rgba(255,255,255,0.08)'}`,
+                    color: bumpType===t?BUMP_COLORS[t]:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ marginBottom:14 }}>
+              <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Changelog (optional)</div>
+              <textarea value={changelog} onChange={e=>setChangelog(e.target.value)} rows={4} placeholder="## Changes&#10;- Fixed login bug&#10;- Added dark mode"
+                style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6,
+                  padding:'8px 12px', color:'#e8eaf0', fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none', resize:'vertical' }}/>
+            </div>
+
+            {/* AI advice */}
+            <div style={{ marginBottom:14 }}>
+              <button onClick={askAI} disabled={advising} style={{ padding:'6px 14px',
+                background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
+                borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif",
+                display:'flex', alignItems:'center', gap:6 }}>
+                {advising ? <Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> : <Sparkles size={12}/>}
+                {advising ? 'Analyzing…' : 'Ask AI: What should we bump?'}
+              </button>
+              {aiAdvice && (
+                <div style={{ marginTop:8, padding:'10px 14px', background:`${BUMP_COLORS[aiAdvice.bump]}10`,
+                  border:`1px solid ${BUMP_COLORS[aiAdvice.bump]}30`, borderRadius:6 }}>
+                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600, color:BUMP_COLORS[aiAdvice.bump], marginBottom:4 }}>
+                    ✦ AI recommends: {aiAdvice.bump} bump
+                  </div>
+                  <div style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{aiAdvice.reason}</div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>setShowManual(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+              <button onClick={createVersion} disabled={builds.length===0} style={{ flex:2, padding:'8px', background:'#a078ff', border:'none', borderRadius:6, color:'#fff', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
+                Create {bumpType} version
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {/* Version timeline */}
+        {versions.length === 0 ? (
+          <div style={{ textAlign:'center', padding:'48px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
+            <Tag size={32} style={{ opacity:0.3, marginBottom:12 }}/>
+            <div style={{ fontSize:14 }}>No versions yet</div>
+            <div style={{ fontSize:12, marginTop:4 }}>Versions are auto-created after every successful build</div>
+          </div>
+        ) : (
+          <div style={{ position:'relative' }}>
+            <div style={{ position:'absolute', left:15, top:0, bottom:0, width:1, background:'rgba(255,255,255,0.07)' }}/>
+            {versions.map((v,i)=>(
+              <div key={v.id} style={{ display:'flex', gap:16, marginBottom:16 }}>
+                <div style={{ width:30, height:30, borderRadius:'50%', background:`${BUMP_COLORS[v.bump_type]||'#545f72'}20`,
+                  border:`2px solid ${BUMP_COLORS[v.bump_type]||'#545f72'}`,
+                  display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, zIndex:1 }}>
+                  <Tag size={12} color={BUMP_COLORS[v.bump_type]||'#545f72'}/>
+                </div>
+                <Card style={{ flex:1, borderLeft:`3px solid ${BUMP_COLORS[v.bump_type]||'#545f72'}` }}>
+                  <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:6 }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                      <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:16, fontWeight:700, color:'#fff' }}>{v.tag}</span>
+                      <span style={{ fontSize:10, padding:'2px 8px', borderRadius:4,
+                        background:`${BUMP_COLORS[v.bump_type]||'#545f72'}20`,
+                        color:BUMP_COLORS[v.bump_type]||'#545f72',
+                        fontFamily:"'IBM Plex Mono',monospace", fontWeight:600 }}>{v.bump_type}</span>
+                      {v.git_tagged && <span style={{ fontSize:10, color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>⬧ git tagged</span>}
+                    </div>
+                    <span style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
+                      {new Date(v.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                  {v.bump_reason && <div style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif", marginBottom:6 }}>{v.bump_reason}</div>}
+                  {v.changelog && (
+                    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72',
+                      background:'rgba(255,255,255,0.02)', borderRadius:5, padding:'8px 10px', whiteSpace:'pre-wrap' }}>
+                      {v.changelog.slice(0,200)}{v.changelog.length>200?'…':''}
+                    </div>
+                  )}
+                </Card>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /* ── render ───────────────────────────────────────────────────────────────── */
+  const main = () => {
+
 
   /* ── AI panel ─────────────────────────────────────────────────────────────── */
   function AiPanel() {
@@ -1917,6 +2576,9 @@ export default function App() {
     if (view === 'llm-config') return <LLMConfigView/>;
     if (view === 'secrets')    return <Secrets/>;
     if (view === 'settings')   return <SettingsView/>;
+    if (view === 'environments')  return <EnvironmentsView/>;
+    if (view === 'notifications') return <NotificationsView/>;
+    if (view === 'versions')      return <VersionsView/>;
     if (!sel) return <Welcome/>;
     switch(view) {
       case 'dashboard': return <Dashboard/>;
@@ -1953,4 +2615,4 @@ export default function App() {
       </div>
     </>
   );
-}
+}}
