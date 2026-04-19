@@ -3,9 +3,14 @@ package config
 import (
 	"os"
 	"strconv"
+	"sync"
 )
 
+// Config holds all runtime configuration.
+// Access must go through the getter/setter methods to avoid data races (004).
 type Config struct {
+	mu sync.RWMutex // protects all fields below
+
 	Port        string
 	DBPath      string
 	JWTSecret   string
@@ -32,6 +37,10 @@ type Config struct {
 	// Feature flags
 	TelemetryEnabled bool
 	DevMode          bool
+
+	// API token for simple authentication (001)
+	// Set via CALLAHAN_API_TOKEN env var. Empty = auth disabled (dev convenience).
+	APIToken string
 }
 
 func Load() *Config {
@@ -54,8 +63,28 @@ func Load() *Config {
 		GitLabClientSecret: getEnv("GITLAB_CLIENT_SECRET", ""),
 		TelemetryEnabled:   getBoolEnv("TELEMETRY_ENABLED", false),
 		DevMode:            getBoolEnv("DEV_MODE", false),
+		APIToken:           getEnv("CALLAHAN_API_TOKEN", ""),
 	}
 }
+
+// ─── Thread-safe getters/setters for mutable fields (004) ────────────────────
+
+func (c *Config) GetDefaultLLMProvider() string { c.mu.RLock(); defer c.mu.RUnlock(); return c.DefaultLLMProvider }
+func (c *Config) GetDefaultLLMModel() string    { c.mu.RLock(); defer c.mu.RUnlock(); return c.DefaultLLMModel }
+func (c *Config) GetAnthropicKey() string       { c.mu.RLock(); defer c.mu.RUnlock(); return c.AnthropicKey }
+func (c *Config) GetOpenAIKey() string          { c.mu.RLock(); defer c.mu.RUnlock(); return c.OpenAIKey }
+func (c *Config) GetGroqKey() string            { c.mu.RLock(); defer c.mu.RUnlock(); return c.GroqKey }
+func (c *Config) GetGoogleKey() string          { c.mu.RLock(); defer c.mu.RUnlock(); return c.GoogleKey }
+func (c *Config) GetOllamaURL() string          { c.mu.RLock(); defer c.mu.RUnlock(); return c.OllamaURL }
+func (c *Config) GetAPIToken() string           { c.mu.RLock(); defer c.mu.RUnlock(); return c.APIToken }
+
+func (c *Config) SetLLMProvider(v string) { c.mu.Lock(); defer c.mu.Unlock(); c.DefaultLLMProvider = v }
+func (c *Config) SetLLMModel(v string)    { c.mu.Lock(); defer c.mu.Unlock(); c.DefaultLLMModel = v }
+func (c *Config) SetAnthropicKey(v string){ c.mu.Lock(); defer c.mu.Unlock(); c.AnthropicKey = v }
+func (c *Config) SetOpenAIKey(v string)   { c.mu.Lock(); defer c.mu.Unlock(); c.OpenAIKey = v }
+func (c *Config) SetGroqKey(v string)     { c.mu.Lock(); defer c.mu.Unlock(); c.GroqKey = v }
+func (c *Config) SetGoogleKey(v string)   { c.mu.Lock(); defer c.mu.Unlock(); c.GoogleKey = v }
+func (c *Config) SetOllamaURL(v string)   { c.mu.Lock(); defer c.mu.Unlock(); c.OllamaURL = v }
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {

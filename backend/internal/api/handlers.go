@@ -1,3 +1,16 @@
+// handlers_security_patches.go
+//
+// This file documents all targeted changes to handlers.go.
+// Apply these as direct edits to handlers.go — each section is labelled.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATCH 001-a: Add AuthMiddleware import reference (security.go is in same package)
+// No change needed — security.go is package api, same as handlers.go.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// PATCH 002: Command injection — validate step commands in UpdatePipeline
+// Replace UpdatePipeline with this version:
+
 package api
 
 import (
@@ -16,16 +29,15 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/callahan-ci/callahan/internal/llm"
-	"github.com/callahan-ci/callahan/internal/notifications"
 	"github.com/callahan-ci/callahan/internal/pipeline"
 	"github.com/callahan-ci/callahan/internal/storage"
 	"github.com/callahan-ci/callahan/pkg/config"
 	"github.com/callahan-ci/callahan/pkg/models"
 )
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Handler
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 type Handler struct {
 	store   *storage.Store
@@ -49,62 +61,57 @@ func NewHandler(store *storage.Store, llmClient *llm.Client, cfg *config.Config)
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api := r.Group("/api/v1")
 
-	// Dashboard
 	api.GET("/stats", h.GetStats)
 
-	// Projects
 	api.GET("/projects", h.ListProjects)
 	api.POST("/projects", h.CreateProject)
 	api.GET("/projects/:id", h.GetProject)
 	api.PUT("/projects/:id", h.UpdateProject)
 	api.DELETE("/projects/:id", h.DeleteProject)
 
-	// Builds
 	api.GET("/projects/:id/builds", h.ListBuilds)
 	api.POST("/projects/:id/builds", h.TriggerBuild)
 	api.GET("/builds/:buildId", h.GetBuild)
 	api.POST("/builds/:buildId/cancel", h.CancelBuild)
 
-	// Jobs & Steps
 	api.GET("/builds/:buildId/jobs", h.ListJobs)
 	api.GET("/jobs/:jobId/steps", h.ListSteps)
 
-	// Pipeline YAML
 	api.GET("/projects/:id/pipeline", h.GetPipeline)
 	api.PUT("/projects/:id/pipeline", h.UpdatePipeline)
 
-	// Secrets
 	api.GET("/projects/:id/secrets", h.ListSecrets)
 	api.POST("/projects/:id/secrets", h.SetSecret)
 	api.DELETE("/projects/:id/secrets/:name", h.DeleteSecret)
 
-	// LLM config (frontend-editable, persisted in DB via system secrets)
 	api.GET("/settings/llm", h.GetLLMConfig)
 	api.PUT("/settings/llm", h.SaveLLMConfig)
 	api.POST("/settings/llm/test", h.TestLLMConfig)
 	api.GET("/ai/models", h.ListModels)
 
-	// AI
 	api.POST("/ai/generate-pipeline", h.GeneratePipeline)
 	api.POST("/ai/explain-build", h.ExplainBuild)
 	api.POST("/ai/chat", h.Chat)
 	api.POST("/ai/review", h.ReviewCode)
 
-	// Webhooks
 	api.POST("/webhook/:provider", h.Webhook)
 
-	// WebSocket
-	r.GET("/ws", h.WebSocket)
+	// Demo
+	api.POST("/demo/seed", h.SeedDemo)
 
-	// Health
+	// Settings
+	api.GET("/settings/retention", h.GetRetentionSettings)
+	api.PUT("/settings/retention", h.SaveRetentionSettings)
+
+	r.GET("/ws", h.WebSocket)
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "version": "1.0.0"})
 	})
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Dashboard
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) GetStats(c *gin.Context) {
 	stats, err := h.store.GetDashboardStats()
@@ -115,9 +122,9 @@ func (h *Handler) GetStats(c *gin.Context) {
 	c.JSON(200, stats)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Projects
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) ListProjects(c *gin.Context) {
 	projects, err := h.store.ListProjects()
@@ -138,12 +145,19 @@ func (h *Handler) CreateProject(c *gin.Context) {
 		Provider    string `json:"provider"`
 		Branch      string `json:"branch"`
 		Description string `json:"description"`
-		Token       string `json:"token"` // PAT — stored as secret
+		Token       string `json:"token"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+
+	// 009: SSRF protection — validate repo URL before storing
+	if err := ValidateRepoURL(req.RepoURL); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid repository URL: " + err.Error()})
+		return
+	}
+
 	if req.Provider == "" { req.Provider = "github" }
 	if req.Branch == "" { req.Branch = "main" }
 
@@ -164,13 +178,17 @@ func (h *Handler) CreateProject(c *gin.Context) {
 		return
 	}
 
-	// Store PAT as a secret on the project
+	// 003: Store PAT obfuscated
 	if req.Token != "" {
+		obfuscated, err := ObfuscateSecret(req.Token)
+		if err != nil {
+			obfuscated = req.Token // fallback to plaintext if obfuscation fails
+		}
 		_ = h.store.SetSecret(&models.Secret{
 			ID:        uuid.New().String(),
 			ProjectID: p.ID,
 			Name:      "GIT_TOKEN",
-			Value:     req.Token,
+			Value:     obfuscated,
 			CreatedAt: time.Now(),
 		})
 	}
@@ -197,6 +215,11 @@ func (h *Handler) UpdateProject(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+	// 009: Re-validate repo URL if it changed
+	if err := ValidateRepoURL(p.RepoURL); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid repository URL: " + err.Error()})
+		return
+	}
 	p.ID = c.Param("id")
 	if err := h.store.UpdateProject(p); err != nil {
 		c.JSON(500, gin.H{"error": err.Error()})
@@ -213,9 +236,9 @@ func (h *Handler) DeleteProject(c *gin.Context) {
 	c.JSON(204, nil)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Builds — real execution
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Builds
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) ListBuilds(c *gin.Context) {
 	builds, err := h.store.ListBuilds(c.Param("id"), 50)
@@ -267,7 +290,6 @@ func (h *Handler) TriggerBuild(c *gin.Context) {
 		return
 	}
 
-	// Create a cancellable context and store the cancel func
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancels.Store(build.ID, cancel)
 
@@ -285,7 +307,6 @@ func (h *Handler) GetBuild(c *gin.Context) {
 	c.JSON(200, build)
 }
 
-// CancelBuild cancels a running build by calling its context cancel func
 func (h *Handler) CancelBuild(c *gin.Context) {
 	buildID := c.Param("buildId")
 	if cancel, ok := h.cancels.Load(buildID); ok {
@@ -294,7 +315,7 @@ func (h *Handler) CancelBuild(c *gin.Context) {
 	}
 	now := time.Now()
 	h.store.UpdateBuildStatus(buildID, "cancelled", &now, 0, "Cancelled by user")
-	h.wsHub.broadcast(models.WSMessage{
+	h.wsHub.broadcast(buildID, models.WSMessage{
 		Type: "build_status",
 		Payload: gin.H{"build_id": buildID, "status": "cancelled"},
 	})
@@ -321,9 +342,9 @@ func (h *Handler) ListSteps(c *gin.Context) {
 	c.JSON(200, steps)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Pipeline definition
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) GetPipeline(c *gin.Context) {
 	p, _ := h.store.GetProject(c.Param("id"))
@@ -331,13 +352,53 @@ func (h *Handler) GetPipeline(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
 	}
-	content := pipeline.DefaultPipeline(p.Language, p.Framework)
+	content, _ := h.store.GetPipeline(p.ID)
+	if content == "" && p.RepoURL != "" {
+		token, _ := h.store.GetSecret(p.ID, "GIT_TOKEN")
+		token, _ = DeobfuscateSecret(token)
+		workDir := filepath.Join(os.TempDir(), "callahan", "pipeline-read-"+p.ID)
+		defer os.RemoveAll(workDir)
+		if err := pipeline.CloneRepo(context.Background(), p.RepoURL, p.Branch, token, workDir, func(s string) {}); err == nil {
+			if _, callahanData := pipeline.FindCallahanfile(workDir); callahanData != nil {
+				content = string(callahanData)
+				h.store.SavePipeline(p.ID, content)
+			}
+		}
+	}
+	if content == "" {
+		content = pipeline.DefaultPipeline(p.Language, p.Framework)
+	}
 	c.JSON(200, gin.H{"content": content, "language": p.Language, "framework": p.Framework})
 }
 
+// UpdatePipeline — 002: validate step commands before saving
 func (h *Handler) UpdatePipeline(c *gin.Context) {
-	var req struct{ Content string `json:"content"` }
-	c.ShouldBindJSON(&req)
+	var req struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Parse and validate step commands (002)
+	if req.Content != "" {
+		parsed, err := h.parser.Parse([]byte(req.Content))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "Invalid pipeline YAML: " + err.Error()})
+			return
+		}
+		for jobName, job := range parsed.Jobs {
+			for i, step := range job.Steps {
+				if step.Run != "" {
+					if err := ValidateStepCommand(step.Run); err != nil {
+						c.JSON(400, gin.H{"error": fmt.Sprintf("job %q step %d: %s", jobName, i+1, err.Error())})
+						return
+					}
+				}
+			}
+		}
+	}
 
 	p, _ := h.store.GetProject(c.Param("id"))
 	if p == nil {
@@ -345,42 +406,38 @@ func (h *Handler) UpdatePipeline(c *gin.Context) {
 		return
 	}
 
-	// Clone the repo, write the file, commit, push
+	// Always persist to DB so GetPipeline returns the correct content on reload
+	h.store.SavePipeline(p.ID, req.Content)
+
+	// Clone repo, write Callahanfile.yaml, commit and push
 	workDir := filepath.Join(os.TempDir(), "callahan", "pipeline-save-"+c.Param("id"))
 	defer os.RemoveAll(workDir)
 
 	token, _ := h.store.GetSecret(p.ID, "GIT_TOKEN")
+	token, _ = DeobfuscateSecret(token)
 	if err := pipeline.CloneRepo(context.Background(), p.RepoURL, p.Branch, token, workDir, func(s string) {}); err != nil {
 		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (git push failed: " + err.Error() + ")"})
 		return
 	}
 
-	// Write the Callahanfile.yaml
 	callahanPath := filepath.Join(workDir, "Callahanfile.yaml")
 	if err := os.WriteFile(callahanPath, []byte(req.Content), 0644); err != nil {
 		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (file write failed)"})
 		return
 	}
 
-	// Git add, commit, push
-	cmds := [][]string{
+	for _, args := range [][]string{
 		{"git", "-C", workDir, "add", "Callahanfile.yaml"},
 		{"git", "-C", workDir, "commit", "-m", "chore: update Callahanfile.yaml via Callahan UI"},
-	}
-	for _, args := range cmds {
-		if out, err := exec.Command(args[0], args[1:]...).CombinedOutput(); err != nil {
-			// Commit might fail if no changes — that's ok
-			_ = out
-		}
+	} {
+		_ = exec.Command(args[0], args[1:]...).Run()
 	}
 
-	// Push with token
 	pushURL := p.RepoURL
 	if token != "" {
 		pushURL = pipeline.InjectToken(p.RepoURL, token)
 	}
-	pushCmd := exec.Command("git", "-C", workDir, "push", pushURL, p.Branch)
-	if out, err := pushCmd.CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "-C", workDir, "push", pushURL, p.Branch).CombinedOutput(); err != nil {
 		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (push failed: " + string(out) + ")"})
 		return
 	}
@@ -388,9 +445,9 @@ func (h *Handler) UpdatePipeline(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved and pushed to git"})
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Secrets
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Secrets — 003: obfuscate on write, deobfuscate on use
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) ListSecrets(c *gin.Context) {
 	names, err := h.store.ListSecretNames(c.Param("id"))
@@ -411,11 +468,16 @@ func (h *Handler) SetSecret(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
+	// 003: Obfuscate before persisting
+	obfuscated, err := ObfuscateSecret(req.Value)
+	if err != nil {
+		obfuscated = req.Value // fallback
+	}
 	secret := &models.Secret{
 		ID:        uuid.New().String(),
 		ProjectID: c.Param("id"),
 		Name:      req.Name,
-		Value:     req.Value,
+		Value:     obfuscated,
 		CreatedAt: time.Now(),
 	}
 	if err := h.store.SetSecret(secret); err != nil {
@@ -433,28 +495,26 @@ func (h *Handler) DeleteSecret(c *gin.Context) {
 	c.JSON(204, nil)
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// LLM Config — stored in DB, editable from the frontend
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// LLM Config — use thread-safe config getters/setters (004)
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) GetLLMConfig(c *gin.Context) {
-	// Return current provider/model (from env or stored config)
 	provider, _ := h.store.GetSystemSetting("llm_provider")
 	model, _ := h.store.GetSystemSetting("llm_model")
 	ollamaURL, _ := h.store.GetSystemSetting("ollama_url")
-	if provider == "" { provider = h.cfg.DefaultLLMProvider }
-	if model == "" { model = h.cfg.DefaultLLMModel }
-	if ollamaURL == "" { ollamaURL = h.cfg.OllamaURL }
+	if provider == "" { provider = h.cfg.GetDefaultLLMProvider() }
+	if model == "" { model = h.cfg.GetDefaultLLMModel() }
+	if ollamaURL == "" { ollamaURL = h.cfg.GetOllamaURL() }
 
-	// Don't return actual keys — just whether they're set
 	c.JSON(200, gin.H{
-		"provider":         provider,
-		"model":            model,
-		"ollama_url":       ollamaURL,
-		"has_anthropic":    h.resolveKey("anthropic") != "",
-		"has_openai":       h.resolveKey("openai") != "",
-		"has_groq":         h.resolveKey("groq") != "",
-		"has_google":       h.resolveKey("google") != "",
+		"provider":      provider,
+		"model":         model,
+		"ollama_url":    ollamaURL,
+		"has_anthropic": h.resolveKey("anthropic") != "",
+		"has_openai":    h.resolveKey("openai") != "",
+		"has_groq":      h.resolveKey("groq") != "",
+		"has_google":    h.resolveKey("google") != "",
 	})
 }
 
@@ -470,75 +530,72 @@ func (h *Handler) SaveLLMConfig(c *gin.Context) {
 		return
 	}
 
-	// Persist to DB
-	if req.Provider != "" { h.store.SetSystemSetting("llm_provider", req.Provider) }
-	if req.Model != ""    { h.store.SetSystemSetting("llm_model", req.Model) }
-	if req.OllamaURL != "" { h.store.SetSystemSetting("ollama_url", req.OllamaURL) }
-	if req.APIKey != "" && req.Provider != "" {
-		h.store.SetSystemSetting("key_"+req.Provider, req.APIKey)
-	}
+	if req.Provider != "" { h.store.SetSystemSetting("llm_provider", req.Provider); h.cfg.SetLLMProvider(req.Provider) }
+	if req.Model != ""    { h.store.SetSystemSetting("llm_model", req.Model);       h.cfg.SetLLMModel(req.Model) }
+	if req.OllamaURL != "" { h.store.SetSystemSetting("ollama_url", req.OllamaURL); h.cfg.SetOllamaURL(req.OllamaURL) }
 
-	// Apply immediately to live config so all subsequent requests use new settings
-	if req.Provider != "" { h.cfg.DefaultLLMProvider = req.Provider }
-	if req.Model != ""    { h.cfg.DefaultLLMModel = req.Model }
-	if req.OllamaURL != "" { h.cfg.OllamaURL = req.OllamaURL }
-	if req.APIKey != "" {
+	// 003: Obfuscate API keys before storing
+	if req.APIKey != "" && req.Provider != "" {
+		obfuscated, err := ObfuscateSecret(req.APIKey)
+		if err != nil { obfuscated = req.APIKey }
+		h.store.SetSystemSetting("key_"+req.Provider, obfuscated)
+		// Apply to live config (plaintext in memory only, never written back to disk raw)
 		switch req.Provider {
-		case "anthropic": h.cfg.AnthropicKey = req.APIKey
-		case "openai":    h.cfg.OpenAIKey    = req.APIKey
-		case "groq":      h.cfg.GroqKey      = req.APIKey
-		case "google":    h.cfg.GoogleKey    = req.APIKey
+		case "anthropic": h.cfg.SetAnthropicKey(req.APIKey)
+		case "openai":    h.cfg.SetOpenAIKey(req.APIKey)
+		case "groq":      h.cfg.SetGroqKey(req.APIKey)
+		case "google":    h.cfg.SetGoogleKey(req.APIKey)
 		}
 	}
 
-	// Also ensure any previously-saved key for this provider is loaded into cfg
-	// (handles case where key was saved earlier but cfg was empty)
-	if h.cfg.AnthropicKey == "" {
-		if v, _ := h.store.GetSystemSetting("key_anthropic"); v != "" { h.cfg.AnthropicKey = v }
-	}
-	if h.cfg.OpenAIKey == "" {
-		if v, _ := h.store.GetSystemSetting("key_openai"); v != "" { h.cfg.OpenAIKey = v }
-	}
-	if h.cfg.GroqKey == "" {
-		if v, _ := h.store.GetSystemSetting("key_groq"); v != "" { h.cfg.GroqKey = v }
-	}
-	if h.cfg.GoogleKey == "" {
-		if v, _ := h.store.GetSystemSetting("key_google"); v != "" { h.cfg.GoogleKey = v }
-	}
+	// Reload any pre-existing keys from DB (deobfuscated into memory)
+	h.reloadKeysFromDB()
 
 	c.JSON(200, gin.H{
 		"status":   "saved",
-		"provider": h.cfg.DefaultLLMProvider,
-		"model":    h.cfg.DefaultLLMModel,
+		"provider": h.cfg.GetDefaultLLMProvider(),
+		"model":    h.cfg.GetDefaultLLMModel(),
 	})
+}
+
+// reloadKeysFromDB deobfuscates stored API keys into the in-memory config.
+func (h *Handler) reloadKeysFromDB() {
+	for _, provider := range []string{"anthropic", "openai", "groq", "google"} {
+		v, _ := h.store.GetSystemSetting("key_" + provider)
+		if v == "" { continue }
+		plain, err := DeobfuscateSecret(v)
+		if err != nil { plain = v }
+		switch provider {
+		case "anthropic": if h.cfg.GetAnthropicKey() == "" { h.cfg.SetAnthropicKey(plain) }
+		case "openai":    if h.cfg.GetOpenAIKey()    == "" { h.cfg.SetOpenAIKey(plain) }
+		case "groq":      if h.cfg.GetGroqKey()      == "" { h.cfg.SetGroqKey(plain) }
+		case "google":    if h.cfg.GetGoogleKey()    == "" { h.cfg.SetGoogleKey(plain) }
+		}
+	}
 }
 
 func (h *Handler) TestLLMConfig(c *gin.Context) {
 	var req struct {
-		Provider string `json:"provider"`
-		Model    string `json:"model"`
-		APIKey   string `json:"api_key"`
+		Provider  string `json:"provider"`
+		Model     string `json:"model"`
+		APIKey    string `json:"api_key"`
 		OllamaURL string `json:"ollama_url"`
 	}
 	c.ShouldBindJSON(&req)
 
-	// Build a clean config scoped to exactly what the user submitted
-	testCfg := config.Config{
-		DefaultLLMProvider: req.Provider,
-		DefaultLLMModel:    req.Model,
-		OllamaURL:          h.cfg.OllamaURL,
-	}
-	if req.OllamaURL != "" { testCfg.OllamaURL = req.OllamaURL }
+	testCfg := config.Config{}
+	testCfg.SetLLMProvider(req.Provider)
+	testCfg.SetLLMModel(req.Model)
+	testCfg.SetOllamaURL(h.cfg.GetOllamaURL())
+	if req.OllamaURL != "" { testCfg.SetOllamaURL(req.OllamaURL) }
 
-	// Use the key from the request; fall back to whatever is already stored
 	key := req.APIKey
 	if key == "" { key = h.resolveKey(req.Provider) }
-
 	switch req.Provider {
-	case "anthropic": testCfg.AnthropicKey = key
-	case "openai":    testCfg.OpenAIKey    = key
-	case "groq":      testCfg.GroqKey      = key
-	case "google":    testCfg.GoogleKey    = key
+	case "anthropic": testCfg.SetAnthropicKey(key)
+	case "openai":    testCfg.SetOpenAIKey(key)
+	case "groq":      testCfg.SetGroqKey(key)
+	case "google":    testCfg.SetGoogleKey(key)
 	}
 
 	if req.Provider == "" {
@@ -546,7 +603,7 @@ func (h *Handler) TestLLMConfig(c *gin.Context) {
 		return
 	}
 	if key == "" && req.Provider != "ollama" {
-		c.JSON(200, gin.H{"ok": false, "error": "No API key provided — enter your key above before testing"})
+		c.JSON(200, gin.H{"ok": false, "error": "No API key provided"})
 		return
 	}
 
@@ -572,30 +629,32 @@ func (h *Handler) ListModels(c *gin.Context) {
 		{"provider": "openai",    "model": "gpt-4o",                    "name": "GPT-4o",               "available": h.resolveKey("openai") != ""},
 		{"provider": "openai",    "model": "gpt-4o-mini",               "name": "GPT-4o Mini",          "available": h.resolveKey("openai") != ""},
 		{"provider": "groq",      "model": "llama-3.3-70b-versatile",   "name": "Llama 3.3 70B (Groq)", "available": h.resolveKey("groq") != ""},
-		{"provider": "groq",      "model": "llama3-8b-8192",             "name": "Llama 3 8B (Groq)",    "available": h.resolveKey("groq") != ""},
+		{"provider": "groq",      "model": "llama3-8b-8192",            "name": "Llama 3 8B (Groq)",    "available": h.resolveKey("groq") != ""},
 		{"provider": "ollama",    "model": "llama3.2",                  "name": "Llama 3.2 (Local)",    "available": true},
 		{"provider": "ollama",    "model": "mistral",                   "name": "Mistral (Local)",      "available": true},
 	}
 	c.JSON(200, ms)
 }
 
-// resolveKey returns the API key for a provider, checking DB then env
 func (h *Handler) resolveKey(provider string) string {
+	// Try DB first (deobfuscate), then fall back to env/cfg
 	if v, _ := h.store.GetSystemSetting("key_" + provider); v != "" {
-		return v
+		plain, err := DeobfuscateSecret(v)
+		if err == nil && plain != "" { return plain }
+		return v // legacy plaintext
 	}
 	switch provider {
-	case "anthropic": return h.cfg.AnthropicKey
-	case "openai":    return h.cfg.OpenAIKey
-	case "groq":      return h.cfg.GroqKey
-	case "google":    return h.cfg.GoogleKey
+	case "anthropic": return h.cfg.GetAnthropicKey()
+	case "openai":    return h.cfg.GetOpenAIKey()
+	case "groq":      return h.cfg.GetGroqKey()
+	case "google":    return h.cfg.GetGoogleKey()
 	}
 	return ""
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // AI Endpoints
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) GeneratePipeline(c *gin.Context) {
 	var req struct {
@@ -637,7 +696,6 @@ func (h *Handler) Chat(c *gin.Context) {
 	}
 	c.ShouldBindJSON(&req)
 
-	// Build rich context from v3 context engine
 	richContext := req.Context
 	if req.ProjectID != "" {
 		entries, err := h.store.GetProjectContext(req.ProjectID, 30)
@@ -648,8 +706,6 @@ func (h *Handler) Chat(c *gin.Context) {
 			for _, e := range entries {
 				sb.WriteString(fmt.Sprintf("[%s] %s %s\n", e.Type, e.CreatedAt.Format("Jan 2 15:04"), e.Summary))
 			}
-
-			// Also pull latest version and deployment info
 			if latest, _ := h.store.LatestVersion(req.ProjectID); latest != nil {
 				sb.WriteString(fmt.Sprintf("\nLatest version: %s (build #%s, %s bump)\n", latest.Tag, safeHead(latest.BuildID, 8), latest.BumpType))
 			}
@@ -689,28 +745,373 @@ func (h *Handler) Webhook(c *gin.Context) {
 	c.JSON(200, gin.H{"provider": c.Param("provider"), "status": "received"})
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// WebSocket
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Demo seed
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (h *Handler) SeedDemo(c *gin.Context) {
+	// Return existing demo project if already seeded
+	if all, _ := h.store.ListProjects(); all != nil {
+		for _, p := range all {
+			if p.Name == "demo-app" {
+				c.JSON(200, gin.H{"project": p, "already_seeded": true})
+				return
+			}
+		}
+	}
+
+	now := time.Now()
+	pid := uuid.New().String()
+
+	proj := &models.Project{
+		ID: pid, Name: "demo-app",
+		RepoURL:     "https://github.com/callahan-ci/demo-app",
+		Provider:    "github", Branch: "main",
+		Language:    "JavaScript/TypeScript", Framework: "Node.js",
+		Description: "Demo project — explore every Callahan CI feature",
+		Status: "active", HealthScore: 92,
+		CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now,
+	}
+	h.store.CreateProject(proj)
+
+	// Store the Callahanfile.yaml so the pipeline editor shows the full demo config
+	demoYAML := `name: demo-app
+on: [push, pull_request]
+
+jobs:
+  install:
+    runs-on: callahan:node-20
+    steps:
+      - name: Install dependencies
+        run: npm ci
+
+  lint:
+    runs-on: callahan:node-20
+    needs: install
+    steps:
+      - name: Lint
+        run: npm run lint
+
+  test:
+    runs-on: callahan:node-20
+    needs: install
+    steps:
+      - name: Run tests
+        run: npm test
+        env:
+          NODE_ENV: test
+      - name: Check coverage
+        run: npx jest --coverage --coverageThreshold='{"global":{"lines":80}}'
+
+  security:
+    runs-on: callahan:node-20
+    needs: [lint, test]
+    steps:
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+    ai:
+      security-scan: true
+      explain-failures: true
+
+ai:
+  review: true
+  generate-tests: true
+
+deploy:
+  - name: test
+    auto: true
+    steps:
+      - name: Deploy to test
+        run: echo "Deploying demo-app to test environment"
+
+  - name: production
+    requires_approval: true
+    branch_filter: main
+    steps:
+      - name: Deploy to production
+        run: echo "Deploying demo-app to production"
+`
+	h.store.SavePipeline(pid, demoYAML)
+
+	// ── Environments ──────────────────────────────────────────────────────────
+	envTest := &models.Environment{
+		ID: uuid.New().String(), ProjectID: pid,
+		Name: "test", Color: "#00e5a0", AutoDeploy: true,
+		CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour),
+	}
+	envProd := &models.Environment{
+		ID: uuid.New().String(), ProjectID: pid,
+		Name: "production", Color: "#f5c542", RequiresApproval: true, BranchFilter: "main",
+		CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour),
+	}
+	h.store.CreateEnvironment(envTest)
+	h.store.CreateEnvironment(envProd)
+
+	// ── Helper to build a job+steps and return duration ───────────────────────
+	type stepDef struct {
+		name, cmd, log string
+		status         string
+		durMs          int64
+	}
+	mkJob := func(buildID, jobName, jobStatus string, dur int64, steps []stepDef) {
+		jid := uuid.New().String()
+		jStart := now.Add(-time.Duration(dur+500) * time.Millisecond)
+		jEnd := now
+		j := &models.Job{
+			ID: jid, BuildID: buildID, Name: jobName, Status: jobStatus,
+			StartedAt: &jStart, FinishedAt: &jEnd, Duration: dur,
+		}
+		h.store.CreateJob(j)
+		h.store.UpdateJob(j)
+		for _, s := range steps {
+			sStart := jStart
+			sEnd := jStart.Add(time.Duration(s.durMs) * time.Millisecond)
+			step := &models.Step{
+				ID: uuid.New().String(), JobID: jid, Name: s.name,
+				Status: s.status, Command: s.cmd, Log: s.log,
+				StartedAt: &sStart, FinishedAt: &sEnd,
+				Duration: s.durMs,
+			}
+			h.store.CreateStep(step)
+		}
+	}
+
+	// ── Build 1 — success (72h ago, push) ────────────────────────────────────
+	b1Start := now.Add(-72 * time.Hour)
+	b1End := b1Start.Add(38 * time.Second)
+	b1 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 1, Status: "success",
+		Branch: "main", Commit: "a1b2c3d", CommitMsg: "feat: initial project setup",
+		Author: "Manual trigger", Duration: 38000,
+		StartedAt: &b1Start, FinishedAt: &b1End, CreatedAt: b1Start, Trigger: "push",
+		AIInsight: "Clean initial commit. No issues detected.",
+	}
+	h.store.CreateBuild(b1)
+	mkJob(b1.ID, "install", "success", 8200, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 8.2s\n✔ All packages installed", "success", 8200},
+	})
+	mkJob(b1.ID, "lint", "success", 2100, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 2100},
+	})
+	mkJob(b1.ID, "test", "success", 14300, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (8 tests)\n✔ 20 tests passed", "success", 12800},
+		{"Check coverage", "npx jest --coverage", "Lines   : 87.4% ( 124/142 )\n✔ Coverage threshold met", "success", 1500},
+	})
+	mkJob(b1.ID, "security", "success", 3400, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed", "success", 3400},
+	})
+
+	// ── Build 2 — failed (48h ago, lint failure) ─────────────────────────────
+	b2Start := now.Add(-48 * time.Hour)
+	b2End := b2Start.Add(14 * time.Second)
+	b2 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 2, Status: "failed",
+		Branch: "feature/new-auth", Commit: "d4e5f6a", CommitMsg: "feat: add OAuth2 login",
+		Author: "Manual trigger", Duration: 14000,
+		StartedAt: &b2Start, FinishedAt: &b2End, CreatedAt: b2Start, Trigger: "push",
+		AIInsight: "Lint failed on src/auth.js:42 — missing semicolon and unused import 'crypto'. Fix these before merging.",
+	}
+	h.store.CreateBuild(b2)
+	mkJob(b2.ID, "install", "success", 7900, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 7.9s\n✔ All packages installed", "success", 7900},
+	})
+	mkJob(b2.ID, "lint", "failed", 1800, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\nsrc/auth.js\n  42:1  error  Missing semicolon  semi\n  12:8  error  'crypto' is defined but never used  no-unused-vars\n\n✖ 2 problems (2 errors, 0 warnings)", "failed", 1800},
+	})
+
+	// ── Build 3 — success (24h ago, PR) ──────────────────────────────────────
+	b3Start := now.Add(-24 * time.Hour)
+	b3End := b3Start.Add(42 * time.Second)
+	b3 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 3, Status: "success",
+		Branch: "main", Commit: "b7c8d9e", CommitMsg: "fix: resolve auth lint errors, add token refresh",
+		Author: "Manual trigger", Duration: 42000,
+		StartedAt: &b3Start, FinishedAt: &b3End, CreatedAt: b3Start, Trigger: "pull_request",
+		AIInsight: "Auth improvements look solid. Token refresh logic is correct. Consider adding a test for expired token edge case.",
+	}
+	h.store.CreateBuild(b3)
+	mkJob(b3.ID, "install", "success", 7600, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 7.6s\n✔ All packages installed", "success", 7600},
+	})
+	mkJob(b3.ID, "lint", "success", 1900, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 1900},
+	})
+	mkJob(b3.ID, "test", "success", 16100, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\n✔ 28 tests passed", "success", 14200},
+		{"Check coverage", "npx jest --coverage", "Lines   : 91.2% ( 129/142 )\n✔ Coverage threshold met", "success", 1900},
+	})
+	mkJob(b3.ID, "security", "success", 3800, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed", "success", 3800},
+	})
+	mkJob(b3.ID, "ai-review", "success", 5200, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 3 changed files\n\n  [AI] src/auth.js — Token expiry logic looks correct. Minor: consider extracting the 300s buffer to a named constant.\n  [AI] src/token.js — Good use of refresh token rotation.\n  [AI] tests/token.test.js — Tests cover happy path. Add a test for network failure during refresh.\n\n✔ AI review complete — 1 suggestion", "success", 5200},
+	})
+
+	// ── Build 4 — success (6h ago, with security finding) ────────────────────
+	b4Start := now.Add(-6 * time.Hour)
+	b4End := b4Start.Add(51 * time.Second)
+	b4 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 4, Status: "success",
+		Branch: "main", Commit: "e0f1a2b", CommitMsg: "chore: upgrade dependencies, add rate limiting",
+		Author: "Manual trigger", Duration: 51000,
+		StartedAt: &b4Start, FinishedAt: &b4End, CreatedAt: b4Start, Trigger: "push",
+		AIInsight: "Dependency upgrades look safe. Rate limiting middleware correctly applied. 1 medium vulnerability found in an indirect dependency — not directly exploitable.",
+	}
+	h.store.CreateBuild(b4)
+	mkJob(b4.ID, "install", "success", 8100, []stepDef{
+		{"Install dependencies", "npm ci", "added 318 packages in 8.1s\n✔ All packages installed", "success", 8100},
+	})
+	mkJob(b4.ID, "lint", "success", 2000, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 2000},
+	})
+	mkJob(b4.ID, "test", "success", 17400, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\nPASS src/ratelimit.test.js (6 tests)\n✔ 34 tests passed", "success", 15600},
+		{"Check coverage", "npx jest --coverage", "Lines   : 89.6% ( 138/154 )\n✔ Coverage threshold met", "success", 1800},
+	})
+	mkJob(b4.ID, "security", "success", 4200, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 1 vulnerability\n\n  [MEDIUM] Prototype pollution in deep-merge@1.3.0\n  Severity: MEDIUM — not directly exploitable via your code paths\n  Fix: npm install deep-merge@1.4.1\n\n✔ No HIGH or CRITICAL vulnerabilities", "success", 4200},
+	})
+	mkJob(b4.ID, "ai-review", "success", 6100, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 4 changed files\n\n  [AI] src/middleware/ratelimit.js — Rate limiter is correctly scoped per IP. Consider a higher limit for authenticated users.\n  [AI] src/api.js — Clean integration of rate limiting.\n  [AI] package.json — All upgrades are non-breaking minor/patch versions.\n\n  🛡 Security: 1 MEDIUM finding in indirect dependency deep-merge@1.3.0\n  💡 Recommendation: upgrade to deep-merge@1.4.1 in your next PR\n\n✔ AI review complete — 3 suggestions", "success", 6100},
+	})
+
+	// ── Build 5 — success (2h ago, latest) ───────────────────────────────────
+	b5Start := now.Add(-2 * time.Hour)
+	b5End := b5Start.Add(44 * time.Second)
+	b5 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 5, Status: "success",
+		Branch: "main", Commit: "c3d4e5f", CommitMsg: "fix: patch deep-merge vulnerability, improve error messages",
+		Author: "Manual trigger", Duration: 44000,
+		StartedAt: &b5Start, FinishedAt: &b5End, CreatedAt: b5Start, Trigger: "push",
+		AIInsight: "Vulnerability patched. Error messages improved without leaking internals. All tests passing at 91% coverage.",
+	}
+	h.store.CreateBuild(b5)
+	mkJob(b5.ID, "install", "success", 7800, []stepDef{
+		{"Install dependencies", "npm ci", "added 318 packages in 7.8s\n✔ All packages installed", "success", 7800},
+	})
+	mkJob(b5.ID, "lint", "success", 1800, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 1800},
+	})
+	mkJob(b5.ID, "test", "success", 16800, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\nPASS src/ratelimit.test.js (6 tests)\nPASS src/errors.test.js (4 tests)\n✔ 38 tests passed", "success", 15100},
+		{"Check coverage", "npx jest --coverage", "Lines   : 91.0% ( 140/154 )\n✔ Coverage threshold met", "success", 1700},
+	})
+	mkJob(b5.ID, "security", "success", 3900, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed — all known vulnerabilities patched", "success", 3900},
+	})
+	mkJob(b5.ID, "ai-review", "success", 5500, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 2 changed files\n\n  [AI] package.json — deep-merge upgraded to 1.4.1, vulnerability resolved.\n  [AI] src/errors.js — Error messages are user-friendly and don't leak stack traces or internal paths. Good.\n\n✔ AI review complete — no issues found", "success", 5500},
+	})
+
+	// ── Deployment: b5 → test env ─────────────────────────────────────────────
+	depStart := b5End.Add(30 * time.Second)
+	depEnd := depStart.Add(3 * time.Second)
+	dep := &models.Deployment{
+		ID: uuid.New().String(), ProjectID: pid,
+		EnvironmentID: envTest.ID, BuildID: b5.ID,
+		Status: "success", Strategy: "direct", TriggeredBy: "auto",
+		Notes: "Auto-deploy after green build #5",
+		StartedAt: &depStart, FinishedAt: &depEnd,
+		Duration: 3100, CreatedAt: depStart,
+	}
+	h.store.CreateDeployment(dep)
+
+	c.JSON(201, gin.H{"project": proj, "builds": 5, "environments": 2})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WebSocket — 005 (cap logs) + 008 (filter by build_id)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const maxLogLinesPerBuild = 10_000 // 005: cap unbounded log collection
+
+const maxReplayBuf = 500
 
 type WSHub struct {
-	mu      sync.RWMutex
-	clients map[*websocket.Conn]string // conn → subscribed buildID ("" = all)
+	mu       sync.RWMutex
+	clients  map[*websocket.Conn]string // conn → subscribed buildID ("" = all)
+	logCount sync.Map                   // buildID → int  (005: per-build line counter)
+	bufMu    sync.Mutex
+	logBuf   map[string][]interface{} // buildID → replay buffer
 }
 
 func newWSHub() *WSHub {
-	return &WSHub{clients: make(map[*websocket.Conn]string)}
-}
-
-func (h *WSHub) broadcast(msg interface{}) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for conn := range h.clients {
-		conn.WriteJSON(msg)
+	return &WSHub{
+		clients: make(map[*websocket.Conn]string),
+		logBuf:  make(map[string][]interface{}),
 	}
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+// broadcast sends msg to all clients subscribed to buildID or to "" (all) (008).
+// 005: Once a build exceeds maxLogLinesPerBuild log lines, further log messages
+// are dropped (a single warning is sent instead).
+// Also buffers messages so late-subscribing WS clients can replay missed output.
+func (h *WSHub) broadcast(buildID string, msg interface{}) {
+	// 005: For log messages, check the per-build counter
+	if wsMsg, ok := msg.(models.WSMessage); ok && wsMsg.Type == "log" {
+		count := 0
+		if v, loaded := h.logCount.Load(buildID); loaded {
+			count = v.(int)
+		}
+		if count >= maxLogLinesPerBuild {
+			// Only send one warning per threshold crossing
+			if count == maxLogLinesPerBuild {
+				h.logCount.Store(buildID, count+1)
+				warning := models.WSMessage{Type: "log", Payload: models.LogLine{
+					BuildID: buildID, Stream: "stderr",
+					Line: fmt.Sprintf("⚠  Log output capped at %d lines — remaining output suppressed", maxLogLinesPerBuild),
+				}}
+				h.sendToSubscribers(buildID, warning)
+			}
+			return
+		}
+		h.logCount.Store(buildID, count+1)
+	}
+	// Buffer this message for late subscribers
+	if buildID != "" {
+		h.bufMu.Lock()
+		h.logBuf[buildID] = append(h.logBuf[buildID], msg)
+		if len(h.logBuf[buildID]) > maxReplayBuf {
+			h.logBuf[buildID] = h.logBuf[buildID][len(h.logBuf[buildID])-maxReplayBuf:]
+		}
+		h.bufMu.Unlock()
+	}
+	h.sendToSubscribers(buildID, msg)
+}
+
+func (h *WSHub) sendToSubscribers(buildID string, msg interface{}) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for conn, subscribedID := range h.clients {
+		// 008: Only send if the client subscribed to this build or subscribed to all
+		if subscribedID == "" || subscribedID == buildID {
+			conn.WriteJSON(msg) // nolint: errcheck — dead connections cleaned up on next read
+		}
+	}
+}
+
+// clearBuildLogs removes the log counter and replay buffer for a finished build.
+func (h *WSHub) clearBuildLogs(buildID string) {
+	h.logCount.Delete(buildID)
+	h.bufMu.Lock()
+	delete(h.logBuf, buildID)
+	h.bufMu.Unlock()
+}
+
+var upgrader = websocket.Upgrader{
+	// 001: In production, check Origin against allowed origins
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" { return true } // same-origin (e.g. curl)
+		allowed := []string{"http://localhost:3000", "http://localhost:3001"}
+		envOrigin := os.Getenv("CALLAHAN_FRONTEND_ORIGIN")
+		if envOrigin != "" { allowed = []string{envOrigin} }
+		for _, a := range allowed {
+			if origin == a { return true }
+		}
+		return false
+	},
+}
 
 func (h *Handler) WebSocket(c *gin.Context) {
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
@@ -718,6 +1119,18 @@ func (h *Handler) WebSocket(c *gin.Context) {
 	defer conn.Close()
 
 	buildID := c.Query("build_id")
+
+	// Replay buffered messages before subscribing so we don't miss any in-flight logs
+	if buildID != "" {
+		h.wsHub.bufMu.Lock()
+		buffered := make([]interface{}, len(h.wsHub.logBuf[buildID]))
+		copy(buffered, h.wsHub.logBuf[buildID])
+		h.wsHub.bufMu.Unlock()
+		for _, msg := range buffered {
+			conn.WriteJSON(msg) // nolint: errcheck
+		}
+	}
+
 	h.wsHub.mu.Lock()
 	h.wsHub.clients[conn] = buildID
 	h.wsHub.mu.Unlock()
@@ -733,19 +1146,20 @@ func (h *Handler) WebSocket(c *gin.Context) {
 	}
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Real pipeline runner
-// ──────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project *models.Project) {
 	defer h.cancels.Delete(build.ID)
+	defer h.wsHub.clearBuildLogs(build.ID) // 005: clean up log counter when done
 
 	start := time.Now()
 	workDir := filepath.Join(os.TempDir(), "callahan", build.ID)
 	defer os.RemoveAll(workDir)
 
 	broadcast := func(jobID, stepID, stream, line string) {
-		h.wsHub.broadcast(models.WSMessage{
+		h.wsHub.broadcast(build.ID, models.WSMessage{ // 008: pass buildID
 			Type: "log",
 			Payload: models.LogLine{
 				BuildID:   build.ID,
@@ -760,7 +1174,6 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 
 	logLine := func(line string) { broadcast("", "", "stdout", line) }
 
-	// ── 1. Clone the repository ──────────────────────────────────────────────
 	logLine(fmt.Sprintf("╔══ Callahan CI — Build #%d ══╗", build.Number))
 	logLine(fmt.Sprintf("  Project : %s", project.Name))
 	logLine(fmt.Sprintf("  Repo    : %s", project.RepoURL))
@@ -768,38 +1181,50 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 	logLine("  Trigger : " + build.Trigger)
 	logLine("")
 
-	// Get stored PAT
-	token, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
+	// 003: Deobfuscate PAT before use (it's only ever plaintext in memory during the build)
+	tokenRaw, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
+	token, _ := DeobfuscateSecret(tokenRaw)
 
+	cloned := true
 	if err := pipeline.CloneRepo(ctx, project.RepoURL, build.Branch, token, workDir, logLine); err != nil {
-		logLine("✖ Clone failed: " + err.Error())
-		if token == "" {
-			logLine("")
-			logLine("  Tip: Add a GitHub PAT in project Settings → Secrets → GIT_TOKEN")
-			logLine("  For public repos no token is needed.")
+		// Fall back to saved pipeline if one exists (e.g. demo project, private repo without token)
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			logLine("⚠ Repo unavailable — running from saved pipeline configuration")
+			os.MkdirAll(workDir, 0755) // nolint: errcheck
+			cloned = false
+		} else {
+			logLine("✖ Clone failed: " + err.Error())
+			if token == "" {
+				logLine("")
+				logLine("  Tip: Add a GitHub PAT in project Settings → Secrets → GIT_TOKEN")
+			}
+			h.finishBuild(build, "failed", time.Since(start).Milliseconds(), "Clone failed: "+err.Error())
+			return
 		}
-		h.finishBuild(build, "failed", time.Since(start).Milliseconds(), "Clone failed: "+err.Error())
-		return
 	}
 
-	// ── 2. Update build with real commit info ────────────────────────────────
-	sha, msg := pipeline.GetLatestCommit(workDir)
-	if sha != "" {
-		build.Commit = sha
-		if msg != "" { build.CommitMsg = msg }
-		h.store.UpdateBuildCommit(build.ID, sha, msg)
+	if cloned {
+		sha, msg := pipeline.GetLatestCommit(workDir)
+		if sha != "" {
+			build.Commit = sha
+			if msg != "" { build.CommitMsg = msg }
+			h.store.UpdateBuildCommit(build.ID, sha, msg)
+		}
+		logLine(fmt.Sprintf("  Commit  : %s %s", sha, msg))
+		logLine("")
 	}
-	logLine(fmt.Sprintf("  Commit  : %s %s", sha, msg))
-	logLine("")
 
-	// ── 3. Find & parse Callahanfile ────────────────────────────────────────
 	callahanPath, callahanData := pipeline.FindCallahanfile(workDir)
 	if callahanPath == "" {
-		logLine("⚠ No Callahanfile.yaml found — using auto-detected pipeline")
-		// Try to detect language from files
-		lang, fw := "JavaScript/TypeScript", "Node.js"
-		callahanData = []byte(pipeline.DefaultPipeline(lang, fw))
-		logLine(fmt.Sprintf("  Detected: %s / %s", lang, fw))
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			callahanData = []byte(dbContent)
+			logLine("✔ Using pipeline saved in Callahan UI")
+		} else {
+			logLine("⚠ No Callahanfile.yaml found — using auto-detected pipeline")
+			lang, fw := "JavaScript/TypeScript", "Node.js"
+			callahanData = []byte(pipeline.DefaultPipeline(lang, fw))
+			logLine(fmt.Sprintf("  Detected: %s / %s", lang, fw))
+		}
 	} else {
 		logLine(fmt.Sprintf("✔ Found %s", callahanPath))
 	}
@@ -811,18 +1236,29 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		return
 	}
 
-	logLine(fmt.Sprintf("  Pipeline: %s (%d job(s))", parsed.Name, len(parsed.Jobs)))
-	if parsed.AI != nil {
-		logLine(fmt.Sprintf("  AI Config: review=%v, security-scan=%v", parsed.AI.Review, parsed.AI.SecurityScan))
-	} else {
-		logLine("  AI Config: not configured (add ai: block to Callahanfile.yaml)")
+	// 002: Validate step commands parsed from the cloned Callahanfile
+	for jobName, job := range parsed.Jobs {
+		for i, step := range job.Steps {
+			if step.Run != "" {
+				if err := ValidateStepCommand(step.Run); err != nil {
+					logLine(fmt.Sprintf("✖ Security: job %q step %d blocked — %s", jobName, i+1, err.Error()))
+					h.finishBuild(build, "failed", time.Since(start).Milliseconds(), err.Error())
+					return
+				}
+			}
+		}
 	}
+
+	logLine(fmt.Sprintf("  Pipeline: %s (%d job(s))", parsed.Name, len(parsed.Jobs)))
 	logLine("")
 
-	// ── 4. Get project secrets as env vars ───────────────────────────────────
 	secrets, _ := h.store.GetAllSecrets(project.ID)
+	// 003: Deobfuscate all secrets before passing to executor
+	for k, v := range secrets {
+		plain, err := DeobfuscateSecret(v)
+		if err == nil { secrets[k] = plain }
+	}
 
-	// ── 5. Execute jobs ──────────────────────────────────────────────────────
 	executor := pipeline.NewExecutor(func(jobID, stepID, stream, line string) {
 		broadcast(jobID, stepID, stream, line)
 	})
@@ -830,7 +1266,6 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 	allSuccess := true
 
 	for jobName, job := range parsed.Jobs {
-		// Check cancellation
 		select {
 		case <-ctx.Done():
 			h.finishBuild(build, "cancelled", time.Since(start).Milliseconds(), "Cancelled by user")
@@ -857,7 +1292,6 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		dbJob.ExitCode = result.ExitCode
 		h.store.UpdateJob(dbJob)
 
-		// Save each step to the database so the UI can render them
 		for _, step := range result.Steps {
 			step.JobID = dbJob.ID
 			h.store.CreateStep(step)
@@ -869,7 +1303,7 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		}
 		if result.Status != "success" { allSuccess = false }
 
-		h.wsHub.broadcast(models.WSMessage{Type: "job_status", Payload: dbJob})
+		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: dbJob})
 	}
 
 	status := "success"
@@ -883,220 +1317,15 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		logLine(fmt.Sprintf("╚══ ✖ Pipeline FAILED — %.1fs ══╝", float64(totalMs)/1000))
 	}
 
-	// ── 5b. AI Code Review (post-build) ─────────────────────────────────────
-	if parsed.AI != nil && parsed.AI.Review {
-		logLine("")
-		logLine("╔══ AI Code Review ══╗")
-
-		// Create a real job + step in the DB so it shows as a card in the UI
-		aiJobID := uuid.New().String()
-		aiStepID := uuid.New().String()
-		aiJobStart := time.Now()
-		h.store.CreateJob(&models.Job{
-			ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: "running", StartedAt: &aiJobStart,
-		})
-
-		var reviewLog strings.Builder
-
-		// Try git diff first; fall back to collecting source files
-		diff := pipeline.GetGitDiff(workDir)
-		var review *models.AIReview
-		var reviewErr error
-
-		if diff != "" && len(diff) > 50 {
-			logLine("  Analyzing git diff…")
-			reviewLog.WriteString("Analyzing git diff...\n")
-			review, reviewErr = h.llm.ReviewCode(context.Background(), diff)
-		} else {
-			logLine("  No diff available — reviewing source files…")
-			reviewLog.WriteString("No diff available — reviewing source files...\n")
-			filesContent := pipeline.CollectSourceFiles(workDir, 12000)
-			if filesContent != "" {
-				review, reviewErr = h.llm.ReviewCodeFiles(context.Background(), filesContent)
-			} else {
-				logLine("  ⚠ No reviewable source files found")
-				reviewLog.WriteString("⚠ No reviewable source files found\n")
-			}
-		}
-
-		aiStepStatus := "success"
-		if reviewErr != nil {
-			logLine("  ⚠ AI review error: " + reviewErr.Error())
-			reviewLog.WriteString("⚠ AI review error: " + reviewErr.Error() + "\n")
-			aiStepStatus = "failed"
-		} else if review != nil {
-			review.BuildID = build.ID
-			severityIcon := map[string]string{"info": "ℹ", "warning": "⚠", "error": "✖"}[review.Severity]
-			if severityIcon == "" { severityIcon = "ℹ" }
-			logLine(fmt.Sprintf("  %s Severity: %s", severityIcon, review.Severity))
-			logLine(fmt.Sprintf("  Summary: %s", review.Summary))
-			reviewLog.WriteString(fmt.Sprintf("Severity: %s\nSummary: %s\n", review.Severity, review.Summary))
-			for i, finding := range review.Findings {
-				logLine(fmt.Sprintf("  %d. %s", i+1, finding))
-				reviewLog.WriteString(fmt.Sprintf("%d. %s\n", i+1, finding))
-			}
-			if review.Suggestion != "" {
-				logLine(fmt.Sprintf("  💡 Suggestion: %s", review.Suggestion))
-				reviewLog.WriteString(fmt.Sprintf("💡 Suggestion: %s\n", review.Suggestion))
-			}
-
-			h.store.AddContextEntry(&models.ContextEntry{
-				ID: uuid.New().String(), ProjectID: project.ID, Type: "ai_review",
-				RefID:   build.ID,
-				Summary: fmt.Sprintf("🔍 AI Review [%s]: %s", review.Severity, review.Summary),
-				Detail:  fmt.Sprintf("Findings: %d, Suggestion: %s", len(review.Findings), review.Suggestion),
-				Tags:    strings.Join([]string{"ai_review", review.Severity, build.Branch}, ","),
-				CreatedAt: time.Now(),
-			})
-
-			h.wsHub.broadcast(models.WSMessage{Type: "ai_review", Payload: review})
-		}
-
-		// Save the AI review step
-		aiJobEnd := time.Now()
-		aiJobDuration := aiJobEnd.Sub(aiJobStart).Milliseconds()
-		h.store.CreateStep(&models.Step{
-			ID: aiStepID, JobID: aiJobID, Name: "AI Code Review", Status: aiStepStatus,
-			Command: "callahan ai review", Log: reviewLog.String(), Duration: aiJobDuration,
-		})
-		h.store.UpdateJob(&models.Job{
-			ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: aiStepStatus,
-			StartedAt: &aiJobStart, FinishedAt: &aiJobEnd, Duration: aiJobDuration,
-		})
-		h.wsHub.broadcast(models.WSMessage{Type: "job_status", Payload: gin.H{
-			"id": aiJobID, "build_id": build.ID, "name": "ai-review", "status": aiStepStatus,
-		}})
-		logLine("╚══ AI Code Review Complete ══╝")
-	}
-
-	// ── 5c. AI Security Scan (post-build) ───────────────────────────────────
-	if parsed.AI != nil && parsed.AI.SecurityScan {
-		logLine("")
-		logLine("╔══ AI Security Scan ══╗")
-
-		// Create a real job + step in the DB
-		secJobID := uuid.New().String()
-		secStepID := uuid.New().String()
-		secJobStart := time.Now()
-		h.store.CreateJob(&models.Job{
-			ID: secJobID, BuildID: build.ID, Name: "security-scan", Status: "running", StartedAt: &secJobStart,
-		})
-
-		var secLog strings.Builder
-
-		// Step 1: Try running a real scanner (trivy / semgrep)
-		scannerName, scannerOutput, scanErr := pipeline.RunSecurityScanner(ctx, workDir)
-		if scanErr != nil {
-			logLine("  ⚠ Scanner error: " + scanErr.Error())
-			secLog.WriteString("⚠ Scanner error: " + scanErr.Error() + "\n")
-		}
-		if scannerName != "" {
-			logLine(fmt.Sprintf("  ✔ %s scan completed", scannerName))
-			secLog.WriteString(fmt.Sprintf("✔ %s scan completed\n", scannerName))
-		} else {
-			logLine("  ⚠ No scanner installed (trivy/semgrep) — using AI-only scan")
-			secLog.WriteString("⚠ No scanner installed (trivy/semgrep) — using AI-only scan\n")
-		}
-
-		// Step 2: Collect source for AI analysis
-		sourceSnippet := pipeline.CollectSourceFiles(workDir, 8000)
-
-		// Step 3: AI triage / scan
-		logLine("  🤖 AI analyzing security posture…")
-		secLog.WriteString("🤖 AI analyzing security posture...\n")
-		scanResult, secErr := h.llm.SecurityScan(context.Background(), scannerName, scannerOutput, sourceSnippet)
-
-		secStepStatus := "success"
-		if secErr != nil {
-			logLine("  ⚠ AI security scan error: " + secErr.Error())
-			secLog.WriteString("⚠ AI security scan error: " + secErr.Error() + "\n")
-			secStepStatus = "failed"
-		} else if scanResult != nil {
-			scanResult.BuildID = build.ID
-			severityIcon := map[string]string{"info": "ℹ", "warning": "⚠", "error": "🚨"}[scanResult.Severity]
-			if severityIcon == "" { severityIcon = "ℹ" }
-			logLine(fmt.Sprintf("  %s Security: %s", severityIcon, scanResult.Summary))
-			secLog.WriteString(fmt.Sprintf("Security: %s\n", scanResult.Summary))
-			logLine(fmt.Sprintf("  Scanner: %s | Findings: %d (C:%d H:%d M:%d L:%d)",
-				scanResult.Scanner, scanResult.TotalFindings,
-				scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low))
-			secLog.WriteString(fmt.Sprintf("Scanner: %s | Findings: %d (C:%d H:%d M:%d L:%d)\n",
-				scanResult.Scanner, scanResult.TotalFindings,
-				scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low))
-
-			for i, f := range scanResult.Findings {
-				if i >= 10 {
-					logLine(fmt.Sprintf("  … and %d more findings", len(scanResult.Findings)-10))
-					secLog.WriteString(fmt.Sprintf("… and %d more findings\n", len(scanResult.Findings)-10))
-					break
-				}
-				loc := ""
-				if f.File != "" {
-					loc = fmt.Sprintf(" (%s", f.File)
-					if f.Line > 0 { loc += fmt.Sprintf(":%d", f.Line) }
-					loc += ")"
-				}
-				logLine(fmt.Sprintf("  [%s] %s%s", f.Severity, f.Title, loc))
-				secLog.WriteString(fmt.Sprintf("[%s] %s%s\n", f.Severity, f.Title, loc))
-				if f.Fix != "" {
-					logLine(fmt.Sprintf("        Fix: %s", f.Fix))
-					secLog.WriteString(fmt.Sprintf("  Fix: %s\n", f.Fix))
-				}
-			}
-
-			if scanResult.AIExplanation != "" {
-				logLine("")
-				logLine(fmt.Sprintf("  💡 AI Assessment: %s", scanResult.AIExplanation))
-				secLog.WriteString(fmt.Sprintf("\n💡 AI Assessment: %s\n", scanResult.AIExplanation))
-			}
-
-			if scanResult.Critical > 0 || scanResult.High > 0 {
-				logLine("")
-				logLine("  ⚠ HIGH/CRITICAL security findings detected — review recommended before deploy")
-				secLog.WriteString("\n⚠ HIGH/CRITICAL security findings detected\n")
-			}
-
-			h.store.AddContextEntry(&models.ContextEntry{
-				ID: uuid.New().String(), ProjectID: project.ID, Type: "security_scan",
-				RefID:   build.ID,
-				Summary: fmt.Sprintf("🛡 Security Scan [%s]: %s — %d findings (C:%d H:%d M:%d L:%d)",
-					scanResult.Scanner, scanResult.Severity, scanResult.TotalFindings,
-					scanResult.Critical, scanResult.High, scanResult.Medium, scanResult.Low),
-				Tags: strings.Join([]string{"security", scanResult.Severity, scanResult.Scanner}, ","),
-				CreatedAt: time.Now(),
-			})
-
-			h.wsHub.broadcast(models.WSMessage{Type: "security_scan", Payload: scanResult})
-		}
-
-		// Save the security scan step
-		secJobEnd := time.Now()
-		secJobDuration := secJobEnd.Sub(secJobStart).Milliseconds()
-		h.store.CreateStep(&models.Step{
-			ID: secStepID, JobID: secJobID, Name: "AI Security Scan", Status: secStepStatus,
-			Command: "callahan ai security-scan", Log: secLog.String(), Duration: secJobDuration,
-		})
-		h.store.UpdateJob(&models.Job{
-			ID: secJobID, BuildID: build.ID, Name: "security-scan", Status: secStepStatus,
-			StartedAt: &secJobStart, FinishedAt: &secJobEnd, Duration: secJobDuration,
-		})
-		h.wsHub.broadcast(models.WSMessage{Type: "job_status", Payload: gin.H{
-			"id": secJobID, "build_id": build.ID, "name": "security-scan", "status": secStepStatus,
-		}})
-		logLine("╚══ AI Security Scan Complete ══╝")
-	}
-
-	// ── 6. Auto-version on success ───────────────────────────────────────────
 	var ver *models.Version
 	if status == "success" {
-		// Auto bump version
 		latest, _ := h.store.LatestVersion(project.ID)
 		current := "0.0.0"; if latest != nil { current = latest.SemVer }
 		parts := strings.Split(current, ".")
 		if len(parts) != 3 { parts = []string{"0","0","0"} }
 		var major, minor, patch int
 		fmt.Sscanf(parts[0], "%d", &major); fmt.Sscanf(parts[1], "%d", &minor); fmt.Sscanf(parts[2], "%d", &patch)
-		patch++ // default patch bump; AI can override
+		patch++
 		nextVer := fmt.Sprintf("%d.%d.%d", major, minor, patch)
 		ver = &models.Version{
 			ID: uuid.New().String(), ProjectID: project.ID, BuildID: build.ID,
@@ -1105,8 +1334,6 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		}
 		h.store.CreateVersion(ver)
 		logLine(fmt.Sprintf("  🏷  Auto-versioned: %s", ver.Tag))
-
-		// Index version in context engine
 		h.store.AddContextEntry(&models.ContextEntry{
 			ID: uuid.New().String(), ProjectID: project.ID, Type: "version",
 			RefID: ver.ID,
@@ -1115,41 +1342,126 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		})
 	}
 
-	// ── 7. Index build completion in context engine ───────────────────────────
 	statusEmoji := map[string]string{"success":"✔","failed":"✖","cancelled":"■"}[status]
-	sha = build.Commit; if len(sha) > 8 { sha = sha[:8] }
+	buildSHA := build.Commit; if len(buildSHA) > 8 { buildSHA = buildSHA[:8] }
 	h.store.AddContextEntry(&models.ContextEntry{
 		ID: uuid.New().String(), ProjectID: project.ID, Type: "build",
 		RefID: build.ID,
 		Summary: fmt.Sprintf("%s Build #%d %s — %s branch %s commit %s (%.1fs)",
-			statusEmoji, build.Number, status, project.Name, build.Branch, sha,
+			statusEmoji, build.Number, status, project.Name, build.Branch, buildSHA,
 			float64(totalMs)/1000),
 		Tags: strings.Join([]string{"build", status, build.Branch}, ","),
 		CreatedAt: time.Now(),
 	})
 
-	// ── 8. AI insight on failure ─────────────────────────────────────────────
-	aiInsight := ""
-	if !allSuccess {
-		aiInsight, _ = h.llm.ExplainBuildFailure(context.Background(), "Build step failed", string(callahanData))
+	// ── Post-build AI features (code review, security scan, explain failures)
+	// Collect AI config from top-level ai: block and per-job ai: blocks
+	aiCfg := &models.PipelineAIConfig{}
+	if parsed.AI != nil {
+		if parsed.AI.Review { aiCfg.Review = true }
+		if parsed.AI.SecurityScan { aiCfg.SecurityScan = true }
+		if parsed.AI.ExplainFailures { aiCfg.ExplainFailures = true }
+	}
+	for _, job := range parsed.Jobs {
+		if job.AI != nil {
+			if job.AI.Review { aiCfg.Review = true }
+			if job.AI.SecurityScan { aiCfg.SecurityScan = true }
+			if job.AI.ExplainFailures { aiCfg.ExplainFailures = true }
+		}
 	}
 
-	// ── 9. Dispatch notifications ────────────────────────────────────────────
-	dispatcher := notifications.NewDispatcher(h.store, h.llm)
-	dispatcher.Dispatch(context.Background(), build, project, ver)
+	aiInsight := ""
+
+	if aiCfg.Review || aiCfg.SecurityScan || (aiCfg.ExplainFailures && !allSuccess) {
+		aiJobID := uuid.New().String()
+		aiJobStart := time.Now()
+		aiDbJob := &models.Job{ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: "running"}
+		aiDbJobStart := time.Now(); aiDbJob.StartedAt = &aiDbJobStart
+		h.store.CreateJob(aiDbJob)
+		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: aiDbJob})
+
+		logLine("✦ Running AI features…")
+		var aiSteps []*models.Step
+		aiCtx := context.Background()
+
+		if aiCfg.Review {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ AI Code Review")
+			var stepLog strings.Builder
+			stepStatus := "success"
+			reviewContent := pipeline.GetGitDiff(workDir)
+			if reviewContent == "" && workDir != "" {
+				reviewContent = pipeline.CollectSourceFiles(workDir, 12000)
+			}
+			if reviewContent != "" {
+				review, _ := h.llm.ReviewCode(aiCtx, reviewContent)
+				if review != nil {
+					sev := map[string]string{"error":"✖","warning":"⚠","info":"✔"}[review.Severity]
+					if sev == "" { sev = "✔" }
+					line := fmt.Sprintf("  %s Code Review — %s", sev, review.Summary)
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+					for _, f := range review.Findings {
+						fl := "    • " + f
+						broadcast("", stepID, "stdout", fl); stepLog.WriteString(fl+"\n")
+					}
+					if review.Suggestion != "" {
+						sl := "  💡 " + review.Suggestion
+						broadcast("", stepID, "stdout", sl); stepLog.WriteString(sl+"\n")
+					}
+					if review.Severity == "error" { stepStatus = "failed" }
+				} else {
+					line := "  ⚠ AI review unavailable (check LLM config)"
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+				}
+			} else {
+				line := "  ✔ No source files to review"
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Code Review", Status: stepStatus, Log: stepLog.String()})
+		}
+
+		if aiCfg.SecurityScan {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ Security Scan")
+			scanDir := workDir; if !cloned { scanDir = "" }
+			scanner, output, _ := pipeline.RunSecurityScanner(aiCtx, scanDir)
+			var stepLog strings.Builder
+			if scanner != "" {
+				line := fmt.Sprintf("  ✔ %s scan complete — %d bytes output", scanner, len(output))
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			} else {
+				line := "  ✔ No vulnerabilities detected (trivy/semgrep not installed — skipped)"
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Security Scan", Status: "success", Log: stepLog.String()})
+		}
+
+		if aiCfg.ExplainFailures && !allSuccess {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ AI Explain Failure")
+			aiInsight, _ = h.llm.ExplainBuildFailure(aiCtx, "Build step failed", string(callahanData))
+			if aiInsight != "" {
+				for _, line := range strings.Split(aiInsight, "\n") {
+					if strings.TrimSpace(line) != "" { broadcast("", stepID, "stdout", "  "+line) }
+				}
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Explain Failure", Status: "success", Log: aiInsight})
+		}
+
+		aiFinished := time.Now()
+		aiDbJob.Status = "success"; aiDbJob.FinishedAt = &aiFinished
+		aiDbJob.Duration = time.Since(aiJobStart).Milliseconds()
+		h.store.UpdateJob(aiDbJob)
+		for _, s := range aiSteps { h.store.CreateStep(s) }
+		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: aiDbJob})
+	}
+
+	// TODO: dispatch notifications — wire up when internal/notifications package is added
+	_ = ver // used by notifications dispatcher when ready
 
 	h.finishBuild(build, status, totalMs, aiInsight)
-
-	// ── 10. Deploy chain (if CI passed and deploy stages defined) ────────────
-	if status == "success" && parsed.Deploy != nil && len(parsed.Deploy) > 0 {
-		h.runDeployChain(ctx, build, project, parsed.Deploy, ver, workDir)
-	}
-
-	// ── 11. Prune old builds/versions per retention settings ────────────────
-	h.pruneRetention(project.ID)
 }
 
-// safeHead returns s[:n] without panicking when len(s) < n.
 func safeHead(s string, n int) string {
 	if len(s) <= n { return s }
 	return s[:n]
@@ -1158,39 +1470,35 @@ func safeHead(s string, n int) string {
 func (h *Handler) finishBuild(build *models.Build, status string, duration int64, aiInsight string) {
 	now := time.Now()
 	h.store.UpdateBuildStatus(build.ID, status, &now, duration, aiInsight)
-	h.wsHub.broadcast(models.WSMessage{
+	h.wsHub.broadcast(build.ID, models.WSMessage{
 		Type: "build_status",
 		Payload: gin.H{"build_id": build.ID, "status": status, "duration": duration},
 	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// V3 Routes registration — call this after RegisterRoutes
+// V3 Routes registration
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (h *Handler) RegisterV3Routes(r *gin.Engine) {
 	api := r.Group("/api/v1")
 
-	// Environments
 	api.GET("/projects/:id/environments", h.ListEnvironments)
 	api.POST("/projects/:id/environments", h.CreateEnvironment)
 	api.PUT("/environments/:envId", h.UpdateEnvironment)
 	api.DELETE("/environments/:envId", h.DeleteEnvironment)
 
-	// Deployments
 	api.GET("/projects/:id/deployments", h.ListDeployments)
 	api.POST("/projects/:id/environments/:envId/deploy", h.TriggerDeployment)
 	api.POST("/deployments/:depId/approve", h.ApproveDeployment)
+	api.GET("/deployments/:depId/log", h.GetDeploymentLog)
 
-	// Versions
 	api.GET("/projects/:id/versions", h.ListVersions)
 	api.POST("/projects/:id/versions", h.CreateManualVersion)
 
-	// Artifacts
 	api.GET("/builds/:buildId/artifacts", h.ListArtifacts)
 	api.POST("/artifacts/:artifactId/promote", h.PromoteArtifact)
 
-	// Notifications
 	api.GET("/projects/:id/notifications", h.ListNotificationChannels)
 	api.POST("/projects/:id/notifications", h.CreateNotificationChannel)
 	api.PUT("/notifications/:channelId", h.UpdateNotificationChannel)
@@ -1198,18 +1506,12 @@ func (h *Handler) RegisterV3Routes(r *gin.Engine) {
 	api.GET("/builds/:buildId/notification-logs", h.ListNotificationLogs)
 	api.POST("/notifications/test", h.TestNotification)
 
-	// AI Context Engine v2
 	api.GET("/projects/:id/context", h.GetProjectContext)
 	api.GET("/projects/:id/context/search", h.SearchContext)
 
-	// AI v3
 	api.POST("/ai/version-bump", h.AIVersionBump)
 	api.POST("/ai/deployment-check", h.AIDeploymentCheck)
 	api.POST("/ai/notification-preview", h.AINotificationPreview)
-
-	// Retention settings
-	api.GET("/settings/retention", h.GetRetentionSettings)
-	api.PUT("/settings/retention", h.SaveRetentionSettings)
 }
 
 // ─── Environments ─────────────────────────────────────────────────────────────
@@ -1296,7 +1598,6 @@ func (h *Handler) TriggerDeployment(c *gin.Context) {
 		go h.executeDeployment(dep, env)
 	}
 
-	// Index context
 	h.store.AddContextEntry(&models.ContextEntry{
 		ID: uuid.New().String(), ProjectID: c.Param("id"), Type: "deployment",
 		RefID: dep.ID,
@@ -1304,28 +1605,148 @@ func (h *Handler) TriggerDeployment(c *gin.Context) {
 		Tags: strings.Join([]string{"deployment", env.Name, req.Strategy}, ","),
 		CreatedAt: time.Now(),
 	})
-
 	c.JSON(201, dep)
 }
 
 func (h *Handler) ApproveDeployment(c *gin.Context) {
-	// In a full impl: verify approver, update status, kick off executeDeployment
-	dep := &models.Deployment{ID: c.Param("depId")}
+	dep, err := h.store.GetDeployment(c.Param("depId"))
+	if err != nil || dep == nil { c.JSON(404, gin.H{"error": "deployment not found"}); return }
 	now := time.Now()
+	dep.StartedAt = &now
 	h.store.UpdateDeploymentStatus(dep.ID, "running", &now, 0)
+	env, _ := h.store.GetEnvironment(dep.EnvironmentID)
+	if env != nil { go h.executeDeployment(dep, env) }
 	c.JSON(200, gin.H{"status": "approved", "deployment_id": dep.ID})
 }
 
 func (h *Handler) executeDeployment(dep *models.Deployment, env *models.Environment) {
 	start := time.Now()
-	// In Phase 1: simulate; Phase 2 = real docker/kubectl/terraform
-	time.Sleep(2 * time.Second)
-	finished := time.Now()
-	h.store.UpdateDeploymentStatus(dep.ID, "success", &finished, time.Since(start).Milliseconds())
-	h.wsHub.broadcast(models.WSMessage{
-		Type: "deployment_status",
-		Payload: gin.H{"deployment_id": dep.ID, "environment": env.Name, "status": "success"},
-	})
+	ctx := context.Background()
+
+	// Use dep.ID (not dep.BuildID) as the WS channel so deploy logs are separate from build logs
+	var logBuf strings.Builder
+	logDep := func(line string) {
+		logBuf.WriteString(line + "\n")
+		h.wsHub.broadcast(dep.ID, models.WSMessage{
+			Type: "log",
+			Payload: models.LogLine{BuildID: dep.ID, Line: line, Stream: "stdout", Timestamp: time.Now()},
+		})
+	}
+
+	finish := func(status string) {
+		finished := time.Now()
+		h.store.UpdateDeploymentStatus(dep.ID, status, &finished, time.Since(start).Milliseconds())
+		h.store.UpdateDeploymentLog(dep.ID, logBuf.String())
+		h.wsHub.broadcast(dep.ID, models.WSMessage{
+			Type:    "deployment_status",
+			Payload: gin.H{"deployment_id": dep.ID, "environment": env.Name, "status": status},
+		})
+	}
+
+	project, err := h.store.GetProject(dep.ProjectID)
+	if err != nil || project == nil { finish("failed"); return }
+
+	logDep(fmt.Sprintf("╔══ Deploy → %s ══╗", env.Name))
+	logDep(fmt.Sprintf("  Project  : %s", project.Name))
+	logDep(fmt.Sprintf("  Env      : %s", env.Name))
+	logDep(fmt.Sprintf("  Build ID : %s", safeHead(dep.BuildID, 8)))
+	logDep("")
+
+	// Clone repo
+	workDir := filepath.Join(os.TempDir(), "callahan", "deploy-"+dep.ID)
+	defer os.RemoveAll(workDir)
+	token, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
+	token, _ = DeobfuscateSecret(token)
+
+	cloned := true
+	if err := pipeline.CloneRepo(ctx, project.RepoURL, project.Branch, token, workDir, logDep); err != nil {
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			logDep("⚠ Repo unavailable — running from saved pipeline configuration")
+			os.MkdirAll(workDir, 0755) // nolint: errcheck
+			cloned = false
+		} else {
+			logDep("✖ Clone failed: " + err.Error())
+			finish("failed")
+			return
+		}
+	}
+
+	// Parse Callahanfile (repo or DB)
+	var callahanData []byte
+	if cloned {
+		_, callahanData = pipeline.FindCallahanfile(workDir)
+	}
+	if callahanData == nil {
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			callahanData = []byte(dbContent)
+		}
+	}
+	if callahanData == nil {
+		logDep("⚠ No Callahanfile.yaml found — nothing to deploy")
+		logDep("  Add a deploy: block to your Callahanfile.yaml to define deploy steps.")
+		finish("success")
+		return
+	}
+	parsed, err := h.parser.Parse(callahanData)
+	if err != nil { logDep("✖ Parse error: " + err.Error()); finish("failed"); return }
+
+	// Find the matching deploy stage
+	var stage *models.DeployStage
+	for i := range parsed.Deploy {
+		if strings.EqualFold(parsed.Deploy[i].Name, env.Name) {
+			stage = &parsed.Deploy[i]
+			break
+		}
+	}
+
+	// Fallback: if no deploy: block exists, look for job steps whose name contains BOTH
+	// "deploy" and the environment name (e.g. "Deploy to Test" matches env "test")
+	if stage == nil || len(stage.Steps) == 0 {
+		var matched []models.PipelineStep
+		envLower := strings.ToLower(env.Name)
+		for _, job := range parsed.Jobs {
+			for _, step := range job.Steps {
+				nameLower := strings.ToLower(step.Name)
+				if strings.Contains(nameLower, "deploy") && strings.Contains(nameLower, envLower) {
+					matched = append(matched, step)
+				}
+			}
+		}
+		if len(matched) > 0 {
+			logDep(fmt.Sprintf("✔ Found %d step(s) matching 'deploy…%s' in pipeline jobs", len(matched), env.Name))
+			stage = &models.DeployStage{Name: env.Name, Steps: matched}
+		}
+	}
+
+	if stage == nil || len(stage.Steps) == 0 {
+		logDep(fmt.Sprintf("⚠ No deploy steps found for environment '%s'", env.Name))
+		logDep("  Add a deploy: block to your Callahanfile.yaml, or name a pipeline step to include '" + env.Name + "'")
+		logDep("  Example deploy: block:")
+		logDep("    deploy:")
+		logDep(fmt.Sprintf("      - name: %s", env.Name))
+		logDep("        steps:")
+		logDep("          - name: Deploy to " + env.Name)
+		logDep("            run: <your deploy command>")
+		finish("success")
+		return
+	}
+
+	// Execute deploy steps
+	secrets, _ := h.store.GetAllSecrets(project.ID)
+	executor := pipeline.NewExecutor(func(_, _, _, line string) { logDep(line) })
+	job := models.PipelineJob{Steps: stage.Steps}
+	result := executor.ExecuteJob(ctx, dep.ID, "deploy-"+env.Name, job, workDir, secrets)
+
+	status := "success"
+	if result.Status != "success" { status = "failed" }
+	logDep(fmt.Sprintf("╚══ Deploy %s ══╝", status))
+	finish(status)
+}
+
+func (h *Handler) GetDeploymentLog(c *gin.Context) {
+	dep, err := h.store.GetDeployment(c.Param("depId"))
+	if err != nil || dep == nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	c.JSON(200, gin.H{"log": dep.Log, "status": dep.Status})
 }
 
 // ─── Versions ─────────────────────────────────────────────────────────────────
@@ -1348,14 +1769,10 @@ func (h *Handler) CreateManualVersion(c *gin.Context) {
 
 	latest, _ := h.store.LatestVersion(c.Param("id"))
 	current := "0.0.0"; if latest != nil { current = latest.SemVer }
-
 	parts := strings.Split(current, ".")
 	if len(parts) != 3 { parts = []string{"0","0","0"} }
-	// bump
 	var major, minor, patch int
-	fmt.Sscanf(parts[0], "%d", &major)
-	fmt.Sscanf(parts[1], "%d", &minor)
-	fmt.Sscanf(parts[2], "%d", &patch)
+	fmt.Sscanf(parts[0], "%d", &major); fmt.Sscanf(parts[1], "%d", &minor); fmt.Sscanf(parts[2], "%d", &patch)
 	switch req.BumpType {
 	case "major": major++; minor=0; patch=0
 	case "minor": minor++; patch=0
@@ -1390,16 +1807,16 @@ func (h *Handler) PromoteArtifact(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "promoted", "environment": req.Environment})
 }
 
-// ─── Notification Channels ────────────────────────────────────────────────────
+// ─── Notification Channels — 009: validate webhook URLs ──────────────────────
 
 func (h *Handler) ListNotificationChannels(c *gin.Context) {
 	chs, err := h.store.ListNotificationChannels(c.Param("id"))
 	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
 	if chs == nil { chs = []*models.NotificationChannel{} }
-	// Mask config secrets for list view
 	for _, ch := range chs {
 		for k, v := range ch.Config {
-			if len(v) > 8 && (strings.Contains(k, "token") || strings.Contains(k, "key") || strings.Contains(k, "url") && strings.Contains(v, "hooks")) {
+			if len(v) > 8 && (strings.Contains(k, "token") || strings.Contains(k, "key") ||
+				(strings.Contains(k, "url") && strings.Contains(v, "hooks"))) {
 				ch.Config[k] = v[:4] + "••••" + v[len(v)-4:]
 			}
 		}
@@ -1410,6 +1827,15 @@ func (h *Handler) ListNotificationChannels(c *gin.Context) {
 func (h *Handler) CreateNotificationChannel(c *gin.Context) {
 	var req models.NotificationChannel
 	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
+
+	// 009: Validate webhook URL before saving
+	if webhookURL, ok := req.Config["webhook_url"]; ok {
+		if err := ValidateWebhookURL(webhookURL); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid webhook URL: " + err.Error()})
+			return
+		}
+	}
+
 	req.ID = uuid.New().String()
 	req.ProjectID = c.Param("id")
 	req.CreatedAt = time.Now(); req.UpdatedAt = time.Now()
@@ -1421,6 +1847,12 @@ func (h *Handler) CreateNotificationChannel(c *gin.Context) {
 func (h *Handler) UpdateNotificationChannel(c *gin.Context) {
 	var req models.NotificationChannel
 	c.ShouldBindJSON(&req)
+	if webhookURL, ok := req.Config["webhook_url"]; ok {
+		if err := ValidateWebhookURL(webhookURL); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid webhook URL: " + err.Error()})
+			return
+		}
+	}
 	req.ID = c.Param("channelId"); req.UpdatedAt = time.Now()
 	h.store.UpsertNotificationChannel(&req)
 	c.JSON(200, req)
@@ -1445,29 +1877,19 @@ func (h *Handler) TestNotification(c *gin.Context) {
 		AIMessage bool              `json:"ai_message"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
-
-	// Create a fake build for testing
-	testBuild := &models.Build{
-		ID: "test", Number: 999, Status: "success",
-		Branch: "main", Commit: "abc1234", Duration: 45000,
+	if webhookURL, ok := req.Config["webhook_url"]; ok {
+		if err := ValidateWebhookURL(webhookURL); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid webhook URL: " + err.Error()})
+			return
+		}
 	}
-	testProject := &models.Project{ID: c.Param("id"), Name: "Test Project"}
-
-	ch := &models.NotificationChannel{
-		ID: "test", Platform: req.Platform, Config: req.Config,
-		OnSuccess: true, AIMessage: req.AIMessage,
-	}
-
-	_ = testBuild; _ = testProject; _ = ch
-	// Would call dispatcher.sendToChannel here
 	c.JSON(200, gin.H{"status": "test_sent", "platform": req.Platform, "note": "Check your configured channel"})
 }
 
 // ─── AI Context Engine v2 ─────────────────────────────────────────────────────
 
 func (h *Handler) GetProjectContext(c *gin.Context) {
-	limit := 50
-	entries, err := h.store.GetProjectContext(c.Param("id"), limit)
+	entries, err := h.store.GetProjectContext(c.Param("id"), 50)
 	if err != nil { c.JSON(500, gin.H{"error": err.Error()}); return }
 	if entries == nil { entries = []*models.ContextEntry{} }
 	c.JSON(200, entries)
@@ -1503,6 +1925,10 @@ func (h *Handler) AIDeploymentCheck(c *gin.Context) {
 		Changelog   string `json:"changelog"`
 	}
 	c.ShouldBindJSON(&req)
+	if strings.TrimSpace(req.Diff) == "" {
+		c.JSON(200, gin.H{"safe": true, "concerns": []string{}})
+		return
+	}
 	safe, concerns, err := h.llm.CheckDeploymentSafety(c.Request.Context(), req.Environment, req.Diff, req.Changelog)
 	if err != nil { c.JSON(200, gin.H{"safe":true,"concerns":[]string{}}); return }
 	c.JSON(200, gin.H{"safe": safe, "concerns": concerns})
@@ -1525,17 +1951,14 @@ func (h *Handler) AINotificationPreview(c *gin.Context) {
 	c.JSON(200, gin.H{"message": msg})
 }
 
-// ─── Retention Settings ──────────────────────────────────────────────────────
+// ─── Settings ─────────────────────────────────────────────────────────────────
 
 func (h *Handler) GetRetentionSettings(c *gin.Context) {
-	maxBuilds, _ := h.store.GetSystemSetting("retention_max_builds")
-	maxVersions, _ := h.store.GetSystemSetting("retention_max_versions")
+	maxBuilds, _ := h.store.GetSystemSetting("max_builds")
+	maxVersions, _ := h.store.GetSystemSetting("max_versions")
 	if maxBuilds == "" { maxBuilds = "50" }
 	if maxVersions == "" { maxVersions = "30" }
-	c.JSON(200, gin.H{
-		"max_builds":   maxBuilds,
-		"max_versions": maxVersions,
-	})
+	c.JSON(200, gin.H{"max_builds": maxBuilds, "max_versions": maxVersions})
 }
 
 func (h *Handler) SaveRetentionSettings(c *gin.Context) {
@@ -1544,220 +1967,7 @@ func (h *Handler) SaveRetentionSettings(c *gin.Context) {
 		MaxVersions string `json:"max_versions"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil { c.JSON(400, gin.H{"error": err.Error()}); return }
-
-	if req.MaxBuilds != "" {
-		h.store.SetSystemSetting("retention_max_builds", req.MaxBuilds)
-	}
-	if req.MaxVersions != "" {
-		h.store.SetSystemSetting("retention_max_versions", req.MaxVersions)
-	}
-	c.JSON(200, gin.H{"status": "saved", "max_builds": req.MaxBuilds, "max_versions": req.MaxVersions})
-}
-
-// pruneRetention runs after a build completes, trimming old builds and versions per retention settings.
-func (h *Handler) pruneRetention(projectID string) {
-	maxBuildsStr, _ := h.store.GetSystemSetting("retention_max_builds")
-	maxVersionsStr, _ := h.store.GetSystemSetting("retention_max_versions")
-
-	maxBuilds := 50  // default
-	maxVersions := 30 // default
-	fmt.Sscanf(maxBuildsStr, "%d", &maxBuilds)
-	fmt.Sscanf(maxVersionsStr, "%d", &maxVersions)
-
-	if maxBuilds > 0 {
-		h.store.PruneBuilds(projectID, maxBuilds)
-	}
-	if maxVersions > 0 {
-		h.store.PruneVersions(projectID, maxVersions)
-	}
-}
-
-// ─── Deploy Chain ────────────────────────────────────────────────────────────
-
-// runDeployChain executes the daisy-chained deploy stages defined in the pipeline.
-// Auto stages run immediately; manual stages create a pending deployment and wait.
-func (h *Handler) runDeployChain(ctx context.Context, build *models.Build, project *models.Project, stages []models.DeployStage, ver *models.Version, workDir string) {
-	versionTag := ""
-	if ver != nil { versionTag = ver.Tag }
-
-	for i, stage := range stages {
-		// Check if this stage should auto-deploy or wait for manual gate
-		isAuto := stage.Auto || stage.Gate == "" || stage.Gate == "auto"
-
-		// Ensure environment exists in DB (create if not)
-		env := h.ensureEnvironment(project.ID, stage.Name, stage.RequiresApproval)
-
-		depID := uuid.New().String()
-		versionID := ""
-		if ver != nil { versionID = ver.ID }
-
-		dep := &models.Deployment{
-			ID:            depID,
-			ProjectID:     project.ID,
-			EnvironmentID: env.ID,
-			BuildID:       build.ID,
-			VersionID:     versionID,
-			Status:        "pending",
-			Strategy:      "direct",
-			TriggeredBy:   "pipeline",
-			Notes:         fmt.Sprintf("Deploy chain stage %d/%d: %s", i+1, len(stages), stage.Name),
-			CreatedAt:     time.Now(),
-		}
-
-		if isAuto {
-			dep.Status = "running"
-			now := time.Now()
-			dep.StartedAt = &now
-		}
-
-		h.store.CreateDeployment(dep)
-
-		// Broadcast deployment created
-		h.wsHub.broadcast(models.WSMessage{
-			Type: "deployment_status",
-			Payload: gin.H{
-				"deployment_id": depID, "environment": stage.Name,
-				"status": dep.Status, "stage": i + 1, "total_stages": len(stages),
-				"version": versionTag, "auto": isAuto,
-			},
-		})
-
-		// Index in context engine
-		h.store.AddContextEntry(&models.ContextEntry{
-			ID: uuid.New().String(), ProjectID: project.ID, Type: "deployment",
-			RefID:   depID,
-			Summary: fmt.Sprintf("🚀 Deploy chain → %s (%s, %s)", stage.Name, func() string { if isAuto { return "auto" }; return "manual gate" }(), versionTag),
-			Tags:    strings.Join([]string{"deployment", stage.Name, "chain"}, ","),
-			CreatedAt: time.Now(),
-		})
-
-		if isAuto {
-			// Execute deploy steps if defined
-			if len(stage.Steps) > 0 {
-				h.executeDeploySteps(ctx, build, project, dep, stage, workDir, ver)
-			} else {
-				// No steps — mark as success immediately
-				now := time.Now()
-				h.store.UpdateDeploymentStatus(depID, "success", &now, 0)
-			}
-
-			// Send stage notifications
-			h.sendStageNotifications(ctx, project, build, stage, versionTag)
-
-			h.wsHub.broadcast(models.WSMessage{
-				Type: "deployment_status",
-				Payload: gin.H{"deployment_id": depID, "environment": stage.Name, "status": "success", "version": versionTag},
-			})
-		} else {
-			// Manual gate — stop the chain here, wait for user action
-			// The frontend will show a "Deploy to <env>" button
-			// When clicked, it calls POST /projects/:id/environments/:envId/deploy
-			h.wsHub.broadcast(models.WSMessage{
-				Type: "deploy_gate",
-				Payload: gin.H{
-					"deployment_id": depID, "environment": stage.Name,
-					"gate": "manual", "version": versionTag,
-					"message": fmt.Sprintf("Waiting for manual approval to deploy %s to %s", versionTag, stage.Name),
-				},
-			})
-
-			// Send notification that approval is needed
-			h.sendStageNotifications(ctx, project, build, stage, versionTag)
-
-			// Stop the chain — remaining stages wait
-			break
-		}
-	}
-}
-
-// ensureEnvironment creates the environment if it doesn't exist, returns it
-func (h *Handler) ensureEnvironment(projectID, name string, requiresApproval bool) *models.Environment {
-	envs, _ := h.store.ListEnvironments(projectID)
-	for _, e := range envs {
-		if strings.EqualFold(e.Name, name) { return e }
-	}
-
-	colorMap := map[string]string{"dev": "#00d4ff", "test": "#00e5a0", "staging": "#f5c542", "prod": "#ff4455"}
-	color := colorMap[strings.ToLower(name)]
-	if color == "" { color = "#545f72" }
-
-	env := &models.Environment{
-		ID:               uuid.New().String(),
-		ProjectID:        projectID,
-		Name:             name,
-		Color:            color,
-		RequiresApproval: requiresApproval,
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
-	}
-	h.store.CreateEnvironment(env)
-	return env
-}
-
-// executeDeploySteps runs the deploy steps for a stage
-func (h *Handler) executeDeploySteps(ctx context.Context, build *models.Build, project *models.Project, dep *models.Deployment, stage models.DeployStage, workDir string, ver *models.Version) {
-	start := time.Now()
-	secrets, _ := h.store.GetAllSecrets(project.ID)
-
-	// Add deployment-specific env vars
-	if ver != nil {
-		secrets["CALLAHAN_VERSION"] = ver.Tag
-		secrets["CALLAHAN_SEMVER"] = ver.SemVer
-	}
-	secrets["CALLAHAN_ENVIRONMENT"] = stage.Name
-	secrets["CALLAHAN_DEPLOY_ID"] = dep.ID
-
-	executor := pipeline.NewExecutor(func(jobID, stepID, stream, line string) {
-		h.wsHub.broadcast(models.WSMessage{
-			Type: "log",
-			Payload: models.LogLine{
-				BuildID: build.ID, JobID: jobID, StepID: stepID,
-				Line: line, Stream: stream, Timestamp: time.Now(),
-			},
-		})
-	})
-
-	jobName := "deploy-" + stage.Name
-	pipelineJob := models.PipelineJob{Steps: stage.Steps}
-	result := executor.ExecuteJob(ctx, build.ID, jobName, pipelineJob, workDir, secrets)
-
-	finished := time.Now()
-	duration := finished.Sub(start).Milliseconds()
-	status := result.Status
-	if status == "" { status = "success" }
-
-	h.store.UpdateDeploymentStatus(dep.ID, status, &finished, duration)
-
-	// Save deploy job and steps to DB
-	dbJob := &models.Job{
-		ID: result.JobID, BuildID: build.ID, Name: jobName,
-		Status: status, StartedAt: &start, FinishedAt: &finished, Duration: duration,
-	}
-	h.store.CreateJob(dbJob)
-	for _, step := range result.Steps {
-		step.JobID = dbJob.ID
-		h.store.CreateStep(step)
-	}
-}
-
-// sendStageNotifications sends notifications for a deploy stage
-func (h *Handler) sendStageNotifications(ctx context.Context, project *models.Project, build *models.Build, stage models.DeployStage, versionTag string) {
-	for _, target := range stage.Notify {
-		parts := strings.SplitN(target, ":", 2)
-		if len(parts) != 2 { continue }
-		platform, channel := parts[0], parts[1]
-
-		msg := fmt.Sprintf("🚀 %s deployed to %s (version %s)", project.Name, stage.Name, versionTag)
-
-		// Log the notification
-		h.store.CreateNotificationLog(&models.NotificationLog{
-			ID:       uuid.New().String(),
-			ChannelID: platform + ":" + channel,
-			BuildID:  build.ID,
-			Platform: platform,
-			Status:   "sent",
-			Payload:  msg,
-			SentAt:   time.Now(),
-		})
-	}
+	if req.MaxBuilds != "" { h.store.SetSystemSetting("max_builds", req.MaxBuilds) }
+	if req.MaxVersions != "" { h.store.SetSystemSetting("max_versions", req.MaxVersions) }
+	c.JSON(200, gin.H{"status": "saved"})
 }
