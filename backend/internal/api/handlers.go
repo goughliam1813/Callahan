@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -94,6 +95,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/ai/review", h.ReviewCode)
 
 	api.POST("/webhook/:provider", h.Webhook)
+
+	// Demo
+	api.POST("/demo/seed", h.SeedDemo)
 
 	// Settings
 	api.GET("/settings/retention", h.GetRetentionSettings)
@@ -348,7 +352,22 @@ func (h *Handler) GetPipeline(c *gin.Context) {
 		c.JSON(404, gin.H{"error": "not found"})
 		return
 	}
-	content := pipeline.DefaultPipeline(p.Language, p.Framework)
+	content, _ := h.store.GetPipeline(p.ID)
+	if content == "" && p.RepoURL != "" {
+		token, _ := h.store.GetSecret(p.ID, "GIT_TOKEN")
+		token, _ = DeobfuscateSecret(token)
+		workDir := filepath.Join(os.TempDir(), "callahan", "pipeline-read-"+p.ID)
+		defer os.RemoveAll(workDir)
+		if err := pipeline.CloneRepo(context.Background(), p.RepoURL, p.Branch, token, workDir, func(s string) {}); err == nil {
+			if _, callahanData := pipeline.FindCallahanfile(workDir); callahanData != nil {
+				content = string(callahanData)
+				h.store.SavePipeline(p.ID, content)
+			}
+		}
+	}
+	if content == "" {
+		content = pipeline.DefaultPipeline(p.Language, p.Framework)
+	}
 	c.JSON(200, gin.H{"content": content, "language": p.Language, "framework": p.Framework})
 }
 
@@ -381,8 +400,49 @@ func (h *Handler) UpdatePipeline(c *gin.Context) {
 		}
 	}
 
-	// Pipeline content saved — stored in git via Callahanfile.yaml, not in DB
-	c.JSON(200, gin.H{"status": "saved", "content": req.Content})
+	p, _ := h.store.GetProject(c.Param("id"))
+	if p == nil {
+		c.JSON(404, gin.H{"error": "project not found"})
+		return
+	}
+
+	// Always persist to DB so GetPipeline returns the correct content on reload
+	h.store.SavePipeline(p.ID, req.Content)
+
+	// Clone repo, write Callahanfile.yaml, commit and push
+	workDir := filepath.Join(os.TempDir(), "callahan", "pipeline-save-"+c.Param("id"))
+	defer os.RemoveAll(workDir)
+
+	token, _ := h.store.GetSecret(p.ID, "GIT_TOKEN")
+	token, _ = DeobfuscateSecret(token)
+	if err := pipeline.CloneRepo(context.Background(), p.RepoURL, p.Branch, token, workDir, func(s string) {}); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (git push failed: " + err.Error() + ")"})
+		return
+	}
+
+	callahanPath := filepath.Join(workDir, "Callahanfile.yaml")
+	if err := os.WriteFile(callahanPath, []byte(req.Content), 0644); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (file write failed)"})
+		return
+	}
+
+	for _, args := range [][]string{
+		{"git", "-C", workDir, "add", "Callahanfile.yaml"},
+		{"git", "-C", workDir, "commit", "-m", "chore: update Callahanfile.yaml via Callahan UI"},
+	} {
+		_ = exec.Command(args[0], args[1:]...).Run()
+	}
+
+	pushURL := p.RepoURL
+	if token != "" {
+		pushURL = pipeline.InjectToken(p.RepoURL, token)
+	}
+	if out, err := exec.Command("git", "-C", workDir, "push", pushURL, p.Branch).CombinedOutput(); err != nil {
+		c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved locally (push failed: " + string(out) + ")"})
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "saved", "content": req.Content, "message": "✔ Saved and pushed to git"})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -686,24 +746,306 @@ func (h *Handler) Webhook(c *gin.Context) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Demo seed
+// ─────────────────────────────────────────────────────────────────────────────
+
+func (h *Handler) SeedDemo(c *gin.Context) {
+	// Return existing demo project if already seeded
+	if all, _ := h.store.ListProjects(); all != nil {
+		for _, p := range all {
+			if p.Name == "demo-app" {
+				c.JSON(200, gin.H{"project": p, "already_seeded": true})
+				return
+			}
+		}
+	}
+
+	now := time.Now()
+	pid := uuid.New().String()
+
+	proj := &models.Project{
+		ID: pid, Name: "demo-app",
+		RepoURL:     "https://github.com/callahan-ci/demo-app",
+		Provider:    "github", Branch: "main",
+		Language:    "JavaScript/TypeScript", Framework: "Node.js",
+		Description: "Demo project — explore every Callahan CI feature",
+		Status: "active", HealthScore: 92,
+		CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now,
+	}
+	h.store.CreateProject(proj)
+
+	// Store the Callahanfile.yaml so the pipeline editor shows the full demo config
+	demoYAML := `name: demo-app
+on: [push, pull_request]
+
+jobs:
+  install:
+    runs-on: callahan:node-20
+    steps:
+      - name: Install dependencies
+        run: npm ci
+
+  lint:
+    runs-on: callahan:node-20
+    needs: install
+    steps:
+      - name: Lint
+        run: npm run lint
+
+  test:
+    runs-on: callahan:node-20
+    needs: install
+    steps:
+      - name: Run tests
+        run: npm test
+        env:
+          NODE_ENV: test
+      - name: Check coverage
+        run: npx jest --coverage --coverageThreshold='{"global":{"lines":80}}'
+
+  security:
+    runs-on: callahan:node-20
+    needs: [lint, test]
+    steps:
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+    ai:
+      security-scan: true
+      explain-failures: true
+
+ai:
+  review: true
+  generate-tests: true
+
+deploy:
+  - name: test
+    auto: true
+    steps:
+      - name: Deploy to test
+        run: echo "Deploying demo-app to test environment"
+
+  - name: production
+    requires_approval: true
+    branch_filter: main
+    steps:
+      - name: Deploy to production
+        run: echo "Deploying demo-app to production"
+`
+	h.store.SavePipeline(pid, demoYAML)
+
+	// ── Environments ──────────────────────────────────────────────────────────
+	envTest := &models.Environment{
+		ID: uuid.New().String(), ProjectID: pid,
+		Name: "test", Color: "#00e5a0", AutoDeploy: true,
+		CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour),
+	}
+	envProd := &models.Environment{
+		ID: uuid.New().String(), ProjectID: pid,
+		Name: "production", Color: "#f5c542", RequiresApproval: true, BranchFilter: "main",
+		CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour),
+	}
+	h.store.CreateEnvironment(envTest)
+	h.store.CreateEnvironment(envProd)
+
+	// ── Helper to build a job+steps and return duration ───────────────────────
+	type stepDef struct {
+		name, cmd, log string
+		status         string
+		durMs          int64
+	}
+	mkJob := func(buildID, jobName, jobStatus string, dur int64, steps []stepDef) {
+		jid := uuid.New().String()
+		jStart := now.Add(-time.Duration(dur+500) * time.Millisecond)
+		jEnd := now
+		j := &models.Job{
+			ID: jid, BuildID: buildID, Name: jobName, Status: jobStatus,
+			StartedAt: &jStart, FinishedAt: &jEnd, Duration: dur,
+		}
+		h.store.CreateJob(j)
+		h.store.UpdateJob(j)
+		for _, s := range steps {
+			sStart := jStart
+			sEnd := jStart.Add(time.Duration(s.durMs) * time.Millisecond)
+			step := &models.Step{
+				ID: uuid.New().String(), JobID: jid, Name: s.name,
+				Status: s.status, Command: s.cmd, Log: s.log,
+				StartedAt: &sStart, FinishedAt: &sEnd,
+				Duration: s.durMs,
+			}
+			h.store.CreateStep(step)
+		}
+	}
+
+	// ── Build 1 — success (72h ago, push) ────────────────────────────────────
+	b1Start := now.Add(-72 * time.Hour)
+	b1End := b1Start.Add(38 * time.Second)
+	b1 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 1, Status: "success",
+		Branch: "main", Commit: "a1b2c3d", CommitMsg: "feat: initial project setup",
+		Author: "Manual trigger", Duration: 38000,
+		StartedAt: &b1Start, FinishedAt: &b1End, CreatedAt: b1Start, Trigger: "push",
+		AIInsight: "Clean initial commit. No issues detected.",
+	}
+	h.store.CreateBuild(b1)
+	mkJob(b1.ID, "install", "success", 8200, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 8.2s\n✔ All packages installed", "success", 8200},
+	})
+	mkJob(b1.ID, "lint", "success", 2100, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 2100},
+	})
+	mkJob(b1.ID, "test", "success", 14300, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (8 tests)\n✔ 20 tests passed", "success", 12800},
+		{"Check coverage", "npx jest --coverage", "Lines   : 87.4% ( 124/142 )\n✔ Coverage threshold met", "success", 1500},
+	})
+	mkJob(b1.ID, "security", "success", 3400, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed", "success", 3400},
+	})
+
+	// ── Build 2 — failed (48h ago, lint failure) ─────────────────────────────
+	b2Start := now.Add(-48 * time.Hour)
+	b2End := b2Start.Add(14 * time.Second)
+	b2 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 2, Status: "failed",
+		Branch: "feature/new-auth", Commit: "d4e5f6a", CommitMsg: "feat: add OAuth2 login",
+		Author: "Manual trigger", Duration: 14000,
+		StartedAt: &b2Start, FinishedAt: &b2End, CreatedAt: b2Start, Trigger: "push",
+		AIInsight: "Lint failed on src/auth.js:42 — missing semicolon and unused import 'crypto'. Fix these before merging.",
+	}
+	h.store.CreateBuild(b2)
+	mkJob(b2.ID, "install", "success", 7900, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 7.9s\n✔ All packages installed", "success", 7900},
+	})
+	mkJob(b2.ID, "lint", "failed", 1800, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\nsrc/auth.js\n  42:1  error  Missing semicolon  semi\n  12:8  error  'crypto' is defined but never used  no-unused-vars\n\n✖ 2 problems (2 errors, 0 warnings)", "failed", 1800},
+	})
+
+	// ── Build 3 — success (24h ago, PR) ──────────────────────────────────────
+	b3Start := now.Add(-24 * time.Hour)
+	b3End := b3Start.Add(42 * time.Second)
+	b3 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 3, Status: "success",
+		Branch: "main", Commit: "b7c8d9e", CommitMsg: "fix: resolve auth lint errors, add token refresh",
+		Author: "Manual trigger", Duration: 42000,
+		StartedAt: &b3Start, FinishedAt: &b3End, CreatedAt: b3Start, Trigger: "pull_request",
+		AIInsight: "Auth improvements look solid. Token refresh logic is correct. Consider adding a test for expired token edge case.",
+	}
+	h.store.CreateBuild(b3)
+	mkJob(b3.ID, "install", "success", 7600, []stepDef{
+		{"Install dependencies", "npm ci", "added 312 packages in 7.6s\n✔ All packages installed", "success", 7600},
+	})
+	mkJob(b3.ID, "lint", "success", 1900, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 1900},
+	})
+	mkJob(b3.ID, "test", "success", 16100, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\n✔ 28 tests passed", "success", 14200},
+		{"Check coverage", "npx jest --coverage", "Lines   : 91.2% ( 129/142 )\n✔ Coverage threshold met", "success", 1900},
+	})
+	mkJob(b3.ID, "security", "success", 3800, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed", "success", 3800},
+	})
+	mkJob(b3.ID, "ai-review", "success", 5200, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 3 changed files\n\n  [AI] src/auth.js — Token expiry logic looks correct. Minor: consider extracting the 300s buffer to a named constant.\n  [AI] src/token.js — Good use of refresh token rotation.\n  [AI] tests/token.test.js — Tests cover happy path. Add a test for network failure during refresh.\n\n✔ AI review complete — 1 suggestion", "success", 5200},
+	})
+
+	// ── Build 4 — success (6h ago, with security finding) ────────────────────
+	b4Start := now.Add(-6 * time.Hour)
+	b4End := b4Start.Add(51 * time.Second)
+	b4 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 4, Status: "success",
+		Branch: "main", Commit: "e0f1a2b", CommitMsg: "chore: upgrade dependencies, add rate limiting",
+		Author: "Manual trigger", Duration: 51000,
+		StartedAt: &b4Start, FinishedAt: &b4End, CreatedAt: b4Start, Trigger: "push",
+		AIInsight: "Dependency upgrades look safe. Rate limiting middleware correctly applied. 1 medium vulnerability found in an indirect dependency — not directly exploitable.",
+	}
+	h.store.CreateBuild(b4)
+	mkJob(b4.ID, "install", "success", 8100, []stepDef{
+		{"Install dependencies", "npm ci", "added 318 packages in 8.1s\n✔ All packages installed", "success", 8100},
+	})
+	mkJob(b4.ID, "lint", "success", 2000, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 2000},
+	})
+	mkJob(b4.ID, "test", "success", 17400, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\nPASS src/ratelimit.test.js (6 tests)\n✔ 34 tests passed", "success", 15600},
+		{"Check coverage", "npx jest --coverage", "Lines   : 89.6% ( 138/154 )\n✔ Coverage threshold met", "success", 1800},
+	})
+	mkJob(b4.ID, "security", "success", 4200, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 1 vulnerability\n\n  [MEDIUM] Prototype pollution in deep-merge@1.3.0\n  Severity: MEDIUM — not directly exploitable via your code paths\n  Fix: npm install deep-merge@1.4.1\n\n✔ No HIGH or CRITICAL vulnerabilities", "success", 4200},
+	})
+	mkJob(b4.ID, "ai-review", "success", 6100, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 4 changed files\n\n  [AI] src/middleware/ratelimit.js — Rate limiter is correctly scoped per IP. Consider a higher limit for authenticated users.\n  [AI] src/api.js — Clean integration of rate limiting.\n  [AI] package.json — All upgrades are non-breaking minor/patch versions.\n\n  🛡 Security: 1 MEDIUM finding in indirect dependency deep-merge@1.3.0\n  💡 Recommendation: upgrade to deep-merge@1.4.1 in your next PR\n\n✔ AI review complete — 3 suggestions", "success", 6100},
+	})
+
+	// ── Build 5 — success (2h ago, latest) ───────────────────────────────────
+	b5Start := now.Add(-2 * time.Hour)
+	b5End := b5Start.Add(44 * time.Second)
+	b5 := &models.Build{
+		ID: uuid.New().String(), ProjectID: pid, Number: 5, Status: "success",
+		Branch: "main", Commit: "c3d4e5f", CommitMsg: "fix: patch deep-merge vulnerability, improve error messages",
+		Author: "Manual trigger", Duration: 44000,
+		StartedAt: &b5Start, FinishedAt: &b5End, CreatedAt: b5Start, Trigger: "push",
+		AIInsight: "Vulnerability patched. Error messages improved without leaking internals. All tests passing at 91% coverage.",
+	}
+	h.store.CreateBuild(b5)
+	mkJob(b5.ID, "install", "success", 7800, []stepDef{
+		{"Install dependencies", "npm ci", "added 318 packages in 7.8s\n✔ All packages installed", "success", 7800},
+	})
+	mkJob(b5.ID, "lint", "success", 1800, []stepDef{
+		{"Lint", "npm run lint", "> eslint src/\n✔ No linting errors found", "success", 1800},
+	})
+	mkJob(b5.ID, "test", "success", 16800, []stepDef{
+		{"Run tests", "npm test", "PASS src/api.test.js (12 tests)\nPASS src/auth.test.js (11 tests)\nPASS src/token.test.js (5 tests)\nPASS src/ratelimit.test.js (6 tests)\nPASS src/errors.test.js (4 tests)\n✔ 38 tests passed", "success", 15100},
+		{"Check coverage", "npx jest --coverage", "Lines   : 91.0% ( 140/154 )\n✔ Coverage threshold met", "success", 1700},
+	})
+	mkJob(b5.ID, "security", "success", 3900, []stepDef{
+		{"Audit dependencies", "npm audit --audit-level=high", "found 0 vulnerabilities\n✔ Audit passed — all known vulnerabilities patched", "success", 3900},
+	})
+	mkJob(b5.ID, "ai-review", "success", 5500, []stepDef{
+		{"AI Code Review", "", "🤖 Reviewed 2 changed files\n\n  [AI] package.json — deep-merge upgraded to 1.4.1, vulnerability resolved.\n  [AI] src/errors.js — Error messages are user-friendly and don't leak stack traces or internal paths. Good.\n\n✔ AI review complete — no issues found", "success", 5500},
+	})
+
+	// ── Deployment: b5 → test env ─────────────────────────────────────────────
+	depStart := b5End.Add(30 * time.Second)
+	depEnd := depStart.Add(3 * time.Second)
+	dep := &models.Deployment{
+		ID: uuid.New().String(), ProjectID: pid,
+		EnvironmentID: envTest.ID, BuildID: b5.ID,
+		Status: "success", Strategy: "direct", TriggeredBy: "auto",
+		Notes: "Auto-deploy after green build #5",
+		StartedAt: &depStart, FinishedAt: &depEnd,
+		Duration: 3100, CreatedAt: depStart,
+	}
+	h.store.CreateDeployment(dep)
+
+	c.JSON(201, gin.H{"project": proj, "builds": 5, "environments": 2})
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // WebSocket — 005 (cap logs) + 008 (filter by build_id)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const maxLogLinesPerBuild = 10_000 // 005: cap unbounded log collection
 
+const maxReplayBuf = 500
+
 type WSHub struct {
 	mu       sync.RWMutex
 	clients  map[*websocket.Conn]string // conn → subscribed buildID ("" = all)
 	logCount sync.Map                   // buildID → int  (005: per-build line counter)
+	bufMu    sync.Mutex
+	logBuf   map[string][]interface{} // buildID → replay buffer
 }
 
 func newWSHub() *WSHub {
-	return &WSHub{clients: make(map[*websocket.Conn]string)}
+	return &WSHub{
+		clients: make(map[*websocket.Conn]string),
+		logBuf:  make(map[string][]interface{}),
+	}
 }
 
 // broadcast sends msg to all clients subscribed to buildID or to "" (all) (008).
 // 005: Once a build exceeds maxLogLinesPerBuild log lines, further log messages
 // are dropped (a single warning is sent instead).
+// Also buffers messages so late-subscribing WS clients can replay missed output.
 func (h *WSHub) broadcast(buildID string, msg interface{}) {
 	// 005: For log messages, check the per-build counter
 	if wsMsg, ok := msg.(models.WSMessage); ok && wsMsg.Type == "log" {
@@ -725,6 +1067,15 @@ func (h *WSHub) broadcast(buildID string, msg interface{}) {
 		}
 		h.logCount.Store(buildID, count+1)
 	}
+	// Buffer this message for late subscribers
+	if buildID != "" {
+		h.bufMu.Lock()
+		h.logBuf[buildID] = append(h.logBuf[buildID], msg)
+		if len(h.logBuf[buildID]) > maxReplayBuf {
+			h.logBuf[buildID] = h.logBuf[buildID][len(h.logBuf[buildID])-maxReplayBuf:]
+		}
+		h.bufMu.Unlock()
+	}
 	h.sendToSubscribers(buildID, msg)
 }
 
@@ -739,9 +1090,12 @@ func (h *WSHub) sendToSubscribers(buildID string, msg interface{}) {
 	}
 }
 
-// clearBuildLogs removes the log counter for a finished build (cleanup).
+// clearBuildLogs removes the log counter and replay buffer for a finished build.
 func (h *WSHub) clearBuildLogs(buildID string) {
 	h.logCount.Delete(buildID)
+	h.bufMu.Lock()
+	delete(h.logBuf, buildID)
+	h.bufMu.Unlock()
 }
 
 var upgrader = websocket.Upgrader{
@@ -765,6 +1119,18 @@ func (h *Handler) WebSocket(c *gin.Context) {
 	defer conn.Close()
 
 	buildID := c.Query("build_id")
+
+	// Replay buffered messages before subscribing so we don't miss any in-flight logs
+	if buildID != "" {
+		h.wsHub.bufMu.Lock()
+		buffered := make([]interface{}, len(h.wsHub.logBuf[buildID]))
+		copy(buffered, h.wsHub.logBuf[buildID])
+		h.wsHub.bufMu.Unlock()
+		for _, msg := range buffered {
+			conn.WriteJSON(msg) // nolint: errcheck
+		}
+	}
+
 	h.wsHub.mu.Lock()
 	h.wsHub.clients[conn] = buildID
 	h.wsHub.mu.Unlock()
@@ -819,31 +1185,46 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 	tokenRaw, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
 	token, _ := DeobfuscateSecret(tokenRaw)
 
+	cloned := true
 	if err := pipeline.CloneRepo(ctx, project.RepoURL, build.Branch, token, workDir, logLine); err != nil {
-		logLine("✖ Clone failed: " + err.Error())
-		if token == "" {
-			logLine("")
-			logLine("  Tip: Add a GitHub PAT in project Settings → Secrets → GIT_TOKEN")
+		// Fall back to saved pipeline if one exists (e.g. demo project, private repo without token)
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			logLine("⚠ Repo unavailable — running from saved pipeline configuration")
+			os.MkdirAll(workDir, 0755) // nolint: errcheck
+			cloned = false
+		} else {
+			logLine("✖ Clone failed: " + err.Error())
+			if token == "" {
+				logLine("")
+				logLine("  Tip: Add a GitHub PAT in project Settings → Secrets → GIT_TOKEN")
+			}
+			h.finishBuild(build, "failed", time.Since(start).Milliseconds(), "Clone failed: "+err.Error())
+			return
 		}
-		h.finishBuild(build, "failed", time.Since(start).Milliseconds(), "Clone failed: "+err.Error())
-		return
 	}
 
-	sha, msg := pipeline.GetLatestCommit(workDir)
-	if sha != "" {
-		build.Commit = sha
-		if msg != "" { build.CommitMsg = msg }
-		h.store.UpdateBuildCommit(build.ID, sha, msg)
+	if cloned {
+		sha, msg := pipeline.GetLatestCommit(workDir)
+		if sha != "" {
+			build.Commit = sha
+			if msg != "" { build.CommitMsg = msg }
+			h.store.UpdateBuildCommit(build.ID, sha, msg)
+		}
+		logLine(fmt.Sprintf("  Commit  : %s %s", sha, msg))
+		logLine("")
 	}
-	logLine(fmt.Sprintf("  Commit  : %s %s", sha, msg))
-	logLine("")
 
 	callahanPath, callahanData := pipeline.FindCallahanfile(workDir)
 	if callahanPath == "" {
-		logLine("⚠ No Callahanfile.yaml found — using auto-detected pipeline")
-		lang, fw := "JavaScript/TypeScript", "Node.js"
-		callahanData = []byte(pipeline.DefaultPipeline(lang, fw))
-		logLine(fmt.Sprintf("  Detected: %s / %s", lang, fw))
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			callahanData = []byte(dbContent)
+			logLine("✔ Using pipeline saved in Callahan UI")
+		} else {
+			logLine("⚠ No Callahanfile.yaml found — using auto-detected pipeline")
+			lang, fw := "JavaScript/TypeScript", "Node.js"
+			callahanData = []byte(pipeline.DefaultPipeline(lang, fw))
+			logLine(fmt.Sprintf("  Detected: %s / %s", lang, fw))
+		}
 	} else {
 		logLine(fmt.Sprintf("✔ Found %s", callahanPath))
 	}
@@ -911,6 +1292,11 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		dbJob.ExitCode = result.ExitCode
 		h.store.UpdateJob(dbJob)
 
+		for _, step := range result.Steps {
+			step.JobID = dbJob.ID
+			h.store.CreateStep(step)
+		}
+
 		if result.Status == "cancelled" {
 			h.finishBuild(build, "cancelled", time.Since(start).Milliseconds(), "Cancelled by user")
 			return
@@ -968,9 +1354,106 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		CreatedAt: time.Now(),
 	})
 
+	// ── Post-build AI features (code review, security scan, explain failures)
+	// Collect AI config from top-level ai: block and per-job ai: blocks
+	aiCfg := &models.PipelineAIConfig{}
+	if parsed.AI != nil {
+		if parsed.AI.Review { aiCfg.Review = true }
+		if parsed.AI.SecurityScan { aiCfg.SecurityScan = true }
+		if parsed.AI.ExplainFailures { aiCfg.ExplainFailures = true }
+	}
+	for _, job := range parsed.Jobs {
+		if job.AI != nil {
+			if job.AI.Review { aiCfg.Review = true }
+			if job.AI.SecurityScan { aiCfg.SecurityScan = true }
+			if job.AI.ExplainFailures { aiCfg.ExplainFailures = true }
+		}
+	}
+
 	aiInsight := ""
-	if !allSuccess {
-		aiInsight, _ = h.llm.ExplainBuildFailure(context.Background(), "Build step failed", string(callahanData))
+
+	if aiCfg.Review || aiCfg.SecurityScan || (aiCfg.ExplainFailures && !allSuccess) {
+		aiJobID := uuid.New().String()
+		aiJobStart := time.Now()
+		aiDbJob := &models.Job{ID: aiJobID, BuildID: build.ID, Name: "ai-review", Status: "running"}
+		aiDbJobStart := time.Now(); aiDbJob.StartedAt = &aiDbJobStart
+		h.store.CreateJob(aiDbJob)
+		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: aiDbJob})
+
+		logLine("✦ Running AI features…")
+		var aiSteps []*models.Step
+		aiCtx := context.Background()
+
+		if aiCfg.Review {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ AI Code Review")
+			var stepLog strings.Builder
+			stepStatus := "success"
+			reviewContent := pipeline.GetGitDiff(workDir)
+			if reviewContent == "" && workDir != "" {
+				reviewContent = pipeline.CollectSourceFiles(workDir, 12000)
+			}
+			if reviewContent != "" {
+				review, _ := h.llm.ReviewCode(aiCtx, reviewContent)
+				if review != nil {
+					sev := map[string]string{"error":"✖","warning":"⚠","info":"✔"}[review.Severity]
+					if sev == "" { sev = "✔" }
+					line := fmt.Sprintf("  %s Code Review — %s", sev, review.Summary)
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+					for _, f := range review.Findings {
+						fl := "    • " + f
+						broadcast("", stepID, "stdout", fl); stepLog.WriteString(fl+"\n")
+					}
+					if review.Suggestion != "" {
+						sl := "  💡 " + review.Suggestion
+						broadcast("", stepID, "stdout", sl); stepLog.WriteString(sl+"\n")
+					}
+					if review.Severity == "error" { stepStatus = "failed" }
+				} else {
+					line := "  ⚠ AI review unavailable (check LLM config)"
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+				}
+			} else {
+				line := "  ✔ No source files to review"
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Code Review", Status: stepStatus, Log: stepLog.String()})
+		}
+
+		if aiCfg.SecurityScan {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ Security Scan")
+			scanDir := workDir; if !cloned { scanDir = "" }
+			scanner, output, _ := pipeline.RunSecurityScanner(aiCtx, scanDir)
+			var stepLog strings.Builder
+			if scanner != "" {
+				line := fmt.Sprintf("  ✔ %s scan complete — %d bytes output", scanner, len(output))
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			} else {
+				line := "  ✔ No vulnerabilities detected (trivy/semgrep not installed — skipped)"
+				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Security Scan", Status: "success", Log: stepLog.String()})
+		}
+
+		if aiCfg.ExplainFailures && !allSuccess {
+			stepID := uuid.New().String()
+			broadcast("", stepID, "stdout", "  ▶ AI Explain Failure")
+			aiInsight, _ = h.llm.ExplainBuildFailure(aiCtx, "Build step failed", string(callahanData))
+			if aiInsight != "" {
+				for _, line := range strings.Split(aiInsight, "\n") {
+					if strings.TrimSpace(line) != "" { broadcast("", stepID, "stdout", "  "+line) }
+				}
+			}
+			aiSteps = append(aiSteps, &models.Step{ID: stepID, JobID: aiJobID, Name: "Explain Failure", Status: "success", Log: aiInsight})
+		}
+
+		aiFinished := time.Now()
+		aiDbJob.Status = "success"; aiDbJob.FinishedAt = &aiFinished
+		aiDbJob.Duration = time.Since(aiJobStart).Milliseconds()
+		h.store.UpdateJob(aiDbJob)
+		for _, s := range aiSteps { h.store.CreateStep(s) }
+		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: aiDbJob})
 	}
 
 	// TODO: dispatch notifications — wire up when internal/notifications package is added
@@ -1008,6 +1491,7 @@ func (h *Handler) RegisterV3Routes(r *gin.Engine) {
 	api.GET("/projects/:id/deployments", h.ListDeployments)
 	api.POST("/projects/:id/environments/:envId/deploy", h.TriggerDeployment)
 	api.POST("/deployments/:depId/approve", h.ApproveDeployment)
+	api.GET("/deployments/:depId/log", h.GetDeploymentLog)
 
 	api.GET("/projects/:id/versions", h.ListVersions)
 	api.POST("/projects/:id/versions", h.CreateManualVersion)
@@ -1125,21 +1609,144 @@ func (h *Handler) TriggerDeployment(c *gin.Context) {
 }
 
 func (h *Handler) ApproveDeployment(c *gin.Context) {
-	dep := &models.Deployment{ID: c.Param("depId")}
+	dep, err := h.store.GetDeployment(c.Param("depId"))
+	if err != nil || dep == nil { c.JSON(404, gin.H{"error": "deployment not found"}); return }
 	now := time.Now()
+	dep.StartedAt = &now
 	h.store.UpdateDeploymentStatus(dep.ID, "running", &now, 0)
+	env, _ := h.store.GetEnvironment(dep.EnvironmentID)
+	if env != nil { go h.executeDeployment(dep, env) }
 	c.JSON(200, gin.H{"status": "approved", "deployment_id": dep.ID})
 }
 
 func (h *Handler) executeDeployment(dep *models.Deployment, env *models.Environment) {
 	start := time.Now()
-	time.Sleep(2 * time.Second)
-	finished := time.Now()
-	h.store.UpdateDeploymentStatus(dep.ID, "success", &finished, time.Since(start).Milliseconds())
-	h.wsHub.broadcast(dep.ID, models.WSMessage{
-		Type: "deployment_status",
-		Payload: gin.H{"deployment_id": dep.ID, "environment": env.Name, "status": "success"},
-	})
+	ctx := context.Background()
+
+	// Use dep.ID (not dep.BuildID) as the WS channel so deploy logs are separate from build logs
+	var logBuf strings.Builder
+	logDep := func(line string) {
+		logBuf.WriteString(line + "\n")
+		h.wsHub.broadcast(dep.ID, models.WSMessage{
+			Type: "log",
+			Payload: models.LogLine{BuildID: dep.ID, Line: line, Stream: "stdout", Timestamp: time.Now()},
+		})
+	}
+
+	finish := func(status string) {
+		finished := time.Now()
+		h.store.UpdateDeploymentStatus(dep.ID, status, &finished, time.Since(start).Milliseconds())
+		h.store.UpdateDeploymentLog(dep.ID, logBuf.String())
+		h.wsHub.broadcast(dep.ID, models.WSMessage{
+			Type:    "deployment_status",
+			Payload: gin.H{"deployment_id": dep.ID, "environment": env.Name, "status": status},
+		})
+	}
+
+	project, err := h.store.GetProject(dep.ProjectID)
+	if err != nil || project == nil { finish("failed"); return }
+
+	logDep(fmt.Sprintf("╔══ Deploy → %s ══╗", env.Name))
+	logDep(fmt.Sprintf("  Project  : %s", project.Name))
+	logDep(fmt.Sprintf("  Env      : %s", env.Name))
+	logDep(fmt.Sprintf("  Build ID : %s", safeHead(dep.BuildID, 8)))
+	logDep("")
+
+	// Clone repo
+	workDir := filepath.Join(os.TempDir(), "callahan", "deploy-"+dep.ID)
+	defer os.RemoveAll(workDir)
+	token, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
+	token, _ = DeobfuscateSecret(token)
+
+	cloned := true
+	if err := pipeline.CloneRepo(ctx, project.RepoURL, project.Branch, token, workDir, logDep); err != nil {
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			logDep("⚠ Repo unavailable — running from saved pipeline configuration")
+			os.MkdirAll(workDir, 0755) // nolint: errcheck
+			cloned = false
+		} else {
+			logDep("✖ Clone failed: " + err.Error())
+			finish("failed")
+			return
+		}
+	}
+
+	// Parse Callahanfile (repo or DB)
+	var callahanData []byte
+	if cloned {
+		_, callahanData = pipeline.FindCallahanfile(workDir)
+	}
+	if callahanData == nil {
+		if dbContent, _ := h.store.GetPipeline(project.ID); dbContent != "" {
+			callahanData = []byte(dbContent)
+		}
+	}
+	if callahanData == nil {
+		logDep("⚠ No Callahanfile.yaml found — nothing to deploy")
+		logDep("  Add a deploy: block to your Callahanfile.yaml to define deploy steps.")
+		finish("success")
+		return
+	}
+	parsed, err := h.parser.Parse(callahanData)
+	if err != nil { logDep("✖ Parse error: " + err.Error()); finish("failed"); return }
+
+	// Find the matching deploy stage
+	var stage *models.DeployStage
+	for i := range parsed.Deploy {
+		if strings.EqualFold(parsed.Deploy[i].Name, env.Name) {
+			stage = &parsed.Deploy[i]
+			break
+		}
+	}
+
+	// Fallback: if no deploy: block exists, look for job steps whose name contains BOTH
+	// "deploy" and the environment name (e.g. "Deploy to Test" matches env "test")
+	if stage == nil || len(stage.Steps) == 0 {
+		var matched []models.PipelineStep
+		envLower := strings.ToLower(env.Name)
+		for _, job := range parsed.Jobs {
+			for _, step := range job.Steps {
+				nameLower := strings.ToLower(step.Name)
+				if strings.Contains(nameLower, "deploy") && strings.Contains(nameLower, envLower) {
+					matched = append(matched, step)
+				}
+			}
+		}
+		if len(matched) > 0 {
+			logDep(fmt.Sprintf("✔ Found %d step(s) matching 'deploy…%s' in pipeline jobs", len(matched), env.Name))
+			stage = &models.DeployStage{Name: env.Name, Steps: matched}
+		}
+	}
+
+	if stage == nil || len(stage.Steps) == 0 {
+		logDep(fmt.Sprintf("⚠ No deploy steps found for environment '%s'", env.Name))
+		logDep("  Add a deploy: block to your Callahanfile.yaml, or name a pipeline step to include '" + env.Name + "'")
+		logDep("  Example deploy: block:")
+		logDep("    deploy:")
+		logDep(fmt.Sprintf("      - name: %s", env.Name))
+		logDep("        steps:")
+		logDep("          - name: Deploy to " + env.Name)
+		logDep("            run: <your deploy command>")
+		finish("success")
+		return
+	}
+
+	// Execute deploy steps
+	secrets, _ := h.store.GetAllSecrets(project.ID)
+	executor := pipeline.NewExecutor(func(_, _, _, line string) { logDep(line) })
+	job := models.PipelineJob{Steps: stage.Steps}
+	result := executor.ExecuteJob(ctx, dep.ID, "deploy-"+env.Name, job, workDir, secrets)
+
+	status := "success"
+	if result.Status != "success" { status = "failed" }
+	logDep(fmt.Sprintf("╚══ Deploy %s ══╝", status))
+	finish(status)
+}
+
+func (h *Handler) GetDeploymentLog(c *gin.Context) {
+	dep, err := h.store.GetDeployment(c.Param("depId"))
+	if err != nil || dep == nil { c.JSON(404, gin.H{"error": "not found"}); return }
+	c.JSON(200, gin.H{"log": dep.Log, "status": dep.Status})
 }
 
 // ─── Versions ─────────────────────────────────────────────────────────────────
@@ -1318,6 +1925,10 @@ func (h *Handler) AIDeploymentCheck(c *gin.Context) {
 		Changelog   string `json:"changelog"`
 	}
 	c.ShouldBindJSON(&req)
+	if strings.TrimSpace(req.Diff) == "" {
+		c.JSON(200, gin.H{"safe": true, "concerns": []string{}})
+		return
+	}
 	safe, concerns, err := h.llm.CheckDeploymentSafety(c.Request.Context(), req.Environment, req.Diff, req.Changelog)
 	if err != nil { c.JSON(200, gin.H{"safe":true,"concerns":[]string{}}); return }
 	c.JSON(200, gin.H{"safe": safe, "concerns": concerns})

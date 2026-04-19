@@ -119,6 +119,23 @@ CREATE INDEX IF NOT EXISTS idx_jobs_build ON jobs(build_id);
 CREATE INDEX IF NOT EXISTS idx_steps_job ON steps(job_id);
 `
 	_, err := s.db.Exec(schema)
+	if err != nil {
+		return err
+	}
+	// Add pipeline_content column if it doesn't exist (safe on existing DBs)
+	_, _ = s.db.Exec(`ALTER TABLE projects ADD COLUMN pipeline_content TEXT DEFAULT ''`)
+	return nil
+}
+
+func (s *Store) GetPipeline(projectID string) (string, error) {
+	var content string
+	err := s.db.QueryRow(`SELECT COALESCE(pipeline_content,'') FROM projects WHERE id=?`, projectID).Scan(&content)
+	if err == sql.ErrNoRows { return "", nil }
+	return content, err
+}
+
+func (s *Store) SavePipeline(projectID, content string) error {
+	_, err := s.db.Exec(`UPDATE projects SET pipeline_content=? WHERE id=?`, content, projectID)
 	return err
 }
 
@@ -515,7 +532,10 @@ CREATE INDEX IF NOT EXISTS idx_context_project ON context_entries(project_id);
 CREATE INDEX IF NOT EXISTS idx_context_type ON context_entries(type);
 `
 	_, err := s.db.Exec(schema)
-	return err
+	if err != nil { return err }
+	// Safe to run on existing DBs — ignored if column already exists
+	_, _ = s.db.Exec(`ALTER TABLE deployments ADD COLUMN log TEXT DEFAULT ''`)
+	return nil
 }
 
 // ─── Environments ─────────────────────────────────────────────────────────────
@@ -582,6 +602,11 @@ func (s *Store) UpdateDeploymentStatus(id, status string, finishedAt *time.Time,
 	return err
 }
 
+func (s *Store) UpdateDeploymentLog(id, log string) error {
+	_, err := s.db.Exec(`UPDATE deployments SET log=? WHERE id=?`, log, id)
+	return err
+}
+
 func (s *Store) ListDeployments(projectID string, limit int) ([]*models.Deployment, error) {
 	rows, err := s.db.Query(`SELECT id,project_id,environment_id,build_id,version_id,status,strategy,triggered_by,approved_by,started_at,finished_at,duration_ms,notes,created_at
 		FROM deployments WHERE project_id=? ORDER BY created_at DESC LIMIT ?`, projectID, limit)
@@ -594,6 +619,15 @@ func (s *Store) ListDeployments(projectID string, limit int) ([]*models.Deployme
 		ds = append(ds, d)
 	}
 	return ds, nil
+}
+
+func (s *Store) GetDeployment(id string) (*models.Deployment, error) {
+	d := &models.Deployment{}
+	err := s.db.QueryRow(`SELECT id,project_id,environment_id,build_id,version_id,status,strategy,triggered_by,created_at,COALESCE(log,'')
+		FROM deployments WHERE id=?`, id).
+		Scan(&d.ID,&d.ProjectID,&d.EnvironmentID,&d.BuildID,&d.VersionID,&d.Status,&d.Strategy,&d.TriggeredBy,&d.CreatedAt,&d.Log)
+	if err == sql.ErrNoRows { return nil, nil }
+	return d, err
 }
 
 func (s *Store) LatestDeploymentForEnv(envID string) (*models.Deployment, error) {

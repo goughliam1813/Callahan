@@ -2,6 +2,8 @@ package models
 
 import (
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Project represents a connected Git repository
@@ -76,8 +78,9 @@ type Pipeline struct {
 
 // PipelineAIConfig holds the top-level ai: block from Callahanfile.yaml
 type PipelineAIConfig struct {
-	Review       bool `yaml:"review" json:"review"`
-	SecurityScan bool `yaml:"security-scan" json:"security_scan"`
+	Review          bool `yaml:"review" json:"review"`
+	SecurityScan    bool `yaml:"security-scan" json:"security_scan"`
+	ExplainFailures bool `yaml:"explain-failures" json:"explain_failures"`
 }
 
 // DeployStage represents one environment in the CD daisy chain
@@ -92,10 +95,53 @@ type DeployStage struct {
 }
 
 type PipelineTrigger struct {
-	Push         *PushTrigger `yaml:"push" json:"push,omitempty"`
-	PullRequest  *PRTrigger   `yaml:"pull_request" json:"pull_request,omitempty"`
-	Schedule     []Schedule   `yaml:"schedule" json:"schedule,omitempty"`
-	WorkflowDispatch *struct{} `yaml:"workflow_dispatch" json:"workflow_dispatch,omitempty"`
+	Push             *PushTrigger `yaml:"push" json:"push,omitempty"`
+	PullRequest      *PRTrigger   `yaml:"pull_request" json:"pull_request,omitempty"`
+	Schedule         []Schedule   `yaml:"schedule" json:"schedule,omitempty"`
+	WorkflowDispatch *struct{}    `yaml:"workflow_dispatch" json:"workflow_dispatch,omitempty"`
+}
+
+// UnmarshalYAML handles both shorthand (on: [push, pull_request]) and map forms.
+func (pt *PipelineTrigger) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		for _, item := range value.Content {
+			switch item.Value {
+			case "push":
+				pt.Push = &PushTrigger{}
+			case "pull_request":
+				pt.PullRequest = &PRTrigger{}
+			}
+		}
+		return nil
+	case yaml.ScalarNode:
+		switch value.Value {
+		case "push":
+			pt.Push = &PushTrigger{}
+		case "pull_request":
+			pt.PullRequest = &PRTrigger{}
+		}
+		return nil
+	default:
+		type plain PipelineTrigger
+		return value.Decode((*plain)(pt))
+	}
+}
+
+// StringOrSlice unmarshals either a scalar string or a sequence into []string.
+type StringOrSlice []string
+
+func (s *StringOrSlice) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		*s = []string{value.Value}
+		return nil
+	}
+	var slice []string
+	if err := value.Decode(&slice); err != nil {
+		return err
+	}
+	*s = slice
+	return nil
 }
 
 type PushTrigger struct {
@@ -112,14 +158,15 @@ type Schedule struct {
 }
 
 type PipelineJob struct {
-	Name      string            `yaml:"name" json:"name"`
-	RunsOn    string            `yaml:"runs-on" json:"runs_on"`
-	Needs     []string          `yaml:"needs" json:"needs"`
-	Env       map[string]string `yaml:"env" json:"env"`
-	If        string            `yaml:"if" json:"if"`
-	Matrix    *Matrix           `yaml:"matrix" json:"matrix,omitempty"`
+	Name      string             `yaml:"name" json:"name"`
+	RunsOn    string             `yaml:"runs-on" json:"runs_on"`
+	Needs     StringOrSlice      `yaml:"needs" json:"needs"`
+	Env       map[string]string  `yaml:"env" json:"env"`
+	If        string             `yaml:"if" json:"if"`
+	Matrix    *Matrix            `yaml:"matrix" json:"matrix,omitempty"`
 	Services  map[string]Service `yaml:"services" json:"services,omitempty"`
-	Steps     []PipelineStep    `yaml:"steps" json:"steps"`
+	Steps     []PipelineStep     `yaml:"steps" json:"steps"`
+	AI        *PipelineAIConfig  `yaml:"ai" json:"ai,omitempty"`
 }
 
 type Matrix struct {
@@ -268,6 +315,7 @@ type Deployment struct {
 	FinishedAt    *time.Time `json:"finished_at,omitempty" db:"finished_at"`
 	Duration      int64      `json:"duration_ms" db:"duration_ms"`
 	Notes         string     `json:"notes,omitempty" db:"notes"`
+	Log           string     `json:"log,omitempty" db:"log"`
 	CreatedAt     time.Time  `json:"created_at" db:"created_at"`
 }
 

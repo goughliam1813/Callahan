@@ -13,8 +13,10 @@ import { pageApi as api, Project } from '@/lib/api';
 // Local Build type — compatible with both the API response and demo data
 type Build = {
   id: string; project_id: string; status: string; branch: string;
-  commit_sha: string; commit_message: string; duration: number;
-  created_at: string; started_at: string; finished_at: string;
+  number?: number; commit?: string; commitMsg?: string;
+  commit_sha?: string; commit_message?: string; duration?: number;
+  duration_ms?: number;
+  created_at: string; started_at?: string; finished_at?: string;
 };
 import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
@@ -96,12 +98,15 @@ function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
     wsRef.current = ws;
+    let cleanedUp = false;
 
     ws.onopen = () => {
-      if (!stoppedRef.current) setLines(l=>[...l,{msg:'Connected to build log stream…',color:'#545f72'}]);
+      if (cleanedUp || stoppedRef.current) return;
+      // Reset any stale lines from a prior aborted attempt
+      setLines([]);
     };
     ws.onmessage = (e) => {
-      if (stoppedRef.current) return;
+      if (cleanedUp || stoppedRef.current) return;
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'log' && msg.payload?.line) {
@@ -120,9 +125,9 @@ function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
         }
       } catch {}
     };
-    ws.onerror = () => { if (!stoppedRef.current) setLines(l=>[...l,{msg:'WebSocket error — is the backend running?',color:'#ff4455'}]); };
-    ws.onclose = () => { if (!stoppedRef.current && !stopped) setLines(l=>[...l,{msg:'Connection closed.',color:'#545f72'}]); };
-    return () => { ws.close(); };
+    ws.onerror = () => { /* suppress — retry handles it */ };
+    ws.onclose = () => { /* suppress connection noise */ };
+    return () => { cleanedUp = true; ws.close(); };
   }, [build.id]);
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [lines]);
@@ -180,7 +185,7 @@ function stepStatusColor(s: string) {
 function stepStatusIcon(s: string) {
   return s==='success'?'✔':s==='failed'?'✖':s==='running'?'▶':s==='cancelled'?'■':'○';
 }
-function StepRow({ step }: { step: any }) {
+function StepRow({ step, onExplain }: { step: any; onExplain?: (name: string, log: string) => void }) {
   const [logOpen, setLogOpen] = useState(true);
   const stepTests = parseTestResults(step.log||'');
   const stepPassed = stepTests.filter(t=>t.status==='pass').length;
@@ -207,6 +212,15 @@ function StepRow({ step }: { step: any }) {
         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
           {step.duration_ms ? `${(step.duration_ms/1000).toFixed(1)}s` : ''}
         </span>
+        {step.status === 'failed' && onExplain && (
+          <button onClick={e=>{ e.stopPropagation(); onExplain(step.name, step.log||''); }}
+            style={{ display:'flex', alignItems:'center', gap:4, padding:'3px 10px',
+              background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.3)',
+              borderRadius:5, color:'#a078ff', cursor:'pointer', fontSize:11,
+              fontFamily:"'Figtree',sans-serif", fontWeight:600, flexShrink:0 }}>
+            <Sparkles size={11}/> Explain
+          </button>
+        )}
         <ChevronDown size={12} style={{ color:'#545f72',
           transform:logOpen?'none':'rotate(-90deg)', transition:'0.15s' }}/>
       </div>
@@ -315,6 +329,22 @@ export default function App() {
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
   useEffect(() => { api.getProjects().then(setProjects).catch(()=>{}); api.getBuilds().then(setBuilds).catch(()=>{}); }, []);
 
+  const [loadingDemo, setLoadingDemo] = useState(false);
+  const loadDemo = async () => {
+    setLoadingDemo(true);
+    try {
+      const r = await fetch('http://localhost:8080/api/v1/demo/seed', { method: 'POST' });
+      const d = await r.json();
+      const projs = await api.getProjects();
+      setProjects(projs);
+      const demo = projs.find((p: Project) => p.id === d.project.id);
+      if (demo) { setSel(demo); setView('builds'); }
+      const allBuilds = await api.getBuilds();
+      setBuilds(allBuilds);
+    } catch {}
+    setLoadingDemo(false);
+  };
+
   const projBuilds = sel ? builds.filter(b=>b.project_id===sel.id) : builds;
 
   const triggerBuild = async () => {
@@ -420,12 +450,19 @@ export default function App() {
         {projects.filter(p=>!folders.some(f=>f.projects.find(fp=>fp.id===p.id))).map(p=><ProjRow key={p.id} project={p} depth={0}/>)}
 
         {projects.length===0 && (
-          <button onClick={()=>setAddProj(true)} style={{ width:'100%', padding:12,
-            border:'1px dashed rgba(255,255,255,0.12)', borderRadius:8, background:'none',
-            color:'#545f72', fontSize:12, cursor:'pointer', marginTop:8,
-            fontFamily:"'Figtree',sans-serif" }}>
-            + Connect repository
-          </button>
+          <div style={{ display:'flex', flexDirection:'column', gap:6, marginTop:8 }}>
+            <button onClick={()=>setAddProj(true)} style={{ width:'100%', padding:10,
+              border:'1px dashed rgba(255,255,255,0.12)', borderRadius:8, background:'none',
+              color:'#545f72', fontSize:12, cursor:'pointer', fontFamily:"'Figtree',sans-serif" }}>
+              + Connect repository
+            </button>
+            <button onClick={loadDemo} disabled={loadingDemo} style={{ width:'100%', padding:10,
+              border:'1px solid rgba(160,120,255,0.3)', borderRadius:8,
+              background:'rgba(160,120,255,0.07)', color: loadingDemo ? '#545f72' : '#a078ff',
+              fontSize:12, cursor: loadingDemo ? 'wait' : 'pointer', fontFamily:"'Figtree',sans-serif" }}>
+              {loadingDemo ? '⏳ Loading…' : '✦ Try Demo'}
+            </button>
+          </div>
         )}
       </div>
 
@@ -608,12 +645,19 @@ export default function App() {
       <p style={{ color:'#8892a4', fontSize:16, maxWidth:400, lineHeight:1.7, marginBottom:36 }}>
         Connect a repository to run AI-powered pipelines locally. No cloud. No agents.
       </p>
-      <div style={{ display:'flex', gap:12, marginBottom:52 }}>
+      <div style={{ display:'flex', gap:12, marginBottom:52, flexWrap:'wrap', justifyContent:'center' }}>
         <button onClick={()=>setAddProj(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'13px 24px', background:'#00d4ff', color:'#000', border:'none',
           borderRadius:8, fontSize:14, fontWeight:700, cursor:'pointer',
           fontFamily:"'Figtree',sans-serif" }}>
           <Plus size={16}/> Connect Repository
+        </button>
+        <button onClick={loadDemo} disabled={loadingDemo} style={{ display:'flex', alignItems:'center', gap:8,
+          padding:'13px 24px', background:'rgba(160,120,255,0.12)', color: loadingDemo ? '#545f72' : '#a078ff',
+          border:'1px solid rgba(160,120,255,0.35)', borderRadius:8,
+          fontSize:14, fontWeight:700, cursor: loadingDemo ? 'wait' : 'pointer',
+          fontFamily:"'Figtree',sans-serif" }}>
+          {loadingDemo ? <><Loader2 size={16} style={{animation:'spin 1s linear infinite'}}/> Loading…</> : <><Sparkles size={16}/> Try Demo</>}
         </button>
         <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'13px 24px', background:'transparent', color:'#8892a4',
@@ -674,7 +718,7 @@ export default function App() {
         {[
           { label:'Total Builds',  value: projBuilds.length.toString(), mono:true },
           { label:'Success Rate',  value: projBuilds.length?`${Math.round(projBuilds.filter(b=>b.status==='success').length/projBuilds.length*100)}%`:'—', color:'#00e5a0', mono:true },
-          { label:'Avg Duration',  value: formatDuration(projBuilds.filter(b=>b.duration).reduce((a,b)=>a+b.duration,0)/Math.max(projBuilds.filter(b=>b.duration).length,1)), mono:true },
+          { label:'Avg Duration',  value: formatDuration(projBuilds.filter(b=>b.duration??b.duration_ms).reduce((a,b)=>a+(b.duration??b.duration_ms??0),0)/Math.max(projBuilds.filter(b=>b.duration??b.duration_ms).length,1)), mono:true },
           { label:'Status',        value: sel?.status??'—', badge:true },
         ].map(s=>(
           <Card key={s.label}>
@@ -757,9 +801,25 @@ export default function App() {
 
   /* ── builds ───────────────────────────────────────────────────────────────── */
   function Builds() {
+    const [buildSubTab, setBuildSubTab] = useState<'builds'|'environments'>('builds');
+
+    // ── Builds sub-tab state
     const [jobs, setJobs] = useState<any[]>([]);
     const [steps, setSteps] = useState({} as Record<string, any[]>);
     const [expanded, setExpanded] = useState({} as Record<string, boolean>);
+
+    // ── Environments sub-tab state
+    const [envs, setEnvs] = useState<any[]>([]);
+    const [deployments, setDeployments] = useState<any[]>([]);
+    const [selDep, setSelDep] = useState<any|null>(null);
+    const [deploying, setDeploying] = useState<string|null>(null);
+    const [deployTarget, setDeployTarget] = useState<{envId:string;envName:string}|null>(null);
+    const [pickedVersion, setPickedVersion] = useState('');
+    const [showAddEnv, setShowAddEnv] = useState(false);
+    const [newEnv, setNewEnv] = useState({ name:'', description:'', color:'#00e5a0', auto_deploy:false, requires_approval:false });
+
+    const projBuilds = sel ? builds.filter(b => b.project_id === sel.id) : [];
+    const ENV_COLORS: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455', production:'#ff4455' };
 
     useEffect(() => {
       if (!selBuild || selBuild.status === 'running') return;
@@ -784,21 +844,163 @@ export default function App() {
       load();
     }, [selBuild?.id, selBuild?.status]);
 
-    const dur = (b: Build) => b.duration;
+    useEffect(() => {
+      if (!sel || buildSubTab !== 'environments') return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`).then(r=>r.json()).then(d=>setEnvs(Array.isArray(d)?d:[])).catch(()=>{});
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id, buildSubTab]);
+
+    const reloadDeployments = () => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>{
+        if (!Array.isArray(d)) return;
+        setDeployments(d);
+        // Also refresh selDep so the log viewer badge updates
+        setSelDep((prev: any) => prev ? (d.find((x: any) => x.id === prev.id) ?? prev) : null);
+      }).catch(()=>{});
+    };
+
+    const openDeployModal = (envId: string, envName: string) => {
+      const latestSuccess = projBuilds.find(b=>b.status==='success');
+      setPickedVersion(latestSuccess?.id ?? '');
+      setDeployTarget({ envId, envName });
+    };
+
+    const confirmDeploy = async () => {
+      if (!sel || !deployTarget || !pickedVersion) return;
+      const buildNum = projBuilds.find(b=>b.id===pickedVersion)?.number ?? '';
+      setDeploying(deployTarget.envId);
+      setDeployTarget(null);
+      try {
+        const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${deployTarget.envId}/deploy`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ build_id: pickedVersion, strategy:'direct', notes:`Deploy build #${buildNum}` })
+        });
+        if (r.ok) {
+          const d = await r.json();
+          setDeployments(ds=>[d,...ds]);
+          setSelDep(d);
+        }
+      } catch {}
+      setDeploying(null);
+    };
+
+    const dur = (b: Build) => b.duration ?? b.duration_ms ?? 0;
+
+    // Deploy-specific log viewer — uses dep.id as WS channel
+    function DeployLog({ dep }: { dep: any }) {
+      const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
+      const bottomRef = useRef<HTMLDivElement>(null);
+      const envForDep = envs.find((e:any) => e.id === dep.environment_id);
+      const statusColor = dep.status==='success'?'#00e5a0':dep.status==='failed'?'#ff4455':dep.status==='running'?'#00d4ff':'#f5c542';
+      const envColor = ENV_COLORS[(envForDep?.name??'').toLowerCase()] ?? '#00e5a0';
+
+      useEffect(() => {
+        setLines([]);
+        if (dep.status !== 'running') {
+          fetch(`http://localhost:8080/api/v1/deployments/${dep.id}/log`)
+            .then(r=>r.json()).then(d=>{
+              if (d.log) setLines(d.log.split('\n').filter(Boolean).map((msg:string)=>({
+                msg,
+                color: (msg.includes('✖')||msg.toLowerCase().includes('failed')) ? '#ff4455'
+                  : (msg.includes('✔')||msg.toLowerCase().includes('success')) ? '#00e5a0'
+                  : (msg.startsWith('╔')||msg.startsWith('╚')||msg.startsWith('✦')) ? '#a078ff'
+                  : msg.startsWith('▶') ? '#00d4ff' : '#8892a4'
+              })));
+            }).catch(()=>{});
+          return;
+        }
+        const proto = window.location.protocol==='https:'?'wss':'ws';
+        const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${dep.id}`);
+        let cleanedUp = false;
+        ws.onopen = () => { if (!cleanedUp) setLines([]); };
+        ws.onmessage = (e) => {
+          if (cleanedUp) return;
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type==='log' && msg.payload?.line) {
+              const raw: string = msg.payload.line;
+              setLines(l=>[...l,{msg:raw,
+                color: (raw.startsWith('✖')||raw.toLowerCase().includes('failed')) ? '#ff4455'
+                  : (raw.startsWith('✔')||raw.toLowerCase().includes('success')) ? '#00e5a0'
+                  : (raw.startsWith('╔')||raw.startsWith('╚')||raw.startsWith('✦')) ? '#a078ff'
+                  : raw.startsWith('▶') ? '#00d4ff' : '#8892a4'
+              }]);
+            }
+            if (msg.type==='deployment_status') { setTimeout(reloadDeployments, 600); }
+          } catch {}
+        };
+        ws.onerror = ()=>{}; ws.onclose = ()=>{};
+        return () => { cleanedUp=true; ws.close(); };
+      }, [dep.id, dep.status]);
+
+      useEffect(() => { bottomRef.current?.scrollIntoView({behavior:'smooth'}); }, [lines]);
+
+      return (
+        <div style={{ flex:1 }}>
+          <div style={{ marginBottom:14, display:'flex', alignItems:'center', gap:10 }}>
+            <span style={{ width:8, height:8, borderRadius:'50%', background:statusColor, flexShrink:0,
+              boxShadow:dep.status==='running'?`0 0 8px ${statusColor}`:'none' }}/>
+            <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>
+              Deploy → <span style={{color:envColor}}>{envForDep?.name ?? 'env'}</span>
+            </span>
+            <Badge status={dep.status}/>
+            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', marginLeft:'auto' }}>
+              {timeAgo(dep.created_at)}
+            </span>
+          </div>
+          <div style={{ background:'#080a0f', borderRadius:8, padding:16, maxHeight:440, overflowY:'auto',
+            fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2,
+            border:'1px solid rgba(255,255,255,0.06)' }}>
+            {lines.length===0 && dep.status==='running' && <span style={{color:'#545f72'}}>Connecting…</span>}
+            {lines.length===0 && dep.status!=='running' && <span style={{color:'#545f72'}}>No log stored for this deployment.</span>}
+            {lines.map((l,i)=><div key={i} style={{color:l.color}}>{l.msg}</div>)}
+            <div ref={bottomRef}/>
+          </div>
+        </div>
+      );
+    }
 
     return (
     <div style={{ padding:28 }}>
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
-        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
-          color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Build History</h2>
-        <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:8,
-          padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
-          borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
-          fontFamily:"'Figtree',sans-serif" }}>
-          <Play size={13} fill="#000"/> Run Build
-        </button>
+      {/* Header with sub-tab switcher */}
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:14 }}>
+          <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
+            color:'#fff', letterSpacing:'-0.03em', margin:0 }}>
+            {buildSubTab==='builds' ? 'Build History' : 'Environments'}
+          </h2>
+          <div style={{ display:'flex', background:'rgba(255,255,255,0.04)', borderRadius:7, padding:3, gap:2 }}>
+            {(['builds','environments'] as const).map(t=>(
+              <button key={t} onClick={()=>setBuildSubTab(t)} style={{
+                padding:'5px 14px', borderRadius:5, border:'none', cursor:'pointer',
+                background:buildSubTab===t?'rgba(0,212,255,0.12)':'transparent',
+                color:buildSubTab===t?'#00d4ff':'#545f72',
+                fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:buildSubTab===t?600:400,
+                transition:'all 0.15s'
+              }}>{t==='builds'?'Builds':'Environments'}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:8 }}>
+          {buildSubTab==='environments' && (
+            <button onClick={()=>setShowAddEnv(s=>!s)} style={{ display:'flex', alignItems:'center', gap:6,
+              padding:'7px 14px', background:'rgba(0,229,160,0.08)', border:'1px solid rgba(0,229,160,0.2)',
+              borderRadius:7, color:'#00e5a0', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+              <Plus size={12}/> Add Env
+            </button>
+          )}
+          <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:8,
+            padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
+            borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
+            fontFamily:"'Figtree',sans-serif" }}>
+            <Play size={13} fill="#000"/> Run Build
+          </button>
+        </div>
       </div>
 
+      {/* ══ BUILDS SUB-TAB ══════════════════════════════════════════════════════ */}
+      {buildSubTab === 'builds' && (<>
       {selBuild ? (
         <div style={{ display:'flex', gap:16, alignItems:'flex-start' }}>
           <div style={{ width:176, flexShrink:0 }}>
@@ -820,7 +1022,7 @@ export default function App() {
                     <div style={{ flex:1, minWidth:0 }}>
                       <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
                         color:active?'#00d4ff':'#e8eaf0', fontWeight:active?700:400 }}>
-                        #{b.id.slice(0,4)}
+                        #{b.number ?? b.id.slice(0,4)}
                       </div>
                       <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9,
                         color:'#545f72', marginTop:1 }}>{timeAgo(b.created_at)}</div>
@@ -922,7 +1124,6 @@ export default function App() {
                     </button>
                   </div>
                 )}
-
                 {jobs.length === 0 && (
                   <Card>
                     <div style={{ textAlign:'center', padding:'24px 0', color:'#545f72',
@@ -931,11 +1132,10 @@ export default function App() {
                     </div>
                   </Card>
                 )}
-
                 {jobs.map(job => {
                   const jobSteps = steps[job.id] || [];
                   const isExpanded = expanded[job.id] !== false;
-                  const testResults = jobSteps.flatMap(s => parseTestResults(s.log||'')); 
+                  const testResults = jobSteps.flatMap(s => parseTestResults(s.log||''));
                   const passed = testResults.filter(t=>t.status==='pass').length;
                   const failed = testResults.filter(t=>t.status==='fail').length;
                   const skipped = testResults.filter(t=>t.status==='skip').length;
@@ -957,14 +1157,26 @@ export default function App() {
                           </div>
                         )}
                         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
-                          {job.duration_ms?`${(job.duration_ms/1000).toFixed(1)}s`:''} 
+                          {job.duration_ms?`${(job.duration_ms/1000).toFixed(1)}s`:''}
                         </span>
                         <ChevronDown size={13} style={{ color:'#545f72',
                           transform:isExpanded?'none':'rotate(-90deg)', transition:'0.15s' }}/>
                       </div>
                       {isExpanded && (
                         <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-                          {jobSteps.map(step => <StepRow key={step.id} step={step}/>)}
+                          {jobSteps.map(step => <StepRow key={step.id} step={step} onExplain={(name, log) => {
+                            setAiOpen(true); setLoading(true);
+                            const msg = `Explain why the "${name}" step failed in build #${selBuild.number} for project "${sel?.name}":\n\n${log||'No log output.'}`;
+                            setMsgs(m=>[...m,{role:'user',content:msg}]);
+                            fetch('http://localhost:8080/api/v1/ai/explain-build', {
+                              method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify({ build_id: selBuild.id, logs: log, pipeline: '' }),
+                            }).then(r=>r.json()).then(d=>{
+                              setMsgs(m=>[...m,{role:'assistant',content:d.explanation||'No explanation returned.'}]);
+                            }).catch(()=>{
+                              setMsgs(m=>[...m,{role:'assistant',content:'Could not reach backend.'}]);
+                            }).finally(()=>setLoading(false));
+                          }}/>)}
                         </div>
                       )}
                     </Card>
@@ -1000,6 +1212,169 @@ export default function App() {
           ))}
         </div>
       )}
+      </>)}
+
+      {/* ══ ENVIRONMENTS SUB-TAB ════════════════════════════════════════════════ */}
+      {buildSubTab === 'environments' && (<>
+        {/* Add env form */}
+        {showAddEnv && (
+          <Card style={{ marginBottom:16, padding:16 }}>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+              {[['Name','name','text'],['Description','description','text']].map(([lbl,field])=>(
+                <div key={field}>
+                  <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:6 }}>{lbl}</div>
+                  <input value={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.value}))}
+                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)', borderRadius:6, padding:'8px 10px', color:'#e8eaf0', outline:'none', fontFamily:"'Figtree',sans-serif", fontSize:13, boxSizing:'border-box' as const }}/>
+                </div>
+              ))}
+              <div style={{ display:'flex', gap:8, alignItems:'center', marginTop:4 }}>
+                <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#8892a4' }}>
+                  <input type="checkbox" checked={newEnv.auto_deploy} onChange={e=>setNewEnv(n=>({...n,auto_deploy:e.target.checked}))}/> Auto deploy
+                </label>
+                <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#8892a4' }}>
+                  <input type="checkbox" checked={newEnv.requires_approval} onChange={e=>setNewEnv(n=>({...n,requires_approval:e.target.checked}))}/> Requires approval
+                </label>
+              </div>
+              <button onClick={async ()=>{
+                if(!sel||!newEnv.name.trim()) return;
+                const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`,{
+                  method:'POST', headers:{'Content-Type':'application/json'},
+                  body: JSON.stringify({...newEnv, color: ENV_COLORS[newEnv.name.toLowerCase()]??'#00e5a0'})
+                });
+                if(r.ok){ const e=await r.json(); setEnvs(es=>[...es,e]); setNewEnv({name:'',description:'',color:'#00e5a0',auto_deploy:false,requires_approval:false}); setShowAddEnv(false); }
+              }} style={{ padding:'8px 18px', background:'#00e5a0', color:'#000', border:'none', borderRadius:6, fontWeight:700, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, marginTop:4 }}>
+                Create Environment
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {envs.length === 0 ? (
+          <Card style={{ textAlign:'center', padding:'40px 0' }}>
+            <Globe size={28} style={{ color:'#545f72', marginBottom:10 }}/>
+            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, color:'#545f72' }}>No environments yet</div>
+            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#3a4050', marginTop:4 }}>Click Add Env to create test, staging or production environments</div>
+          </Card>
+        ) : (
+          <div style={{ display:'flex', gap:16, alignItems:'flex-start' }}>
+            {/* Left: env list */}
+            <div style={{ width:300, flexShrink:0, display:'flex', flexDirection:'column', gap:8 }}>
+              {envs.map((env:any) => {
+                const envDeps = deployments.filter(d=>d.environment_id===env.id);
+                const latestDep = envDeps[0] ?? null;
+                const envCol = ENV_COLORS[env.name?.toLowerCase()] ?? env.color ?? '#00e5a0';
+                return (
+                  <Card key={env.id} style={{ padding:0 }}>
+                    {/* Env header */}
+                    <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px', borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
+                      <span style={{ width:8, height:8, borderRadius:'50%', background:envCol, flexShrink:0 }}/>
+                      <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700, color:'#fff', flex:1 }}>{env.name}</span>
+                      {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'rgba(0,229,160,0.1)', color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
+                      {env.requires_approval && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'rgba(245,197,66,0.1)', color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
+                      <button onClick={()=>openDeployModal(env.id, env.name)} disabled={!!deploying}
+                        style={{ display:'flex', alignItems:'center', gap:5, padding:'4px 10px', background:'rgba(0,212,255,0.1)', border:'1px solid rgba(0,212,255,0.25)', borderRadius:5, color:'#00d4ff', cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                        <Rocket size={10}/> Deploy
+                      </button>
+                    </div>
+                    {/* Currently deployed */}
+                    {latestDep && latestDep.status==='success' && (
+                      <div style={{ padding:'8px 14px', borderBottom:'1px solid rgba(255,255,255,0.04)', display:'flex', alignItems:'center', gap:8 }}>
+                        <span style={{ width:6, height:6, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
+                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#00e5a0' }}>
+                          live: build #{projBuilds.find(b=>b.id===latestDep.build_id)?.number??'?'}
+                        </span>
+                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', marginLeft:'auto' }}>{timeAgo(latestDep.created_at)}</span>
+                      </div>
+                    )}
+                    {/* Deployment history */}
+                    <div style={{ display:'flex', flexDirection:'column', gap:2, padding:'6px 8px' }}>
+                      {envDeps.slice(0,5).map((d:any)=>{
+                        const isSelected = selDep?.id === d.id;
+                        const dCol = d.status==='success'?'#00e5a0':d.status==='failed'?'#ff4455':d.status==='running'?'#00d4ff':'#f5c542';
+                        const bNum = projBuilds.find(b=>b.id===d.build_id)?.number;
+                        return (
+                          <div key={d.id} onClick={()=>setSelDep(d)}
+                            style={{ display:'flex', alignItems:'center', gap:8, padding:'5px 6px', borderRadius:5, cursor:'pointer',
+                              background:isSelected?'rgba(0,212,255,0.07)':'transparent',
+                              border:`1px solid ${isSelected?'rgba(0,212,255,0.15)':'transparent'}`,
+                              transition:'background 0.12s' }}
+                            onMouseEnter={e=>{ if(!isSelected)(e.currentTarget as HTMLElement).style.background='rgba(255,255,255,0.03)'; }}
+                            onMouseLeave={e=>{ if(!isSelected)(e.currentTarget as HTMLElement).style.background='transparent'; }}>
+                            <span style={{ width:6, height:6, borderRadius:'50%', background:dCol, flexShrink:0 }}/>
+                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:dCol, width:48, flexShrink:0 }}>{d.status}</span>
+                            {bNum && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>#{bNum}</span>}
+                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', marginLeft:'auto' }}>{timeAgo(d.created_at)}</span>
+                            {d.status==='pending' && (
+                              <button onClick={async e=>{ e.stopPropagation();
+                                await fetch(`http://localhost:8080/api/v1/deployments/${d.id}/approve`,{method:'POST'});
+                                setTimeout(reloadDeployments, 800);
+                              }} style={{ padding:'2px 8px', background:'rgba(245,197,66,0.12)', border:'1px solid rgba(245,197,66,0.3)', borderRadius:4, color:'#f5c542', cursor:'pointer', fontSize:10, fontFamily:"'Figtree',sans-serif" }}>
+                                Approve
+                              </button>
+                            )}
+                          </div>
+                        );
+                      })}
+                      {envDeps.length===0 && <div style={{ padding:'8px 6px', fontSize:11, color:'#3a4050', fontFamily:"'Figtree',sans-serif", fontStyle:'italic' }}>No deployments yet</div>}
+                    </div>
+                  </Card>
+                );
+              })}
+            </div>
+
+            {/* Right: deploy log viewer */}
+            <div style={{ flex:1, minWidth:0 }}>
+              {selDep ? (
+                <Card><DeployLog dep={selDep}/></Card>
+              ) : (
+                <Card style={{ textAlign:'center', padding:'60px 0' }}>
+                  <Rocket size={28} style={{ color:'#545f72', marginBottom:10 }}/>
+                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, color:'#545f72' }}>Select a deployment to view logs</div>
+                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#3a4050', marginTop:4 }}>Or click Deploy to push a build to an environment</div>
+                </Card>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Deploy version picker modal */}
+        {deployTarget && (
+          <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center',
+            background:'rgba(0,0,0,0.7)', backdropFilter:'blur(8px)' }} onClick={()=>setDeployTarget(null)}>
+            <div style={{ background:'#111620', border:'1px solid rgba(255,255,255,0.1)', borderRadius:12, padding:28, width:480, maxHeight:'80vh', overflowY:'auto' }}
+              onClick={e=>e.stopPropagation()}>
+              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:17, fontWeight:700, color:'#fff', marginBottom:4 }}>
+                Deploy to <span style={{ color: ENV_COLORS[deployTarget.envName.toLowerCase()]??'#00e5a0' }}>{deployTarget.envName}</span>
+              </div>
+              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#545f72', marginBottom:18 }}>Pick a successful build to deploy</div>
+              <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:20 }}>
+                {projBuilds.filter(b=>b.status==='success').map(b=>(
+                  <div key={b.id} onClick={()=>setPickedVersion(b.id)}
+                    style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 12px', borderRadius:7, cursor:'pointer',
+                      background:pickedVersion===b.id?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
+                      border:`1px solid ${pickedVersion===b.id?'rgba(0,212,255,0.25)':'rgba(255,255,255,0.06)'}` }}>
+                    <span style={{ width:7, height:7, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00e5a0', fontWeight:600 }}>#{b.number??b.id.slice(0,4)}</span>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>{(b.commit??b.commit_sha??'').slice(0,7)}</span>
+                    <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif", flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{b.commit_message}</span>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', flexShrink:0 }}>{timeAgo(b.created_at)}</span>
+                  </div>
+                ))}
+                {projBuilds.filter(b=>b.status==='success').length===0 && (
+                  <div style={{ textAlign:'center', padding:'20px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>No successful builds yet — run a build first</div>
+                )}
+              </div>
+              <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>
+                <button onClick={()=>setDeployTarget(null)} style={{ padding:'9px 18px', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.1)', borderRadius:7, color:'#8892a4', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+                <button onClick={confirmDeploy} disabled={!pickedVersion}
+                  style={{ padding:'9px 22px', background: pickedVersion?'#00d4ff':'rgba(0,212,255,0.3)', color:pickedVersion?'#000':'#545f72', border:'none', borderRadius:7, fontWeight:700, cursor:pickedVersion?'pointer':'default', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+                  Deploy Build #{projBuilds.find(b=>b.id===pickedVersion)?.number ?? '—'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </>)}
     </div>
     );
   }
@@ -1030,15 +1405,59 @@ export default function App() {
 
     // ── Steps
     type Step = { id: string; name: string; run: string; continueOnError: boolean };
-    const [steps, setSteps] = useState<Step[]>([
-      { id:'1', name:'Install', run:'npm ci', continueOnError:false },
-      { id:'2', name:'Test',    run:'npm test', continueOnError:false },
-      { id:'3', name:'Build',   run:'npm run build', continueOnError:false },
-    ]);
+    const [steps, setSteps] = useState<Step[]>([]);
     const addStep = () => setSteps(s=>[...s,{ id:Date.now().toString(), name:'', run:'', continueOnError:false }]);
     const delStep = (id:string) => setSteps(s=>s.filter(x=>x.id!==id));
     const updateStep = (id:string, field:keyof Step, val:string|boolean) =>
       setSteps(s=>s.map(x=>x.id===id?{...x,[field]:val}:x));
+
+    // ── Steps toolbar (AI generate + YAML editor)
+    const [aiPrompt,     setAiPrompt]     = useState('');
+    const [aiGenerating, setAiGenerating] = useState(false);
+    const [showAiBox,    setShowAiBox]    = useState(false);
+    const [showYaml,     setShowYaml]     = useState(false);
+    const [yamlText,     setYamlText]     = useState('');
+
+    const applyYaml = (yaml: string) => {
+      const lines = yaml.split('\n');
+      const parsed: Step[] = [];
+      let i = 0;
+      while (i < lines.length) {
+        const nameLine = lines[i].match(/^\s*-\s+name:\s*(.+)$/);
+        if (nameLine) {
+          const name = nameLine[1].trim();
+          let run = ''; let continueOnError = false;
+          i++;
+          while (i < lines.length && !lines[i].match(/^\s*-\s+name:/)) {
+            const runLine = lines[i].match(/^\s+run:\s*(.+)$/);
+            const coeLine = lines[i].match(/^\s+continue-on-error:\s*true/);
+            if (runLine) run = runLine[1].trim();
+            if (coeLine) continueOnError = true;
+            i++;
+          }
+          if (name && run) parsed.push({ id: Date.now().toString()+parsed.length, name, run, continueOnError });
+        } else { i++; }
+      }
+      if (parsed.length > 0) setSteps(parsed);
+    };
+
+    const generateSteps = async () => {
+      if (!aiPrompt.trim() || !sel) return;
+      setAiGenerating(true);
+      try {
+        const r = await fetch('http://localhost:8080/api/v1/ai/generate-pipeline', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ description: aiPrompt, language: sel.language||'', framework: sel.framework||'' })
+        });
+        const d = await r.json();
+        if (d.content) {
+          applyYaml(d.content);
+          setShowAiBox(false);
+          setAiPrompt('');
+        }
+      } catch {}
+      setAiGenerating(false);
+    };
 
     // ── AI
     const [aiReview,    setAiReview]    = useState(true);
@@ -1080,6 +1499,31 @@ export default function App() {
       fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
       fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`).then(r=>r.json()).then(d=>setChannels(Array.isArray(d)?d:[])).catch(()=>{});
       fetch(`http://localhost:8080/api/v1/projects/${sel.id}/versions`).then(r=>r.json()).then(d=>setVersions(Array.isArray(d)?d:[])).catch(()=>{});
+      // Load saved pipeline and parse steps
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`).then(r=>r.json()).then(d=>{
+        if (!d.content) return;
+        const lines = d.content.split('\n');
+        const parsed: Step[] = [];
+        let i = 0;
+        while (i < lines.length) {
+          const nameLine = lines[i].match(/^\s*-\s+name:\s*(.+)$/);
+          if (nameLine) {
+            const name = nameLine[1].trim();
+            let run = '';
+            let continueOnError = false;
+            i++;
+            while (i < lines.length && !lines[i].match(/^\s*-\s+name:/)) {
+              const runLine = lines[i].match(/^\s+run:\s*(.+)$/);
+              const coeLine = lines[i].match(/^\s+continue-on-error:\s*true/);
+              if (runLine) run = runLine[1].trim();
+              if (coeLine) continueOnError = true;
+              i++;
+            }
+            if (name && run) parsed.push({ id: Date.now().toString() + parsed.length, name, run, continueOnError });
+          } else { i++; }
+        }
+        if (parsed.length > 0) setSteps(parsed);
+      }).catch(()=>{});
     }, [sel?.id]);
 
     const savePipeline = async () => {
@@ -1123,29 +1567,28 @@ export default function App() {
       setEnvs(e=>e.filter(x=>x.id!==id));
     };
     const openDeployModal = (envId: string, envName: string) => {
-      setPickedVersion('latest');
+      const latestSuccess = projBuilds.find(b=>b.status==='success');
+      setPickedVersion(latestSuccess?.id ?? '');
       setDeployTarget({ envId, envName });
     };
     const confirmDeploy = async () => {
-      if (!sel || !deployTarget) return;
+      if (!sel || !deployTarget || !pickedVersion) return;
+      const buildId = pickedVersion; // pickedVersion is now always a build ID
+      const buildNum = projBuilds.find(b=>b.id===buildId)?.number ?? '';
       setDeploying(deployTarget.envId);
       setDeployTarget(null);
-      // AI guardrail
-      const guard = await fetch('http://localhost:8080/api/v1/ai/deployment-check', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ environment: deployTarget.envName, diff:'', changelog:'' })
-      });
-      if (guard.ok) { const g = await guard.json(); setGuardResult(g); if(!g.safe) { setDeploying(null); return; } }
-      const buildId = pickedVersion === 'latest'
-        ? projBuilds.find(b=>b.status==='success')?.id || projBuilds[0]?.id
-        : versions.find(v=>v.tag===pickedVersion)?.build_id;
-      if (!buildId) { setDeploying(null); return; }
       const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${deployTarget.envId}/deploy`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ build_id: buildId, strategy:'direct', notes:`Deploy ${pickedVersion} — Manual` })
+        body: JSON.stringify({ build_id: buildId, strategy:'direct', notes:`Deploy build #${buildNum} — Manual` })
       });
-      if (r.ok) { const d = await r.json(); setDeployments(ds=>[d,...ds]); }
-      setDeploying(null); setGuardResult(null);
+      if (r.ok) {
+        const d = await r.json(); setDeployments(ds=>[d,...ds]);
+        setTimeout(() => {
+          fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`)
+            .then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
+        }, 3200);
+      }
+      setDeploying(null);
     };
     const lastDepForEnv = (envId: string) => deployments.find(d=>d.environment_id===envId);
 
@@ -1192,7 +1635,6 @@ export default function App() {
       { id:'triggers',     label:'Triggers',     icon:<Zap size={13}/> },
       { id:'steps',        label:'Steps',        icon:<Terminal size={13}/> },
       { id:'ai',           label:'AI',           icon:<Sparkles size={13}/> },
-      { id:'environments', label:'Environments', icon:<Globe size={13}/> },
       { id:'notifications',label:'Notifications',icon:<Bell size={13}/> },
     ];
 
@@ -1298,58 +1740,121 @@ export default function App() {
           {/* ── STEPS ─────────────────────────────────────────────────── */}
           {tab==='steps' && (
             <div style={{ maxWidth:720 }}>
+              {/* toolbar */}
               <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
                 <SectionLabel>Build Steps</SectionLabel>
-                <button onClick={addStep} style={{ display:'flex', alignItems:'center', gap:6,
-                  padding:'6px 14px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
-                  borderRadius:6, color:'#00d4ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                  <Plus size={12}/> Add Step
-                </button>
-              </div>
-              <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-                {steps.map((s, idx)=>(
-                  <Card key={s.id} style={{ padding:'14px 18px' }}>
-                    <div style={{ display:'flex', alignItems:'flex-start', gap:12 }}>
-                      <div style={{ width:24, height:24, borderRadius:6, background:'rgba(0,212,255,0.1)',
-                        border:'1px solid rgba(0,212,255,0.2)', display:'flex', alignItems:'center',
-                        justifyContent:'center', flexShrink:0, marginTop:2 }}>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#00d4ff' }}>{idx+1}</span>
-                      </div>
-                      <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 2fr', gap:10 }}>
-                        <div>
-                          <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Step Name</div>
-                          <input style={{ ...inputStyle, fontSize:12 }} value={s.name} placeholder="e.g. Install"
-                            onChange={e=>updateStep(s.id,'name',e.target.value)}/>
-                        </div>
-                        <div>
-                          <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Command</div>
-                          <input style={{ ...monoInput }} value={s.run} placeholder="npm ci"
-                            onChange={e=>updateStep(s.id,'run',e.target.value)}/>
-                        </div>
-                      </div>
-                      <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:6 }}>
-                        <label style={{ display:'flex', alignItems:'center', gap:5, cursor:'pointer' }}>
-                          <input type="checkbox" checked={s.continueOnError}
-                            onChange={e=>updateStep(s.id,'continueOnError',e.target.checked)}/>
-                          <span style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif", whiteSpace:'nowrap' }}>
-                            Continue on error
-                          </span>
-                        </label>
-                        <button onClick={()=>delStep(s.id)} style={{ background:'none', border:'none',
-                          cursor:'pointer', color:'#545f72', lineHeight:0, padding:4 }}
-                          onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
-                          onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
-                          <Trash2 size={13}/>
-                        </button>
-                      </div>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-              {steps.length===0 && (
-                <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
-                  No steps yet — click Add Step or use AI to generate them
+                <div style={{ display:'flex', gap:8 }}>
+                  <button onClick={()=>{ setShowYaml(v=>!v); setYamlText(steps.map(s=>`      - name: ${s.name}\n        run: ${s.run}${s.continueOnError?'\n        continue-on-error: true':''}`).join('\n')); }}
+                    style={{ display:'flex', alignItems:'center', gap:5,
+                      padding:'6px 12px', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.1)',
+                      borderRadius:6, color:'#8892a4', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+                    {showYaml ? 'Form view' : 'Edit YAML'}
+                  </button>
+                  <button onClick={()=>setShowAiBox(v=>!v)} style={{ display:'flex', alignItems:'center', gap:5,
+                    padding:'6px 12px', background:'rgba(160,120,255,0.08)', border:'1px solid rgba(160,120,255,0.2)',
+                    borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+                    <Sparkles size={11}/> Generate with AI
+                  </button>
+                  {!showYaml && <button onClick={addStep} style={{ display:'flex', alignItems:'center', gap:5,
+                    padding:'6px 12px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
+                    borderRadius:6, color:'#00d4ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+                    <Plus size={12}/> Add Step
+                  </button>}
                 </div>
+              </div>
+
+              {/* AI prompt box */}
+              {showAiBox && (
+                <Card style={{ marginBottom:14, padding:'14px 16px' }}>
+                  <div style={{ fontSize:12, color:'#a078ff', fontWeight:600, marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>
+                    ✦ Describe your pipeline in plain English
+                  </div>
+                  <textarea value={aiPrompt} onChange={e=>setAiPrompt(e.target.value)}
+                    placeholder="e.g. Test and build a Go CLI tool, run go vet, go test, then go build"
+                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(160,120,255,0.2)',
+                      borderRadius:6, padding:'10px 12px', color:'#e8eaf0', outline:'none',
+                      fontFamily:"'Figtree',sans-serif", fontSize:13, resize:'vertical', minHeight:72,
+                      boxSizing:'border-box' }}/>
+                  <div style={{ display:'flex', gap:8, marginTop:10 }}>
+                    <button onClick={()=>setShowAiBox(false)} style={{ padding:'7px 14px', background:'transparent',
+                      border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72',
+                      cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Cancel</button>
+                    <button onClick={generateSteps} disabled={aiGenerating||!aiPrompt.trim()} style={{ display:'flex', alignItems:'center', gap:6,
+                      padding:'7px 18px', background:'#a078ff', border:'none', borderRadius:6,
+                      color:'#000', cursor:aiGenerating?'wait':'pointer', fontSize:12,
+                      fontFamily:"'Figtree',sans-serif", fontWeight:700, opacity:aiGenerating?0.6:1 }}>
+                      {aiGenerating ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Generating…</> : <><Sparkles size={12}/> Generate</>}
+                    </button>
+                  </div>
+                </Card>
+              )}
+
+              {/* YAML editor */}
+              {showYaml ? (
+                <Card style={{ padding:'14px 16px' }}>
+                  <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>
+                    Paste or edit YAML steps — then click Apply
+                  </div>
+                  <textarea value={yamlText} onChange={e=>setYamlText(e.target.value)}
+                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)',
+                      borderRadius:6, padding:'12px', color:'#e8eaf0', outline:'none',
+                      fontFamily:"'IBM Plex Mono',monospace", fontSize:12, resize:'vertical', minHeight:180,
+                      boxSizing:'border-box', lineHeight:1.6 }}/>
+                  <button onClick={()=>{ applyYaml(yamlText); setShowYaml(false); }}
+                    style={{ marginTop:10, padding:'7px 18px', background:'#00d4ff', border:'none',
+                      borderRadius:6, color:'#000', cursor:'pointer', fontSize:12,
+                      fontFamily:"'Figtree',sans-serif", fontWeight:700 }}>
+                    Apply YAML
+                  </button>
+                </Card>
+              ) : (
+                <>
+                  <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+                    {steps.map((s, idx)=>(
+                      <Card key={s.id} style={{ padding:'14px 18px' }}>
+                        <div style={{ display:'flex', alignItems:'flex-start', gap:12 }}>
+                          <div style={{ width:24, height:24, borderRadius:6, background:'rgba(0,212,255,0.1)',
+                            border:'1px solid rgba(0,212,255,0.2)', display:'flex', alignItems:'center',
+                            justifyContent:'center', flexShrink:0, marginTop:2 }}>
+                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#00d4ff' }}>{idx+1}</span>
+                          </div>
+                          <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 2fr', gap:10 }}>
+                            <div>
+                              <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Step Name</div>
+                              <input style={{ ...inputStyle, fontSize:12 }} value={s.name} placeholder="e.g. Install"
+                                onChange={e=>updateStep(s.id,'name',e.target.value)}/>
+                            </div>
+                            <div>
+                              <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Command</div>
+                              <input style={{ ...monoInput }} value={s.run} placeholder="e.g. go test ./..."
+                                onChange={e=>updateStep(s.id,'run',e.target.value)}/>
+                            </div>
+                          </div>
+                          <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:6 }}>
+                            <label style={{ display:'flex', alignItems:'center', gap:5, cursor:'pointer' }}>
+                              <input type="checkbox" checked={s.continueOnError}
+                                onChange={e=>updateStep(s.id,'continueOnError',e.target.checked)}/>
+                              <span style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif", whiteSpace:'nowrap' }}>
+                                Continue on error
+                              </span>
+                            </label>
+                            <button onClick={()=>delStep(s.id)} style={{ background:'none', border:'none',
+                              cursor:'pointer', color:'#545f72', lineHeight:0, padding:4 }}
+                              onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
+                              onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                              <Trash2 size={13}/>
+                            </button>
+                          </div>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
+                  {steps.length===0 && (
+                    <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+                      No steps yet — click Add Step, Generate with AI, or Edit YAML
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -1378,7 +1883,7 @@ export default function App() {
 
           {/* ── ENVIRONMENTS ──────────────────────────────────────────── */}
           {tab==='environments' && (
-            <div style={{ maxWidth:840 }}>
+            <div style={{ maxWidth:900 }}>
               <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
                 <SectionLabel>Deploy Environments</SectionLabel>
                 <button onClick={()=>setShowAddEnv(s=>!s)} style={{ display:'flex', alignItems:'center', gap:6,
@@ -1457,49 +1962,122 @@ export default function App() {
               )}
 
               {/* Env cards */}
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
+              <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
                 {envs.map(env=>{
-                  const dep = lastDepForEnv(env.id);
+                  const envDeps = deployments.filter(d=>d.environment_id===env.id).slice(0,5);
+                  const latestDep = envDeps[0];
+                  const deployedBuild = latestDep ? projBuilds.find(b=>b.id===latestDep.build_id) : null;
                   const isDeploying = deploying===env.id;
                   return (
-                    <Card key={env.id} style={{ borderLeft:`3px solid ${env.color||'#545f72'}` }}>
-                      <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:10 }}>
-                        <div>
-                          <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:3 }}>
-                            <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>{env.name}</span>
-                            {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 6px', borderRadius:4,
-                              background:'rgba(0,229,160,0.1)', color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
-                            {env.requires_approval && <span style={{ fontSize:10, padding:'2px 6px', borderRadius:4,
-                              background:'rgba(245,197,66,0.1)', color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
-                          </div>
-                          {env.branch_filter && <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>branch: {env.branch_filter}</div>}
+                    <Card key={env.id} style={{ borderLeft:`3px solid ${env.color||'#545f72'}`, padding:0, overflow:'hidden' }}>
+                      {/* Header row */}
+                      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                        padding:'14px 16px', borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
+                        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>{env.name}</span>
+                          {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4,
+                            background:'rgba(0,229,160,0.1)', color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
+                          {env.requires_approval && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4,
+                            background:'rgba(245,197,66,0.1)', color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
+                          {env.branch_filter && <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>branch: {env.branch_filter}</span>}
                         </div>
-                        <button onClick={()=>deleteEnv(env.id)} style={{ background:'none', border:'none',
-                          cursor:'pointer', color:'#545f72', lineHeight:0 }}
-                          onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
-                          onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
-                          <Trash2 size={13}/>
-                        </button>
+                        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                          <button onClick={()=>openDeployModal(env.id, env.name)} disabled={isDeploying}
+                            style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px',
+                              background: isDeploying?'rgba(0,212,255,0.05)':'rgba(0,212,255,0.12)',
+                              border:`1px solid ${isDeploying?'rgba(0,212,255,0.1)':'rgba(0,212,255,0.3)'}`,
+                              borderRadius:6, color:isDeploying?'#545f72':'#00d4ff', cursor:isDeploying?'wait':'pointer',
+                              fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
+                            {isDeploying ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Deploying…</> : <><Rocket size={12}/> Deploy</>}
+                          </button>
+                          <button onClick={()=>deleteEnv(env.id)} style={{ background:'none', border:'none',
+                            cursor:'pointer', color:'#545f72', lineHeight:0 }}
+                            onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
+                            onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                            <Trash2 size={13}/>
+                          </button>
+                        </div>
                       </div>
 
-                      {dep && (
-                        <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace",
-                          marginBottom:10, padding:'6px 8px', background:'rgba(255,255,255,0.03)',
-                          borderRadius:5, display:'flex', alignItems:'center', gap:6 }}>
-                          <span style={{ width:6, height:6, borderRadius:'50%', flexShrink:0,
-                            background: dep.status==='success'?'#00e5a0':dep.status==='running'?'#00d4ff':'#545f72' }}/>
-                          Last deploy: {dep.status} · {new Date(dep.created_at).toLocaleDateString()}
+                      {/* Currently deployed */}
+                      <div style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,0.04)',
+                        background:'rgba(255,255,255,0.015)' }}>
+                        <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
+                          fontFamily:"'IBM Plex Mono',monospace", marginBottom:6 }}>Currently Deployed</div>
+                        {deployedBuild && latestDep?.status === 'success' ? (
+                          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                            <span style={{ width:7, height:7, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
+                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00e5a0', fontWeight:600 }}>
+                              #{deployedBuild.number ?? '?'}
+                            </span>
+                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
+                              {deployedBuild.commit?.slice(0,7) ?? deployedBuild.commit_sha?.slice(0,7) ?? ''}
+                            </span>
+                            <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif",
+                              flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                              {deployedBuild.commit_message ?? deployedBuild.commitMsg ?? ''}
+                            </span>
+                            <span style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
+                              {timeAgo(latestDep.created_at)}
+                            </span>
+                          </div>
+                        ) : (
+                          <div style={{ fontSize:12, color:'#545f72', fontFamily:"'Figtree',sans-serif", fontStyle:'italic' }}>
+                            {latestDep ? `Last deploy: ${latestDep.status}` : 'Nothing deployed yet'}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Deployment history */}
+                      {envDeps.length > 0 && (
+                        <div style={{ padding:'10px 16px' }}>
+                          <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
+                            fontFamily:"'IBM Plex Mono',monospace", marginBottom:8 }}>Deployment History</div>
+                          <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+                            {envDeps.map((d,i)=>{
+                              const b = projBuilds.find(b=>b.id===d.build_id);
+                              const statusColor = d.status==='success'?'#00e5a0':d.status==='running'?'#00d4ff':d.status==='pending'?'#f5c542':'#ff4455';
+                              return (
+                                <div key={d.id}
+                                  onClick={b ? ()=>{ setView('builds'); setSelBuild(b); } : undefined}
+                                  style={{ display:'flex', alignItems:'center', gap:10,
+                                  padding:'6px 8px', borderRadius:5, cursor: b ? 'pointer' : 'default',
+                                  background: i===0 ? 'rgba(255,255,255,0.025)' : 'transparent',
+                                  transition:'background 0.12s' }}
+                                  onMouseEnter={b?e=>(e.currentTarget.style.background='rgba(255,255,255,0.04)'):undefined}
+                                  onMouseLeave={b?e=>(e.currentTarget.style.background=i===0?'rgba(255,255,255,0.025)':'transparent'):undefined}>
+                                  <span style={{ width:6, height:6, borderRadius:'50%', background:statusColor, flexShrink:0 }}/>
+                                  <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:statusColor, width:52, flexShrink:0 }}>{d.status}</span>
+                                  {b && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:52, flexShrink:0 }}>
+                                    build #{b.number ?? '?'}
+                                  </span>}
+                                  {b && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:52, flexShrink:0 }}>
+                                    {(b.commit??b.commit_sha??'').slice(0,7)}
+                                  </span>}
+                                  {b && <span style={{ fontSize:11, color:'#8892a4', fontFamily:"'Figtree',sans-serif",
+                                    flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                                    {b.commit_message ?? b.commitMsg ?? ''}
+                                  </span>}
+                                  <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
+                                    {timeAgo(d.created_at)}
+                                  </span>
+                                  {d.status==='pending' && (
+                                    <button onClick={async ()=>{
+                                      await fetch(`http://localhost:8080/api/v1/deployments/${d.id}/approve`,{method:'POST'});
+                                      setTimeout(()=>fetch(`http://localhost:8080/api/v1/projects/${sel!.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{}), 3200);
+                                    }} style={{ padding:'3px 10px', background:'rgba(245,197,66,0.12)',
+                                      border:'1px solid rgba(245,197,66,0.3)', borderRadius:5,
+                                      color:'#f5c542', cursor:'pointer', fontSize:11,
+                                      fontFamily:"'Figtree',sans-serif", flexShrink:0 }}>
+                                      Approve
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                       )}
-
-                      <button onClick={()=>openDeployModal(env.id, env.name)} disabled={isDeploying}
-                        style={{ width:'100%', padding:'8px', display:'flex', alignItems:'center', justifyContent:'center', gap:7,
-                          background: isDeploying ? 'rgba(0,212,255,0.05)' : 'rgba(0,212,255,0.1)',
-                          border:`1px solid ${isDeploying?'rgba(0,212,255,0.1)':'rgba(0,212,255,0.25)'}`,
-                          borderRadius:7, color: isDeploying?'#545f72':'#00d4ff', cursor:isDeploying?'wait':'pointer',
-                          fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
-                        {isDeploying ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Deploying…</> : <><Rocket size={12}/> Deploy</>}
-                      </button>
                     </Card>
                   );
                 })}
@@ -1641,84 +2219,106 @@ export default function App() {
         </div>
 
         {/* ── Deploy version picker modal */}
-        {deployTarget && (
+        {deployTarget && (() => {
+          const successBuilds = projBuilds.filter(b=>b.status==='success');
+          const envForModal = envs.find(e=>e.id===deployTarget.envId);
+          const currentDep = deployments.find(d=>d.environment_id===deployTarget.envId && d.status==='success');
+          const currentBuild = currentDep ? projBuilds.find(b=>b.id===currentDep.build_id) : null;
+          return (
           <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center',
             justifyContent:'center', background:'rgba(0,0,0,0.7)', backdropFilter:'blur(6px)' }}
             onClick={()=>setDeployTarget(null)}>
-            <div style={{ width:440, background:'#0d1117', border:'1px solid rgba(255,255,255,0.14)',
-              borderRadius:12, padding:26, boxShadow:'0 32px 80px rgba(0,0,0,0.7)' }}
+            <div style={{ width:520, background:'#0d1117', border:'1px solid rgba(255,255,255,0.14)',
+              borderRadius:12, padding:24, boxShadow:'0 32px 80px rgba(0,0,0,0.7)', maxHeight:'85vh', display:'flex', flexDirection:'column' }}
               onClick={e=>e.stopPropagation()}>
-              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:18 }}>
+
+              {/* Header */}
+              <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:16 }}>
                 <div>
-                  <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:17, fontWeight:700, color:'#fff', margin:0 }}>
-                    Deploy to {deployTarget.envName}
+                  <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:17, fontWeight:700, color:'#fff', margin:'0 0 4px' }}>
+                    Deploy to <span style={{ color: envForModal?.color||'#00d4ff' }}>{deployTarget.envName}</span>
                   </h3>
-                  <p style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#545f72', margin:'3px 0 0' }}>
-                    Pick which version to deploy
-                  </p>
+                  {currentBuild ? (
+                    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
+                      Currently running: build #{currentBuild.number} · {(currentBuild.commit??currentBuild.commit_sha??'').slice(0,7)}
+                    </div>
+                  ) : (
+                    <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#545f72' }}>Nothing deployed yet</div>
+                  )}
                 </div>
                 <button onClick={()=>setDeployTarget(null)} style={{ background:'none', border:'none',
                   cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={15}/></button>
               </div>
 
-              {/* latest option */}
-              <div onClick={()=>setPickedVersion('latest')} style={{ display:'flex', alignItems:'center', gap:12,
-                padding:'12px 14px', borderRadius:8, cursor:'pointer', marginBottom:8,
-                background: pickedVersion==='latest' ? 'rgba(0,212,255,0.08)' : 'rgba(255,255,255,0.02)',
-                border:`1px solid ${pickedVersion==='latest' ? 'rgba(0,212,255,0.3)' : 'rgba(255,255,255,0.08)'}` }}>
-                <div style={{ width:12, height:12, borderRadius:'50%', border:'2px solid',
-                  borderColor: pickedVersion==='latest' ? '#00d4ff' : '#545f72',
-                  background: pickedVersion==='latest' ? '#00d4ff' : 'transparent', flexShrink:0 }}/>
-                <div>
-                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600, color:'#fff' }}>Latest successful build</div>
-                  <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', marginTop:2 }}>
-                    {projBuilds.find(b=>b.status==='success')?.commit_sha?.slice(0,7) ?? 'no successful builds yet'}
-                  </div>
-                </div>
-              </div>
+              {/* Build list */}
+              <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
+                fontFamily:"'IBM Plex Mono',monospace", marginBottom:8 }}>Select Build to Deploy</div>
 
-              {/* specific versions */}
-              {versions.length > 0 && (
-                <div>
-                  <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.08em', textTransform:'uppercase',
-                    fontFamily:"'IBM Plex Mono',monospace", margin:'12px 0 6px' }}>Specific Version</div>
-                  <div style={{ maxHeight:200, overflowY:'auto', display:'flex', flexDirection:'column', gap:4 }}>
-                    {versions.map(v=>(
-                      <div key={v.id} onClick={()=>setPickedVersion(v.tag)} style={{ display:'flex', alignItems:'center', gap:12,
-                        padding:'9px 12px', borderRadius:7, cursor:'pointer',
-                        background: pickedVersion===v.tag ? 'rgba(160,120,255,0.08)' : 'transparent',
-                        border:`1px solid ${pickedVersion===v.tag ? 'rgba(160,120,255,0.25)' : 'rgba(255,255,255,0.06)'}` }}>
-                        <div style={{ width:10, height:10, borderRadius:'50%', border:'2px solid',
-                          borderColor: pickedVersion===v.tag ? '#a078ff' : '#545f72',
-                          background: pickedVersion===v.tag ? '#a078ff' : 'transparent', flexShrink:0 }}/>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color: pickedVersion===v.tag ? '#fff' : '#8892a4', fontWeight:600 }}>
-                          {v.tag}
+              {successBuilds.length === 0 ? (
+                <div style={{ padding:'20px', textAlign:'center', color:'#545f72',
+                  fontFamily:"'Figtree',sans-serif", fontSize:13, fontStyle:'italic' }}>
+                  No successful builds yet — run a build first
+                </div>
+              ) : (
+                <div style={{ overflowY:'auto', display:'flex', flexDirection:'column', gap:4, flex:1, minHeight:0 }}>
+                  {successBuilds.map(b=>{
+                    const bid = b.id;
+                    const isSelected = pickedVersion === bid;
+                    const isCurrent = currentBuild?.id === bid;
+                    const sha = (b.commit??b.commit_sha??'').slice(0,7);
+                    const msg = b.commit_message ?? b.commitMsg ?? '';
+                    return (
+                      <div key={bid} onClick={()=>setPickedVersion(bid)}
+                        style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 12px',
+                          borderRadius:7, cursor:'pointer',
+                          background: isSelected ? 'rgba(0,212,255,0.06)' : 'rgba(255,255,255,0.02)',
+                          border:`1px solid ${isSelected ? 'rgba(0,212,255,0.3)' : 'rgba(255,255,255,0.07)'}` }}>
+                        <div style={{ width:11, height:11, borderRadius:'50%', border:'2px solid', flexShrink:0,
+                          borderColor: isSelected ? '#00d4ff' : '#545f72',
+                          background: isSelected ? '#00d4ff' : 'transparent' }}/>
+                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00d4ff', fontWeight:700, width:52, flexShrink:0 }}>
+                          #{b.number}
                         </span>
-                        <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", marginLeft:'auto' }}>
-                          {new Date(v.created_at).toLocaleDateString()}
+                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:48, flexShrink:0 }}>
+                          {sha}
                         </span>
+                        <span style={{ fontSize:12, color: isSelected?'#fff':'#8892a4', fontFamily:"'Figtree',sans-serif",
+                          flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+                          {msg || b.branch}
+                        </span>
+                        <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
+                          {timeAgo(b.created_at)}
+                        </span>
+                        {isCurrent && <span style={{ fontSize:10, padding:'2px 6px', borderRadius:4, flexShrink:0,
+                          background:'rgba(0,229,160,0.1)', color:'#00e5a0',
+                          fontFamily:"'IBM Plex Mono',monospace" }}>live</span>}
                       </div>
-                    ))}
-                  </div>
+                    );
+                  })}
                 </div>
               )}
 
-              <div style={{ display:'flex', gap:10, marginTop:18 }}>
+              <div style={{ display:'flex', gap:10, marginTop:16 }}>
                 <button onClick={()=>setDeployTarget(null)} style={{ flex:1, padding:'10px',
                   background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
                   borderRadius:7, color:'#8892a4', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
                   Cancel
                 </button>
-                <button onClick={confirmDeploy} style={{ flex:2, padding:'10px', display:'flex',
-                  alignItems:'center', justifyContent:'center', gap:8,
-                  background:'#00d4ff', border:'none', borderRadius:7, color:'#000',
-                  cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
-                  <Rocket size={13}/> Deploy {pickedVersion==='latest' ? 'Latest' : pickedVersion}
+                <button onClick={confirmDeploy} disabled={!pickedVersion || successBuilds.length===0}
+                  style={{ flex:2, padding:'10px', display:'flex', alignItems:'center', justifyContent:'center', gap:8,
+                  background: (!pickedVersion || successBuilds.length===0) ? 'rgba(0,212,255,0.2)' : '#00d4ff',
+                  border:'none', borderRadius:7, color:'#000', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700,
+                  cursor: (!pickedVersion || successBuilds.length===0) ? 'not-allowed' : 'pointer' }}>
+                  <Rocket size={13}/>
+                  {pickedVersion && successBuilds.find(b=>b.id===pickedVersion)
+                    ? `Deploy Build #${successBuilds.find(b=>b.id===pickedVersion)!.number}`
+                    : 'Select a build'}
                 </button>
               </div>
             </div>
           </div>
-        )}
+          );
+        })()}
       </div>
     );
   };
@@ -2019,7 +2619,7 @@ export default function App() {
             style={{ flex:1, background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
               borderRadius:8, padding:'10px 14px', color:'#e8eaf0', outline:'none',
               fontSize:13, fontFamily:"'Figtree',sans-serif" }}/>
-          <button onClick={send} disabled={loading} style={{ width:36, height:36, borderRadius:8,
+          <button onClick={send} disabled={loading} style={{ width:36, height:36,
             background: loading?'#111620':'#00d4ff', color: loading?'#545f72':'#000',
             border:'none', borderRadius:8, cursor: loading?'not-allowed':'pointer', lineHeight:0,
             transition:'all 0.15s' }}>
@@ -2205,6 +2805,9 @@ export default function App() {
                         background:`${BUMP_COLORS[v.bump_type]||'#545f72'}20`,
                         color:BUMP_COLORS[v.bump_type]||'#545f72',
                         fontFamily:"'IBM Plex Mono',monospace", fontWeight:600 }}>{v.bump_type}</span>
+                      {v.build_id && (() => { const bNum = projBuilds.find((b:any)=>b.id===v.build_id)?.number; return bNum ? (
+                        <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>build #{bNum}</span>
+                      ) : null; })()}
                       {v.git_tagged && <span style={{ fontSize:10, color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>⬧ git tagged</span>}
                     </div>
                     <span style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
@@ -2399,7 +3002,9 @@ export default function App() {
         if (res.ok) { const d = await res.json(); id = d.id; }
       } catch {}
       const p: Project = { id, name: name.trim(), repo_url: repo,
-        provider:'github', branch: branch||'main', status:'active', created_at: new Date().toISOString() };
+        provider:'github', branch: branch||'main', status:'active',
+        description:'', language:'', framework:'', health_score:0,
+        created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
       setProjects(prev => [...prev, p]);
       if (folderId) setFolders(fs => fs.map(f => f.id===folderId ? { ...f, projects:[...f.projects,p] } : f));
       setSel(p);

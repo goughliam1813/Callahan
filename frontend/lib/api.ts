@@ -155,6 +155,10 @@ export const pageApi = {
       method: 'POST',
       body: JSON.stringify({ artifact_version_id: artifactVersionId ?? '' }),
     }),
+  updateProject: (id: string, data: Partial<Project>) =>
+    request<Project>(`/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteProject: (id: string) =>
+    request<void>(`/projects/${id}`, { method: 'DELETE' }),
   aiChat: (message: string, projectId?: string) =>
     request<{ response?: string; message?: string }>('/ai/chat', {
       method: 'POST',
