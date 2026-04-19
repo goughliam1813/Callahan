@@ -274,6 +274,22 @@ Callahan auto-detects and configures runners for:
 ---
 
 
+## 📋 Changelog
+
+### v1.1.0
+- Environments moved into Builds view — deploy and view logs from one place
+- Per-step AI explain button on failed steps
+- Build history shows sequential build numbers
+- Version History shows which build created each version
+- AI review now reads top-level `ai:` block in Callahanfile.yaml
+- Code review falls back to source file scan when no git diff available
+- Deploy logs stored and served independently from build logs
+
+### v1.0.0
+- Initial release
+
+---
+
 ## ⚠️ Disclaimer
 
 Callahan CI is provided **"as is"** without warranty of any kind. The authors are not liable for any damages arising from the use of this software. See [LICENSE](LICENSE) for full terms.
