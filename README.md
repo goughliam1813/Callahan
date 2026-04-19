@@ -2,7 +2,9 @@
 
 # 🛸 Callahan CI
 
-**AI-native, serverless CI/CD — local-first, zero cloud required**
+**AI-native, self-hosted CI/CD — local-first, zero cloud required**
+
+![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-orange.svg)](LICENSE)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8.svg)](https://go.dev)
@@ -32,12 +34,14 @@ Callahan is an open-source CI/CD platform that runs entirely on your machine. Th
 |---------|-------------|
 | **Local-first execution** | Runs directly on your machine — no agents, no VMs. Docker container mode coming soon. |
 | **AI Pipeline Architect** | Describe your pipeline in plain English — Callahan writes the YAML. |
-| **AI Build Debugger** | Chat with your failing build: "Why did step 3 fail?" |
-| **AI Code Reviewer** | Automatic AI code review on every build, shown as expandable job cards with findings and fix suggestions. |
+| **AI Build Debugger** | Click **Explain** on any failed step to get an instant AI explanation of exactly what went wrong. |
+| **AI Code Reviewer** | Automatic code review on every build — runs as a job card with severity, findings, and fix suggestions. |
 | **Security built-in** | AI-powered security scanning on every build. Supports Trivy and Semgrep if installed. |
-| **Any LLM** | OpenAI, Anthropic Claude, Google Gemini, Groq, Ollama (local), and more. |
+| **Environments & Deployments** | Deploy to dev/test/staging/prod from the Builds view. Each deployment has its own logs. |
+| **Any LLM** | OpenAI, Anthropic Claude, Groq, Ollama (local), and more. Switch provider from the UI. |
 | **Project folders** | Organise repos into folders in the sidebar. |
-| **Beautiful UI** | Modern dark dashboard with Jenkins-style build history, expandable job cards, and command palette (⌘K). |
+| **Version History** | Automatic SemVer tagging on every successful build with full changelog timeline. |
+| **Beautiful UI** | Modern dark dashboard with build history, expandable job cards, and command palette (⌘K). |
 | **Single binary** | Go backend + SQLite. No external database or message queue. |
 
 ---
@@ -148,7 +152,7 @@ Generate a full `Callahanfile.yaml` from natural language:
 ```
 
 ### Build Debugger
-Open any failed build → click **AI Explain**. The agent reads your logs and explains what went wrong in plain English with specific fix suggestions.
+Open any failed build → click **Explain** on the failed step. The agent reads that step's output and explains exactly what went wrong with specific fix suggestions.
 
 ### Code Reviewer
 Runs an AI code review on every successful build. Results appear as expandable job cards with severity, findings, and fix suggestions. Enable in your `Callahanfile.yaml`:
@@ -190,8 +194,9 @@ jobs:
         run: npm run build
 
 ai:
-  review: true           # AI code review after every build
+  review: true            # AI code review after every build
   security-scan: true     # AI security analysis after every build
+  explain-failures: true  # AI explains failed steps automatically
 ```
 
 ---
