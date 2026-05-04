@@ -41,6 +41,10 @@ type Config struct {
 	// API token for simple authentication (001)
 	// Set via CALLAHAN_API_TOKEN env var. Empty = auth disabled (dev convenience).
 	APIToken string
+
+	// Shared secret for verifying inbound webhooks from GitHub/GitLab.
+	// Set via CALLAHAN_WEBHOOK_SECRET. Empty = verification disabled (dev convenience).
+	WebhookSecret string
 }
 
 func Load() *Config {
@@ -64,6 +68,7 @@ func Load() *Config {
 		TelemetryEnabled:   getBoolEnv("TELEMETRY_ENABLED", false),
 		DevMode:            getBoolEnv("DEV_MODE", false),
 		APIToken:           getEnv("CALLAHAN_API_TOKEN", ""),
+		WebhookSecret:      getEnv("CALLAHAN_WEBHOOK_SECRET", ""),
 	}
 }
 
@@ -77,6 +82,7 @@ func (c *Config) GetGroqKey() string            { c.mu.RLock(); defer c.mu.RUnlo
 func (c *Config) GetGoogleKey() string          { c.mu.RLock(); defer c.mu.RUnlock(); return c.GoogleKey }
 func (c *Config) GetOllamaURL() string          { c.mu.RLock(); defer c.mu.RUnlock(); return c.OllamaURL }
 func (c *Config) GetAPIToken() string           { c.mu.RLock(); defer c.mu.RUnlock(); return c.APIToken }
+func (c *Config) GetWebhookSecret() string      { c.mu.RLock(); defer c.mu.RUnlock(); return c.WebhookSecret }
 
 func (c *Config) SetLLMProvider(v string) { c.mu.Lock(); defer c.mu.Unlock(); c.DefaultLLMProvider = v }
 func (c *Config) SetLLMModel(v string)    { c.mu.Lock(); defer c.mu.Unlock(); c.DefaultLLMModel = v }

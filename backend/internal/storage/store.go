@@ -124,6 +124,9 @@ CREATE INDEX IF NOT EXISTS idx_steps_job ON steps(job_id);
 	}
 	// Add pipeline_content column if it doesn't exist (safe on existing DBs)
 	_, _ = s.db.Exec(`ALTER TABLE projects ADD COLUMN pipeline_content TEXT DEFAULT ''`)
+	// Add PR tracking columns to builds (idempotent — error swallowed if already added)
+	_, _ = s.db.Exec(`ALTER TABLE builds ADD COLUMN pr_number INTEGER DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE builds ADD COLUMN repo_slug TEXT DEFAULT ''`)
 	return nil
 }
 
@@ -211,17 +214,18 @@ func (s *Store) DeleteProject(id string) error {
 // Builds
 func (s *Store) CreateBuild(b *models.Build) error {
 	_, err := s.db.Exec(`
-		INSERT INTO builds (id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		INSERT INTO builds (id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight,pr_number,repo_slug)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		b.ID, b.ProjectID, b.Number, b.Status, b.Branch, b.Commit, b.CommitMsg,
-		b.Author, b.Duration, b.StartedAt, b.FinishedAt, b.CreatedAt, b.Trigger, b.AIInsight)
+		b.Author, b.Duration, b.StartedAt, b.FinishedAt, b.CreatedAt, b.Trigger, b.AIInsight,
+		b.PRNumber, b.RepoSlug)
 	return err
 }
 
 func (s *Store) GetBuild(id string) (*models.Build, error) {
 	b := &models.Build{}
-	err := s.db.QueryRow(`SELECT id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight FROM builds WHERE id=?`, id).
-		Scan(&b.ID, &b.ProjectID, &b.Number, &b.Status, &b.Branch, &b.Commit, &b.CommitMsg, &b.Author, &b.Duration, &b.StartedAt, &b.FinishedAt, &b.CreatedAt, &b.Trigger, &b.AIInsight)
+	err := s.db.QueryRow(`SELECT id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight,COALESCE(pr_number,0),COALESCE(repo_slug,'') FROM builds WHERE id=?`, id).
+		Scan(&b.ID, &b.ProjectID, &b.Number, &b.Status, &b.Branch, &b.Commit, &b.CommitMsg, &b.Author, &b.Duration, &b.StartedAt, &b.FinishedAt, &b.CreatedAt, &b.Trigger, &b.AIInsight, &b.PRNumber, &b.RepoSlug)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -229,7 +233,7 @@ func (s *Store) GetBuild(id string) (*models.Build, error) {
 }
 
 func (s *Store) ListBuilds(projectID string, limit int) ([]*models.Build, error) {
-	rows, err := s.db.Query(`SELECT id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight FROM builds WHERE project_id=? ORDER BY number DESC LIMIT ?`, projectID, limit)
+	rows, err := s.db.Query(`SELECT id,project_id,number,status,branch,commit_sha,commit_message,author,duration_ms,started_at,finished_at,created_at,trigger,ai_insight,COALESCE(pr_number,0),COALESCE(repo_slug,'') FROM builds WHERE project_id=? ORDER BY number DESC LIMIT ?`, projectID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +241,7 @@ func (s *Store) ListBuilds(projectID string, limit int) ([]*models.Build, error)
 	var builds []*models.Build
 	for rows.Next() {
 		b := &models.Build{}
-		if err := rows.Scan(&b.ID, &b.ProjectID, &b.Number, &b.Status, &b.Branch, &b.Commit, &b.CommitMsg, &b.Author, &b.Duration, &b.StartedAt, &b.FinishedAt, &b.CreatedAt, &b.Trigger, &b.AIInsight); err != nil {
+		if err := rows.Scan(&b.ID, &b.ProjectID, &b.Number, &b.Status, &b.Branch, &b.Commit, &b.CommitMsg, &b.Author, &b.Duration, &b.StartedAt, &b.FinishedAt, &b.CreatedAt, &b.Trigger, &b.AIInsight, &b.PRNumber, &b.RepoSlug); err != nil {
 			return nil, err
 		}
 		builds = append(builds, b)

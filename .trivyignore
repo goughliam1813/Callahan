@@ -1,0 +1,7 @@
+# Trivy ignore file for Callahan CI repo
+# Format: one CVE/misconfig ID per line; lines starting with # are comments.
+# See https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+
+# Example ignores (uncomment when triaged):
+# CVE-2023-12345
+# AVD-DS-0001

@@ -38,6 +38,8 @@ type Build struct {
 	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
 	Trigger     string     `json:"trigger" db:"trigger"` // push, pr, manual, schedule
 	AIInsight   string     `json:"ai_insight,omitempty" db:"ai_insight"`
+	PRNumber    int        `json:"pr_number,omitempty" db:"pr_number"`     // 0 = not a PR build
+	RepoSlug    string     `json:"repo_slug,omitempty" db:"repo_slug"`     // owner/repo for SCM API calls
 }
 
 // Job represents a job within a pipeline build

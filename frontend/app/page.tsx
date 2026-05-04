@@ -2873,7 +2873,10 @@ export default function App() {
     const testConnection = async () => {
       setTesting(true); setStatus(null);
       try {
-        const r = await fetch('http://localhost:8080/api/v1/settings/llm/test', { method:'POST' });
+        const r = await fetch('http://localhost:8080/api/v1/settings/llm/test', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider, model, api_key:apiKey, ollama_url:ollamaURL })
+        });
         const d = await r.json();
         setStatus(d.ok ? {ok:true,msg:`Connected — ${d.model||model}`} : {ok:false,msg:d.error||'Connection failed'});
       } catch { setStatus({ok:false,msg:'Backend offline'}); }

@@ -1,0 +1,19 @@
+# Semgrep ignore file for Callahan CI repo
+# Skips paths from semgrep --config auto scans.
+
+# Vendored / build artefacts
+node_modules/
+vendor/
+dist/
+build/
+target/
+.next/
+coverage/
+
+# Test fixtures (often deliberately insecure)
+**/testdata/
+**/fixtures/
+
+# Generated code
+**/*.pb.go
+**/*_generated.go

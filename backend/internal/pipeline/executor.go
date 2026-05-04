@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -314,6 +315,21 @@ func DetectLanguageFromFiles(files []string) (string, string) {
 	return "unknown", "unknown"
 }
 
+// DetectLanguageFromDir scans the top level of workDir for a recognised
+// project marker (go.mod, package.json, etc.) and returns (language, framework).
+// Returns ("unknown","unknown") if workDir can't be read or contains no marker.
+func DetectLanguageFromDir(workDir string) (string, string) {
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return "unknown", "unknown"
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return DetectLanguageFromFiles(names)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // AI Pipeline Helpers — used by handlers.go for post-build AI review & security scan
 // ──────────────────────────────────────────────────────────────────────────────
@@ -404,8 +420,17 @@ func CollectSourceFiles(workDir string, maxBytes int) string {
 func RunSecurityScanner(ctx context.Context, workDir string) (scanner, output string, err error) {
 	// Try trivy first
 	if _, lookErr := exec.LookPath("trivy"); lookErr == nil {
-		cmd := exec.CommandContext(ctx, "trivy", "fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM", "--scanners", "vuln,secret,misconfig", workDir)
-		out, runErr := cmd.CombinedOutput()
+		args := []string{"fs", "--format", "json", "--severity", "CRITICAL,HIGH,MEDIUM", "--scanners", "vuln,secret,misconfig"}
+		// Honour repo-local .trivyignore if present
+		if workDir != "" {
+			if _, statErr := os.Stat(filepath.Join(workDir, ".trivyignore")); statErr == nil {
+				args = append(args, "--ignorefile", filepath.Join(workDir, ".trivyignore"))
+			}
+		}
+		args = append(args, workDir)
+		cmd := exec.CommandContext(ctx, "trivy", args...)
+		// Trivy writes JSON to stdout and progress logs to stderr — must not mix them.
+		out, runErr := cmd.Output()
 		if runErr == nil || len(out) > 0 {
 			return "trivy", string(out), nil
 		}
@@ -414,7 +439,7 @@ func RunSecurityScanner(ctx context.Context, workDir string) (scanner, output st
 	// Try semgrep
 	if _, lookErr := exec.LookPath("semgrep"); lookErr == nil {
 		cmd := exec.CommandContext(ctx, "semgrep", "--json", "--config", "auto", workDir)
-		out, runErr := cmd.CombinedOutput()
+		out, runErr := cmd.Output()
 		if runErr == nil || len(out) > 0 {
 			return "semgrep", string(out), nil
 		}
@@ -422,4 +447,178 @@ func RunSecurityScanner(ctx context.Context, workDir string) (scanner, output st
 
 	// Neither installed
 	return "", "", nil
+}
+
+// extractJSON trims any non-JSON prefix/suffix (progress logs, warnings) so
+// json.Unmarshal succeeds even when stdout contains noise. Looks for the first
+// '{' or '[' and the matching last '}' or ']'.
+func extractJSON(raw string) string {
+	s := strings.TrimSpace(raw)
+	start := strings.IndexAny(s, "{[")
+	if start < 0 {
+		return s
+	}
+	end := strings.LastIndexAny(s, "}]")
+	if end <= start {
+		return s
+	}
+	return s[start : end+1]
+}
+
+// ParseScannerOutput converts raw Trivy or Semgrep JSON into a SecurityScanResult.
+// Returns a zero-value result with Scanner="" if output is empty/unparseable.
+func ParseScannerOutput(scanner, raw string) *models.SecurityScanResult {
+	if raw == "" {
+		return nil
+	}
+	switch scanner {
+	case "trivy":
+		return parseTrivy(raw)
+	case "semgrep":
+		return parseSemgrep(raw)
+	}
+	return nil
+}
+
+// trivy fs --format json output shape (subset):
+// { "Results": [ { "Target": "...", "Vulnerabilities": [...], "Misconfigurations": [...], "Secrets": [...] } ] }
+type trivyOutput struct {
+	Results []struct {
+		Target          string `json:"Target"`
+		Vulnerabilities []struct {
+			VulnerabilityID  string `json:"VulnerabilityID"`
+			PkgName          string `json:"PkgName"`
+			InstalledVersion string `json:"InstalledVersion"`
+			FixedVersion     string `json:"FixedVersion"`
+			Severity         string `json:"Severity"`
+			Title            string `json:"Title"`
+			Description      string `json:"Description"`
+		} `json:"Vulnerabilities"`
+		Misconfigurations []struct {
+			ID          string `json:"ID"`
+			Title       string `json:"Title"`
+			Description string `json:"Description"`
+			Severity    string `json:"Severity"`
+			Resolution  string `json:"Resolution"`
+		} `json:"Misconfigurations"`
+		Secrets []struct {
+			RuleID    string `json:"RuleID"`
+			Category  string `json:"Category"`
+			Severity  string `json:"Severity"`
+			Title     string `json:"Title"`
+			StartLine int    `json:"StartLine"`
+		} `json:"Secrets"`
+	} `json:"Results"`
+}
+
+func parseTrivy(raw string) *models.SecurityScanResult {
+	var t trivyOutput
+	if err := json.Unmarshal([]byte(extractJSON(raw)), &t); err != nil {
+		return nil
+	}
+	res := &models.SecurityScanResult{Scanner: "trivy"}
+	for _, r := range t.Results {
+		for _, v := range r.Vulnerabilities {
+			f := models.SecurityFinding{
+				ID: v.VulnerabilityID, Severity: v.Severity,
+				Title:       fmt.Sprintf("%s in %s@%s", v.VulnerabilityID, v.PkgName, v.InstalledVersion),
+				Description: v.Title, File: r.Target, Fix: v.FixedVersion,
+			}
+			res.Findings = append(res.Findings, f)
+			countSeverity(res, v.Severity)
+		}
+		for _, m := range r.Misconfigurations {
+			f := models.SecurityFinding{
+				ID: m.ID, Severity: m.Severity, Title: m.Title,
+				Description: m.Description, File: r.Target, Fix: m.Resolution,
+			}
+			res.Findings = append(res.Findings, f)
+			countSeverity(res, m.Severity)
+		}
+		for _, s := range r.Secrets {
+			f := models.SecurityFinding{
+				ID: s.RuleID, Severity: s.Severity, Title: s.Title,
+				Description: "Secret detected (" + s.Category + ")",
+				File:        r.Target, Line: s.StartLine,
+			}
+			res.Findings = append(res.Findings, f)
+			countSeverity(res, s.Severity)
+		}
+	}
+	finalize(res)
+	return res
+}
+
+// semgrep --json output shape (subset):
+// { "results": [ { "check_id": "...", "path": "...", "start": {"line": N}, "extra": {"severity": "...", "message": "..."} } ] }
+type semgrepOutput struct {
+	Results []struct {
+		CheckID string `json:"check_id"`
+		Path    string `json:"path"`
+		Start   struct {
+			Line int `json:"line"`
+		} `json:"start"`
+		Extra struct {
+			Severity string `json:"severity"`
+			Message  string `json:"message"`
+		} `json:"extra"`
+	} `json:"results"`
+}
+
+func parseSemgrep(raw string) *models.SecurityScanResult {
+	var s semgrepOutput
+	if err := json.Unmarshal([]byte(extractJSON(raw)), &s); err != nil {
+		return nil
+	}
+	res := &models.SecurityScanResult{Scanner: "semgrep"}
+	for _, r := range s.Results {
+		// Semgrep uses INFO/WARNING/ERROR — normalise to LOW/MEDIUM/HIGH
+		sev := strings.ToUpper(r.Extra.Severity)
+		switch sev {
+		case "ERROR":
+			sev = "HIGH"
+		case "WARNING":
+			sev = "MEDIUM"
+		case "INFO":
+			sev = "LOW"
+		}
+		res.Findings = append(res.Findings, models.SecurityFinding{
+			ID: r.CheckID, Severity: sev, Title: r.CheckID,
+			Description: r.Extra.Message, File: r.Path, Line: r.Start.Line,
+		})
+		countSeverity(res, sev)
+	}
+	finalize(res)
+	return res
+}
+
+func countSeverity(r *models.SecurityScanResult, sev string) {
+	switch strings.ToUpper(sev) {
+	case "CRITICAL":
+		r.Critical++
+	case "HIGH":
+		r.High++
+	case "MEDIUM":
+		r.Medium++
+	case "LOW":
+		r.Low++
+	}
+}
+
+func finalize(r *models.SecurityScanResult) {
+	r.TotalFindings = len(r.Findings)
+	switch {
+	case r.Critical > 0 || r.High > 0:
+		r.Severity = "error"
+		r.Summary = fmt.Sprintf("%d critical, %d high severity findings", r.Critical, r.High)
+	case r.Medium > 0:
+		r.Severity = "warning"
+		r.Summary = fmt.Sprintf("%d medium severity findings", r.Medium)
+	case r.Low > 0 || r.TotalFindings > 0:
+		r.Severity = "info"
+		r.Summary = fmt.Sprintf("%d low severity findings", r.Low)
+	default:
+		r.Severity = "info"
+		r.Summary = "No vulnerabilities detected"
+	}
 }

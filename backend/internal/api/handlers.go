@@ -30,6 +30,7 @@ import (
 
 	"github.com/callahan-ci/callahan/internal/llm"
 	"github.com/callahan-ci/callahan/internal/pipeline"
+	"github.com/callahan-ci/callahan/internal/scm"
 	"github.com/callahan-ci/callahan/internal/storage"
 	"github.com/callahan-ci/callahan/pkg/config"
 	"github.com/callahan-ci/callahan/pkg/models"
@@ -362,6 +363,12 @@ func (h *Handler) GetPipeline(c *gin.Context) {
 			if _, callahanData := pipeline.FindCallahanfile(workDir); callahanData != nil {
 				content = string(callahanData)
 				h.store.SavePipeline(p.ID, content)
+			} else if p.Language == "" {
+				// Repo cloned but no Callahanfile — capture detected language so the
+				// default-pipeline fallback below picks the right template.
+				if lang, fw := pipeline.DetectLanguageFromDir(workDir); lang != "unknown" {
+					p.Language, p.Framework = lang, fw
+				}
 			}
 		}
 	}
@@ -741,9 +748,7 @@ func (h *Handler) ReviewCode(c *gin.Context) {
 	c.JSON(200, review)
 }
 
-func (h *Handler) Webhook(c *gin.Context) {
-	c.JSON(200, gin.H{"provider": c.Param("provider"), "status": "received"})
-}
+// Webhook is implemented in webhook.go.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Demo seed
@@ -1221,7 +1226,13 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 			logLine("✔ Using pipeline saved in Callahan UI")
 		} else {
 			logLine("⚠ No Callahanfile.yaml found — using auto-detected pipeline")
-			lang, fw := "JavaScript/TypeScript", "Node.js"
+			lang, fw := pipeline.DetectLanguageFromDir(workDir)
+			if lang == "unknown" && project.Language != "" {
+				lang, fw = project.Language, project.Framework
+			}
+			if lang == "unknown" {
+				lang, fw = "JavaScript/TypeScript", "Node.js"
+			}
 			callahanData = []byte(pipeline.DefaultPipeline(lang, fw))
 			logLine(fmt.Sprintf("  Detected: %s / %s", lang, fw))
 		}
@@ -1371,6 +1382,8 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 	}
 
 	aiInsight := ""
+	var capturedReview *models.AIReview
+	var capturedScan *models.SecurityScanResult
 
 	if aiCfg.Review || aiCfg.SecurityScan || (aiCfg.ExplainFailures && !allSuccess) {
 		aiJobID := uuid.New().String()
@@ -1396,6 +1409,7 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 			if reviewContent != "" {
 				review, _ := h.llm.ReviewCode(aiCtx, reviewContent)
 				if review != nil {
+					capturedReview = review
 					sev := map[string]string{"error":"✖","warning":"⚠","info":"✔"}[review.Severity]
 					if sev == "" { sev = "✔" }
 					line := fmt.Sprintf("  %s Code Review — %s", sev, review.Summary)
@@ -1427,8 +1441,21 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 			scanner, output, _ := pipeline.RunSecurityScanner(aiCtx, scanDir)
 			var stepLog strings.Builder
 			if scanner != "" {
-				line := fmt.Sprintf("  ✔ %s scan complete — %d bytes output", scanner, len(output))
-				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+				parsed := pipeline.ParseScannerOutput(scanner, output)
+				if parsed != nil {
+					capturedScan = parsed
+					line := fmt.Sprintf("  ✔ %s scan: %s (critical=%d high=%d medium=%d low=%d)",
+						scanner, parsed.Summary, parsed.Critical, parsed.High, parsed.Medium, parsed.Low)
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+					for i, f := range parsed.Findings {
+						if i >= 10 { break } // cap log noise
+						fl := fmt.Sprintf("    • [%s] %s — %s", f.Severity, f.Title, f.File)
+						broadcast("", stepID, "stdout", fl); stepLog.WriteString(fl+"\n")
+					}
+				} else {
+					line := fmt.Sprintf("  ✔ %s scan complete — %d bytes raw output (parser found no findings)", scanner, len(output))
+					broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
+				}
 			} else {
 				line := "  ✔ No vulnerabilities detected (trivy/semgrep not installed — skipped)"
 				broadcast("", stepID, "stdout", line); stepLog.WriteString(line+"\n")
@@ -1454,6 +1481,11 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 		h.store.UpdateJob(aiDbJob)
 		for _, s := range aiSteps { h.store.CreateStep(s) }
 		h.wsHub.broadcast(build.ID, models.WSMessage{Type: "job_status", Payload: aiDbJob})
+
+		// Post combined results back to the PR if this build was triggered by one.
+		if build.PRNumber > 0 && build.RepoSlug != "" && (capturedReview != nil || capturedScan != nil) {
+			h.postPRComment(build, project, capturedReview, capturedScan, aiInsight, allSuccess, logLine)
+		}
 	}
 
 	// TODO: dispatch notifications — wire up when internal/notifications package is added
@@ -1465,6 +1497,89 @@ func (h *Handler) runPipeline(ctx context.Context, build *models.Build, project 
 func safeHead(s string, n int) string {
 	if len(s) <= n { return s }
 	return s[:n]
+}
+
+// postPRComment formats the AI review + security scan into a single markdown
+// comment and posts it back to the PR/MR via the SCM provider's API.
+// It uses the project's GIT_TOKEN secret for auth and logs success/failure
+// to the build log (does not fail the build on post errors).
+func (h *Handler) postPRComment(
+	build *models.Build, project *models.Project,
+	review *models.AIReview, scan *models.SecurityScanResult,
+	aiInsight string, allSuccess bool, logLine func(string),
+) {
+	tokenRaw, _ := h.store.GetSecret(project.ID, "GIT_TOKEN")
+	token, _ := DeobfuscateSecret(tokenRaw)
+	if token == "" {
+		logLine("⚠ PR comment skipped — no GIT_TOKEN secret configured")
+		return
+	}
+
+	body := buildPRCommentBody(build, review, scan, aiInsight, allSuccess)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := scm.PostComment(ctx, project.Provider, build.RepoSlug, build.PRNumber, token, body); err != nil {
+		logLine("⚠ PR comment failed: " + err.Error())
+		return
+	}
+	logLine(fmt.Sprintf("✔ Posted AI review to %s PR #%d", project.Provider, build.PRNumber))
+}
+
+// buildPRCommentBody formats a markdown comment summarising AI review + scan.
+func buildPRCommentBody(
+	build *models.Build, review *models.AIReview, scan *models.SecurityScanResult,
+	aiInsight string, allSuccess bool,
+) string {
+	var b strings.Builder
+	statusIcon := "✅"
+	if !allSuccess { statusIcon = "❌" }
+	b.WriteString(fmt.Sprintf("### %s Callahan CI — Build #%d\n\n", statusIcon, build.Number))
+
+	if review != nil {
+		sevIcon := map[string]string{"error": "🔴", "warning": "🟡", "info": "🟢"}[review.Severity]
+		if sevIcon == "" { sevIcon = "🟢" }
+		b.WriteString(fmt.Sprintf("**%s AI Code Review** — %s\n\n", sevIcon, review.Summary))
+		if len(review.Findings) > 0 {
+			b.WriteString("Findings:\n")
+			for _, f := range review.Findings {
+				b.WriteString("- " + f + "\n")
+			}
+			b.WriteString("\n")
+		}
+		if review.Suggestion != "" {
+			b.WriteString("💡 **Suggestion:** " + review.Suggestion + "\n\n")
+		}
+	}
+
+	if scan != nil {
+		b.WriteString(fmt.Sprintf("**🔒 Security Scan (%s)** — %s\n\n", scan.Scanner, scan.Summary))
+		if scan.TotalFindings > 0 {
+			b.WriteString(fmt.Sprintf("| Critical | High | Medium | Low |\n|---|---|---|---|\n| %d | %d | %d | %d |\n\n",
+				scan.Critical, scan.High, scan.Medium, scan.Low))
+			limit := 10
+			if len(scan.Findings) < limit { limit = len(scan.Findings) }
+			b.WriteString("Top findings:\n")
+			for i := 0; i < limit; i++ {
+				f := scan.Findings[i]
+				loc := f.File
+				if f.Line > 0 { loc = fmt.Sprintf("%s:%d", f.File, f.Line) }
+				b.WriteString(fmt.Sprintf("- **[%s]** %s — `%s`\n", f.Severity, f.Title, loc))
+			}
+			if len(scan.Findings) > limit {
+				b.WriteString(fmt.Sprintf("\n_…and %d more findings (full results in Callahan UI)._\n", len(scan.Findings)-limit))
+			}
+			b.WriteString("\n")
+		}
+	}
+
+	if aiInsight != "" {
+		b.WriteString("**🧠 Failure analysis:**\n\n" + aiInsight + "\n\n")
+	}
+
+	b.WriteString("---\n")
+	b.WriteString(fmt.Sprintf("_Posted by Callahan CI · branch `%s` · commit `%s`_", build.Branch, safeHead(build.Commit, 8)))
+	return b.String()
 }
 
 func (h *Handler) finishBuild(build *models.Build, status string, duration int64, aiInsight string) {
