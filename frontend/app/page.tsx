@@ -5,22 +5,20 @@ import {
   Shield, Search, Sparkles, Command, Lock, FileCode, Loader2,
   GitCommit, X, Send, FolderOpen, Folder, ChevronDown,
   Trash2, GitBranch, Zap, Activity, ChevronRight,
-  Globe, Bell, Tag, Rocket, Package, AlertTriangle, CheckSquare,
-  RotateCcw, ExternalLink, Copy, ChevronUp
+  Globe, Bell, Tag, Rocket, Package, AlertTriangle, CheckSquare
 } from 'lucide-react';
 import { pageApi as api, Project } from '@/lib/api';
+import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
 // Local Build type — compatible with both the API response and demo data
 type Build = {
   id: string; project_id: string; status: string; branch: string;
-  number?: number; commit?: string; commitMsg?: string;
-  commit_sha?: string; commit_message?: string; duration?: number;
-  duration_ms?: number;
-  created_at: string; started_at?: string; finished_at?: string;
+  commit_sha: string; commit_message: string;
+  duration: number; duration_ms: number; number: number;
+  created_at: string; started_at: string; finished_at: string;
 };
-import { formatDuration, timeAgo, statusStyles } from '@/lib/utils';
 
-type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config' | 'versions';
+type View = 'dashboard' | 'builds' | 'pipeline' | 'secrets' | 'settings' | 'llm-config' | 'environments' | 'notifications' | 'versions';
 type ChatMsg = { role: 'user' | 'assistant'; content: string };
 type FolderItem = { id: string; name: string; expanded: boolean; projects: Project[] };
 
@@ -55,7 +53,7 @@ function Badge({ status }: { status: string }) {
   );
 }
 
-/* ─── logo ────────────────────────────────────────────────────────────────── */
+/* ─── logo — exactly matches website ─────────────────────────────────────── */
 function Logo({ size = 28 }: { size?: number }) {
   return (
     <div style={{ width:size, height:size, background:'#00d4ff', borderRadius:Math.round(size*0.214),
@@ -84,89 +82,165 @@ function Card({ children, style = {}, onClick }: { children: React.ReactNode; st
   );
 }
 
-/* ─── real live build log via WebSocket ──────────────────────────────────── */
-function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
-  const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
-  const [stopped, setStopped] = useState(false);
-  const [stopping, setStopping] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const wsRef = useRef<WebSocket|null>(null);
-  const stoppedRef = useRef(false);
+ /* ─── real live build log via WebSocket ──────────────────────────────────── */
+ function RunningLog({ build, onStop }: { build: Build; onStop: ()=>void }) {
+   const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
+   const [stopped, setStopped] = useState(false);
+   const [stopping, setStopping] = useState(false);
+   const [elapsed, setElapsed] = useState(0);
+   const [currentStep, setCurrentStep] = useState('Connecting…');
+   const bottomRef = useRef<HTMLDivElement>(null);
+   const wsRef = useRef<WebSocket|null>(null);
+   const stoppedRef = useRef(false);
+   const startRef = useRef(Date.now());
 
-  useEffect(() => {
-    if (stoppedRef.current) return;
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
-    wsRef.current = ws;
-    let cleanedUp = false;
+   // Elapsed timer
+   useEffect(() => {
+     const t = setInterval(() => {
+       if (!stoppedRef.current) setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
+     }, 1000);
+     return () => clearInterval(t);
+   }, []);
 
-    ws.onopen = () => {
-      if (cleanedUp || stoppedRef.current) return;
-      // Reset any stale lines from a prior aborted attempt
-      setLines([]);
-    };
-    ws.onmessage = (e) => {
-      if (cleanedUp || stoppedRef.current) return;
-      try {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'log' && msg.payload?.line) {
-          const raw: string = msg.payload.line;
-          const color = raw.startsWith('✖')||raw.includes('error')||raw.includes('Error') ? '#ff4455'
-            : raw.startsWith('✔')||raw.includes('success') ? '#00e5a0'
-            : raw.startsWith('▶') ? '#00d4ff'
-            : raw.startsWith('✦') ? '#a078ff'
-            : '#8892a4';
-          setLines(l=>[...l,{msg:raw,color}]);
-        }
-        if (msg.type === 'build_status' && (msg.payload?.status==='success'||msg.payload?.status==='failed'||msg.payload?.status==='cancelled')) {
-          stoppedRef.current = true;
-          setStopped(true);
-          onStop();
-        }
-      } catch {}
-    };
-    ws.onerror = () => { /* suppress — retry handles it */ };
-    ws.onclose = () => { /* suppress connection noise */ };
-    return () => { cleanedUp = true; ws.close(); };
-  }, [build.id]);
+   useEffect(() => {
+     if (stoppedRef.current) return;
+     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+     const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${build.id}`);
+     wsRef.current = ws;
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth' }); }, [lines]);
+     ws.onmessage = (ev) => {
+       try {
+         const msg = JSON.parse(ev.data);
+         if (msg.type === 'log' && msg.payload.build_id === build.id) {
+           const { line, stream } = msg.payload;
+           const color = stream === 'stderr' ? '#ff4455'
+             : line.startsWith('✔') || line.startsWith('└─ Job completed') ? '#00e5a0'
+             : line.startsWith('✖') || line.startsWith('└─ Job FAILED') ? '#ff4455'
+             : line.startsWith('▶') || line.startsWith('│ ▶') || line.startsWith('┌') || line.startsWith('╔') || line.startsWith('╚') ? '#00d4ff'
+             : line.startsWith('│ ✔') ? '#00e5a0'
+             : line.startsWith('│ ✖') ? '#ff4455'
+             : line.startsWith('  [AI]') || line.includes('🤖') ? '#a078ff'
+            : line.includes('🛡') || line.includes('[CRITICAL]') || line.includes('[HIGH]') ? '#ff4455'
+            : line.includes('[MEDIUM]') ? '#f5c542'
+            : line.includes('[LOW]') || line.includes('[INFO]') ? '#545f72'
+            : line.includes('💡') ? '#a078ff'
+            : line.includes('🔍') || line.startsWith('  Summary:') ? '#00d4ff'
+            : line.includes('🏷') ? '#a078ff'
+             : line.startsWith('  ⏳') ? '#f5c542'
+             : '#8892a4';
+           setLines(l => [...l, { msg: line, color }]);
+           // Track current step name
+           if (line.includes('│ ▶')) {
+             setCurrentStep(line.replace('│ ▶', '').trim());
+           } else if (line.includes('┌─ Job:')) {
+             setCurrentStep(line.replace('┌─ Job:', '').trim());
+           } else if (line.startsWith('Cloning')) {
+             setCurrentStep('Cloning repository…');
+           }
+         }
+         if (msg.type === 'build_status' && msg.payload.build_id === build.id) {
+           const s = msg.payload.status;
+           if (s === 'success' || s === 'failed' || s === 'cancelled') {
+             stoppedRef.current = true;
+             setStopped(true);
+             onStop();
+           }
+         }
+       } catch {}
+     };
 
-  const stop = async () => {
-    if (stopping) return;
-    setStopping(true);
-    try {
-      await fetch(`http://localhost:8080/api/v1/builds/${build.id}/cancel`, { method:'POST' });
-    } catch {}
-    stoppedRef.current = true;
-    wsRef.current?.close();
-    onStop();
-  };
+    let hasConnected = false;
+    ws.onopen = () => { hasConnected = true; };
 
-  return (
-    <div>
-      <div style={{ background:'#080a0f', borderRadius:8, padding:16, maxHeight:380, overflowY:'auto',
-        fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2 }}>
-        {lines.length===0 && <span style={{ color:'#545f72' }}>Connecting…</span>}
-        {lines.map((l,i)=>(
-          <div key={i} style={{ color:l.color }}>{l.msg}</div>
-        ))}
-        <div ref={bottomRef}/>
-      </div>
-      {!stopped && (
-        <button onClick={stop} disabled={stopping} style={{ marginTop:10, padding:'6px 14px',
-          background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
-          borderRadius:6, color:'#ff4455', cursor:stopping?'wait':'pointer', fontSize:12,
-          fontFamily:"'Figtree',sans-serif", display:'flex', alignItems:'center', gap:6 }}>
-          {stopping ? <Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> : <X size={12}/>}
-          {stopping ? 'Stopping…' : 'Stop Build'}
-        </button>
-      )}
-    </div>
-  );
-}
+    ws.onerror = () => {};
+    ws.onclose = () => {};
 
-/* ─── build step helpers ──────────────────────────────────────────────────── */
+     return () => { ws.close(); };
+   // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [build.id]);
+
+   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior:'smooth', block:'nearest' }); }, [lines]);
+
+   const stop = async () => {
+     if (stopping || stopped) return;
+     setStopping(true);
+     stoppedRef.current = true;
+     wsRef.current?.close();
+     try {
+       await fetch(`http://localhost:8080/api/v1/builds/${build.id}/cancel`, { method:'POST' });
+     } catch {}
+     setStopped(true);
+     setStopping(false);
+     onStop();
+   };
+
+   const fmt = (s: number) => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+
+   return (
+     <div>
+       {/* Status bar */}
+       {!stopped && (
+         <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+           padding:'8px 12px', background:'rgba(0,212,255,0.05)',
+           border:'1px solid rgba(0,212,255,0.15)', borderRadius:7, marginBottom:10 }}>
+           <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite', flexShrink:0 }}/>
+             <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#e8eaf0', fontWeight:500 }}>
+               {currentStep}
+             </span>
+           </div>
+           <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+             <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#00d4ff' }}>
+               {fmt(elapsed)}
+             </span>
+             <button onClick={stop} disabled={stopping}
+               style={{ display:'flex', alignItems:'center', gap:5,
+                 padding:'4px 10px', background:'rgba(255,68,85,0.1)', border:'1px solid rgba(255,68,85,0.25)',
+                 borderRadius:5, color:'#ff4455', cursor: stopping ? 'wait' : 'pointer', fontSize:11,
+                 fontFamily:"'Figtree',sans-serif", fontWeight:600, opacity: stopping ? 0.6 : 1 }}>
+               ■ {stopping ? 'Stopping…' : 'Stop'}
+             </button>
+           </div>
+         </div>
+       )}
+
+       <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:8 }}>
+         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+           letterSpacing:'0.1em', textTransform:'uppercase' }}>
+           {stopped ? 'Build Log' : 'Build Log — Live'}
+         </span>
+         {stopped && (
+           <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>
+             {fmt(elapsed)} total
+           </span>
+         )}
+       </div>
+
+       <div style={{ background:'#080a0f', borderRadius:8, padding:16,
+         fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:'1.8',
+         color:'#8892a4', maxHeight:340, overflowY:'auto' }}>
+         {lines.length === 0 && !stopped && (
+           <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+             Connecting to pipeline…
+           </div>
+         )}
+         {lines.map((l,i) => <div key={i} style={{ color:l.color, whiteSpace:'pre-wrap' }}>{l.msg}</div>)}
+         {!stopped && lines.length > 0 && (
+           <div style={{ color:'#545f72', display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
+             <span style={{ display:'inline-block', width:7, height:7, borderRadius:'50%',
+               background:'#00d4ff', animation:'blink 1s ease-in-out infinite' }}/>
+           </div>
+         )}
+         <div ref={bottomRef}/>
+       </div>
+     </div>
+   );
+ }
+
+/* ─── module-level helpers (must be outside App to avoid hooks-in-loop) ─────── */
 function parseTestResults(log: string) {
   const results: {name:string; status:'pass'|'fail'|'skip'; duration:string}[] = [];
   for (const line of log.split('\n')) {
@@ -185,7 +259,7 @@ function stepStatusColor(s: string) {
 function stepStatusIcon(s: string) {
   return s==='success'?'✔':s==='failed'?'✖':s==='running'?'▶':s==='cancelled'?'■':'○';
 }
-function StepRow({ step, onExplain }: { step: any; onExplain?: (name: string, log: string) => void }) {
+function StepRow({ step }: { step: any }) {
   const [logOpen, setLogOpen] = useState(true);
   const stepTests = parseTestResults(step.log||'');
   const stepPassed = stepTests.filter(t=>t.status==='pass').length;
@@ -212,15 +286,6 @@ function StepRow({ step, onExplain }: { step: any; onExplain?: (name: string, lo
         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
           {step.duration_ms ? `${(step.duration_ms/1000).toFixed(1)}s` : ''}
         </span>
-        {step.status === 'failed' && onExplain && (
-          <button onClick={e=>{ e.stopPropagation(); onExplain(step.name, step.log||''); }}
-            style={{ display:'flex', alignItems:'center', gap:4, padding:'3px 10px',
-              background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.3)',
-              borderRadius:5, color:'#a078ff', cursor:'pointer', fontSize:11,
-              fontFamily:"'Figtree',sans-serif", fontWeight:600, flexShrink:0 }}>
-            <Sparkles size={11}/> Explain
-          </button>
-        )}
         <ChevronDown size={12} style={{ color:'#545f72',
           transform:logOpen?'none':'rotate(-90deg)', transition:'0.15s' }}/>
       </div>
@@ -252,51 +317,6 @@ function StepRow({ step, onExplain }: { step: any; onExplain?: (name: string, lo
   );
 }
 
-/* ─── section label ───────────────────────────────────────────────────────── */
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-      letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:14 }}>{children}</div>
-  );
-}
-
-/* ─── field ───────────────────────────────────────────────────────────────── */
-function Field({ label, children, hint }: { label: string; children: React.ReactNode; hint?: string }) {
-  return (
-    <div style={{ marginBottom:14 }}>
-      <div style={{ fontSize:12, color:'#8892a4', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{label}</div>
-      {children}
-      {hint && <div style={{ fontSize:11, color:'#545f72', marginTop:4, fontFamily:"'Figtree',sans-serif" }}>{hint}</div>}
-    </div>
-  );
-}
-
-function Input({ value, onChange, placeholder, type='text', mono=false, style={} }: {
-  value: string; onChange: (v:string)=>void; placeholder?: string; type?: string; mono?: boolean; style?: React.CSSProperties;
-}) {
-  return (
-    <input type={type} value={value} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
-      style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-        borderRadius:6, padding:'9px 12px', color:'#e8eaf0', outline:'none', boxSizing:'border-box',
-        fontFamily: mono ? "'IBM Plex Mono',monospace" : "'Figtree',sans-serif", fontSize:13, ...style }}/>
-  );
-}
-
-function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v:boolean)=>void; label: string }) {
-  return (
-    <label style={{ display:'flex', alignItems:'center', gap:8, cursor:'pointer', userSelect:'none' }}>
-      <div onClick={()=>onChange(!checked)} style={{ width:34, height:18, borderRadius:9, position:'relative', flexShrink:0,
-        background: checked ? '#00d4ff' : 'rgba(255,255,255,0.1)', transition:'background 0.2s',
-        border: `1px solid ${checked ? '#00d4ff' : 'rgba(255,255,255,0.2)'}` }}>
-        <div style={{ position:'absolute', top:2, left: checked ? 17 : 2, width:12, height:12,
-          borderRadius:'50%', background:'#fff', transition:'left 0.2s', boxShadow:'0 1px 3px rgba(0,0,0,0.4)' }}/>
-      </div>
-      <span style={{ fontSize:13, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{label}</span>
-    </label>
-  );
-}
-
-/* ════════════════════════════════════════════════════════════════════════════ */
 export default function App() {
   const [projects, setProjects]   = useState<Project[]>(DEMO);
   const [builds, setBuilds]       = useState<Build[]>(DEMO_BUILDS);
@@ -313,7 +333,7 @@ export default function App() {
   ]);
   const [loading, setLoading]     = useState(false);
   const [folders, setFolders]     = useState<FolderItem[]>([]);
-  const [cmdQ, setCmdQ]           = useState('');
+  const [cmdQ, setCmdQ]         = useState('');
   const chatEnd  = useRef<HTMLDivElement>(null);
   const cmdRef   = useRef<HTMLInputElement>(null);
 
@@ -327,34 +347,144 @@ export default function App() {
   }, []);
   useEffect(() => { if (cmdOpen) setTimeout(()=>cmdRef.current?.focus(),50); }, [cmdOpen]);
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
-  useEffect(() => { api.getProjects().then(setProjects).catch(()=>{}); api.getBuilds().then(setBuilds).catch(()=>{}); }, []);
+  useEffect(() => { api.getProjects().then(setProjects).catch(()=>{}); }, []);
 
-  const [loadingDemo, setLoadingDemo] = useState(false);
-  const loadDemo = async () => {
-    setLoadingDemo(true);
-    try {
-      const r = await fetch('http://localhost:8080/api/v1/demo/seed', { method: 'POST' });
-      const d = await r.json();
-      const projs = await api.getProjects();
-      setProjects(projs);
-      const demo = projs.find((p: Project) => p.id === d.project.id);
-      if (demo) { setSel(demo); setView('builds'); }
-      const allBuilds = await api.getBuilds();
-      setBuilds(allBuilds);
-    } catch {}
-    setLoadingDemo(false);
-  };
+  // Fetch builds when project changes
+  useEffect(() => {
+    if (!sel) return;
+    fetch(`http://localhost:8080/api/v1/projects/${sel.id}/builds`)
+      .then(r=>r.json()).then(d=>{ if(Array.isArray(d)) setBuilds(b=>[...d,...b.filter(x=>x.project_id!==sel.id)]); })
+      .catch(()=>{});
+  }, [sel?.id]);
+
+  // Poll running builds every 3s
+  useEffect(() => {
+    const running = builds.filter(b=>b.status==='running');
+    if (!running.length) return;
+    const id = setInterval(async () => {
+      for (const b of running) {
+        try {
+          const res = await fetch(`http://localhost:8080/api/v1/builds/${b.id}`);
+          if (!res.ok) continue;
+          const updated = await res.json();
+          setBuilds(prev=>prev.map(x=>x.id===b.id?{...x,...updated}:x));
+          if (selBuild?.id===b.id) setSelBuild(s=>s?{...s,...updated}:s);
+        } catch {}
+      }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [builds.map(b=>b.id+b.status).join(',')]);
 
   const projBuilds = sel ? builds.filter(b=>b.project_id===sel.id) : builds;
+  const [runModal, setRunModal] = useState(false);
 
-  const triggerBuild = async () => {
+  const triggerBuild = async (artifactVersionId?: string) => {
     if (!sel) return;
-    const mock: Build = { id:`b-${Date.now()}`, project_id:sel.id, status:'running', branch:sel.branch,
-      commit_sha: Math.random().toString(36).slice(2,9), commit_message:'Manual trigger',
-      duration:0, created_at:new Date().toISOString(), started_at:'', finished_at:'' };
+    const mock: Build = {
+      id:`b-${Date.now()}`, project_id:sel.id, status:'running', branch:sel.branch,
+      commit_sha:Math.random().toString(36).slice(2,9),
+      commit_message: artifactVersionId ? `Deploy version ${artifactVersionId}` : 'Manual trigger',
+      duration:0, duration_ms:0, number:0,
+      created_at:new Date().toISOString(), started_at:'', finished_at:''
+    };
     setBuilds(p=>[mock,...p]);
-    try { const b = await api.triggerBuild(sel.id); setBuilds(p=>[b,...p.filter(x=>x.id!==mock.id)]); } catch {}
+    setSelBuild(mock);
+    setView('builds');
+    try {
+      const b = await api.triggerBuild(sel.id, artifactVersionId);
+      setBuilds(p=>[b,...p.filter(x=>x.id!==mock.id)]);
+      setSelBuild(b);
+    } catch {}
   };
+
+  const sendAiMessage = async (msg: string) => {
+    setAiOpen(true);
+    setMsgs(m=>[...m,{role:'user',content:msg}]);
+    setLoading(true);
+    try {
+      const r = await api.aiChat(msg, sel?.id);
+      setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
+    } catch {
+      setMsgs(m=>[...m,{role:'assistant',content:'Backend offline — run `go run ./cmd/callahan` then try again.'}]);
+    }
+    setLoading(false);
+  };
+
+  function RunBuildModal() {
+    const [versions, setVersions] = useState<any[]>([]);
+    const [selVersion, setSelVersion] = useState('');
+    const [loadingV, setLoadingV] = useState(true);
+    useEffect(() => {
+      fetch('http://localhost:8080/api/v1/versions')
+        .then(r=>r.json()).then(d=>{ setVersions(Array.isArray(d)?d:[]); setLoadingV(false); })
+        .catch(()=>setLoadingV(false));
+    }, []);
+    const run = () => { setRunModal(false); triggerBuild(selVersion||undefined); };
+    return (
+      <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'center',
+        justifyContent:'center', background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
+        onClick={()=>setRunModal(false)}>
+        <div style={{ width:460, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
+          onClick={e=>e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700, color:'#fff', margin:0 }}>
+              Run Pipeline
+            </h3>
+            <button onClick={()=>setRunModal(false)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72' }}>
+              <X size={16}/>
+            </button>
+          </div>
+          <div style={{ marginBottom:20 }}>
+            <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'DM Mono',monospace" }}>
+              Pin to a version <em style={{ fontStyle:'italic' }}>(optional — for deploy pipelines)</em>
+            </div>
+            {loadingV ? (
+              <div style={{ color:'#545f72', fontSize:13 }}>Loading versions…</div>
+            ) : versions.length === 0 ? (
+              <div style={{ color:'#545f72', fontSize:12, fontFamily:"'IBM Plex Mono',monospace" }}>
+                No versions available — run a CI build first
+              </div>
+            ) : (
+              <div style={{ display:'flex', flexDirection:'column', gap:5, maxHeight:260, overflowY:'auto' }}>
+                <div onClick={()=>setSelVersion('')}
+                  style={{ padding:'9px 14px', borderRadius:7, cursor:'pointer',
+                    background:selVersion===''?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
+                    border:`1px solid ${selVersion===''?'rgba(0,212,255,0.25)':'rgba(255,255,255,0.07)'}` }}>
+                  <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12,
+                    color:selVersion===''?'#00d4ff':'#8892a4' }}>latest commit (no version pin)</span>
+                </div>
+                {versions.map((v:any)=>(
+                  <div key={v.id} onClick={()=>setSelVersion(v.id)}
+                    style={{ display:'flex', alignItems:'center', gap:10, padding:'9px 14px', borderRadius:7, cursor:'pointer',
+                      background:selVersion===v.id?'rgba(160,120,255,0.08)':'rgba(255,255,255,0.02)',
+                      border:`1px solid ${selVersion===v.id?'rgba(160,120,255,0.3)':'rgba(255,255,255,0.07)'}` }}>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, fontWeight:700,
+                      color:selVersion===v.id?'#a078ff':'#fff' }}>{v.tag}</span>
+                    <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:11, color:'#545f72', flex:1 }}>{v.project_name}</span>
+                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>
+                      {new Date(v.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ display:'flex', gap:10 }}>
+            <button onClick={()=>setRunModal(false)} style={{ flex:1, padding:10, background:'transparent',
+              border:'1px solid rgba(255,255,255,0.12)', borderRadius:7, color:'#8892a4', cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+            <button onClick={run} style={{ flex:1, padding:10, background:'#00d4ff', color:'#000',
+              border:'none', borderRadius:7, fontWeight:700, cursor:'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
+              <Play size={12} fill="#000" style={{ display:'inline', marginRight:6 }}/>
+              Run{selVersion?' with version':''}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const deleteProject = async (id: string) => {
     try { await api.deleteProject(id); } catch {}
@@ -362,6 +492,7 @@ export default function App() {
     setBuilds(b => b.filter(x => x.project_id !== id));
     setFolders(f => f.map(fo => ({ ...fo, projects: fo.projects.filter(p => p.id !== id) })));
     if (sel?.id === id) { setSel(null); setView('dashboard'); }
+     // best-effort API delete (no delete endpoint yet)
   };
 
   /* ── sidebar ─────────────────────────────────────────────────────────────── */
@@ -370,6 +501,7 @@ export default function App() {
       background:'#0d1117', borderRight:'1px solid rgba(255,255,255,0.12)',
       display:'flex', flexDirection:'column', zIndex:10, overflow:'hidden' }}>
 
+      {/* logo — identical to website nav */}
       <div style={{ padding:'15px 16px 13px', borderBottom:'1px solid rgba(255,255,255,0.07)',
         display:'flex', alignItems:'center', gap:10 }}>
         <Logo size={28}/>
@@ -379,6 +511,7 @@ export default function App() {
         </span>
       </div>
 
+      {/* AI + cmd buttons */}
       <div style={{ padding:'10px 10px 6px', display:'flex', flexDirection:'column', gap:6 }}>
         <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:9,
           padding:'9px 12px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
@@ -450,19 +583,12 @@ export default function App() {
         {projects.filter(p=>!folders.some(f=>f.projects.find(fp=>fp.id===p.id))).map(p=><ProjRow key={p.id} project={p} depth={0}/>)}
 
         {projects.length===0 && (
-          <div style={{ display:'flex', flexDirection:'column', gap:6, marginTop:8 }}>
-            <button onClick={()=>setAddProj(true)} style={{ width:'100%', padding:10,
-              border:'1px dashed rgba(255,255,255,0.12)', borderRadius:8, background:'none',
-              color:'#545f72', fontSize:12, cursor:'pointer', fontFamily:"'Figtree',sans-serif" }}>
-              + Connect repository
-            </button>
-            <button onClick={loadDemo} disabled={loadingDemo} style={{ width:'100%', padding:10,
-              border:'1px solid rgba(160,120,255,0.3)', borderRadius:8,
-              background:'rgba(160,120,255,0.07)', color: loadingDemo ? '#545f72' : '#a078ff',
-              fontSize:12, cursor: loadingDemo ? 'wait' : 'pointer', fontFamily:"'Figtree',sans-serif" }}>
-              {loadingDemo ? '⏳ Loading…' : '✦ Try Demo'}
-            </button>
-          </div>
+          <button onClick={()=>setAddProj(true)} style={{ width:'100%', padding:12,
+            border:'1px dashed rgba(255,255,255,0.12)', borderRadius:8, background:'none',
+            color:'#545f72', fontSize:12, cursor:'pointer', marginTop:8,
+            fontFamily:"'Figtree',sans-serif" }}>
+            + Connect repository
+          </button>
         )}
       </div>
 
@@ -491,19 +617,8 @@ export default function App() {
         </div>
       )}
 
-      {/* bottom nav */}
+      {/* status dot + bottom nav */}
       <div style={{ padding:'10px 10px 10px', borderTop:'1px solid rgba(255,255,255,0.07)', display:'flex', flexDirection:'column', gap:2 }}>
-
-        {/* Versions — read-only timeline, still useful */}
-        <button onClick={()=>setView('versions')}
-          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
-            background: view==='versions' ? 'rgba(160,120,255,0.06)' : 'transparent',
-            border: view==='versions' ? '1px solid rgba(160,120,255,0.2)' : '1px solid transparent',
-            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
-          <Tag size={13} color={view==='versions' ? '#a078ff' : '#545f72'}/>
-          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
-            color: view==='versions' ? '#a078ff' : '#545f72', fontWeight:500 }}>Version History</span>
-        </button>
 
         {/* Secrets */}
         <button onClick={()=>setView('secrets')}
@@ -514,6 +629,40 @@ export default function App() {
           <Lock size={13} color={view==='secrets' ? '#00d4ff' : '#545f72'}/>
           <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
             color: view==='secrets' ? '#00d4ff' : '#545f72', fontWeight:500 }}>Secrets</span>
+        </button>
+
+
+        {/* Environments */}
+        <button onClick={()=>setView('environments')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='environments' ? 'rgba(0,229,160,0.06)' : 'transparent',
+            border: view==='environments' ? '1px solid rgba(0,229,160,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Globe size={13} color={view==='environments' ? '#00e5a0' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='environments' ? '#00e5a0' : '#545f72', fontWeight:500 }}>Environments</span>
+        </button>
+
+        {/* Notifications */}
+        <button onClick={()=>setView('notifications')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='notifications' ? 'rgba(245,197,66,0.06)' : 'transparent',
+            border: view==='notifications' ? '1px solid rgba(245,197,66,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Bell size={13} color={view==='notifications' ? '#f5c542' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='notifications' ? '#f5c542' : '#545f72', fontWeight:500 }}>Notifications</span>
+        </button>
+
+        {/* Versions */}
+        <button onClick={()=>setView('versions')}
+          style={{ display:'flex', alignItems:'center', gap:7, width:'100%', padding:'7px 10px',
+            background: view==='versions' ? 'rgba(160,120,255,0.06)' : 'transparent',
+            border: view==='versions' ? '1px solid rgba(160,120,255,0.2)' : '1px solid transparent',
+            borderRadius:6, cursor:'pointer', textAlign:'left' }}>
+          <Tag size={13} color={view==='versions' ? '#a078ff' : '#545f72'}/>
+          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12,
+            color: view==='versions' ? '#a078ff' : '#545f72', fontWeight:500 }}>Versions</span>
         </button>
 
         {/* Settings */}
@@ -622,7 +771,7 @@ export default function App() {
           <Command size={12}/> ⌘K
         </button>
         {sel && (
-          <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:6,
+          <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:6,
             padding:'7px 14px', background:'#00d4ff', color:'#000', border:'none',
             borderRadius:6, fontSize:12, fontWeight:700, cursor:'pointer',
             fontFamily:"'Figtree',sans-serif" }}>
@@ -645,19 +794,12 @@ export default function App() {
       <p style={{ color:'#8892a4', fontSize:16, maxWidth:400, lineHeight:1.7, marginBottom:36 }}>
         Connect a repository to run AI-powered pipelines locally. No cloud. No agents.
       </p>
-      <div style={{ display:'flex', gap:12, marginBottom:52, flexWrap:'wrap', justifyContent:'center' }}>
+      <div style={{ display:'flex', gap:12, marginBottom:52 }}>
         <button onClick={()=>setAddProj(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'13px 24px', background:'#00d4ff', color:'#000', border:'none',
           borderRadius:8, fontSize:14, fontWeight:700, cursor:'pointer',
           fontFamily:"'Figtree',sans-serif" }}>
           <Plus size={16}/> Connect Repository
-        </button>
-        <button onClick={loadDemo} disabled={loadingDemo} style={{ display:'flex', alignItems:'center', gap:8,
-          padding:'13px 24px', background:'rgba(160,120,255,0.12)', color: loadingDemo ? '#545f72' : '#a078ff',
-          border:'1px solid rgba(160,120,255,0.35)', borderRadius:8,
-          fontSize:14, fontWeight:700, cursor: loadingDemo ? 'wait' : 'pointer',
-          fontFamily:"'Figtree',sans-serif" }}>
-          {loadingDemo ? <><Loader2 size={16} style={{animation:'spin 1s linear infinite'}}/> Loading…</> : <><Sparkles size={16}/> Try Demo</>}
         </button>
         <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'13px 24px', background:'transparent', color:'#8892a4',
@@ -705,7 +847,7 @@ export default function App() {
           <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:26, fontWeight:800,
             color:'#fff', letterSpacing:'-0.03em', margin:0 }}>{sel?.name}</h2>
         </div>
-        <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:8,
+        <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:8,
           padding:'10px 22px', background:'#00d4ff', color:'#000', border:'none',
           borderRadius:8, fontSize:13, fontWeight:700, cursor:'pointer',
           fontFamily:"'Figtree',sans-serif" }}>
@@ -713,12 +855,29 @@ export default function App() {
         </button>
       </div>
 
+      {/* v3 quick-access */}
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10, marginBottom:20 }}>
+        {[
+          { label:'Environments', desc:'Deploy to dev, test, staging, prod', color:'#00e5a0', icon:<Globe size={15}/>, view:'environments' as View },
+          { label:'Notifications', desc:'Slack, Teams, Jira, Azure DevOps', color:'#f5c542', icon:<Bell size={15}/>, view:'notifications' as View },
+          { label:'Versions', desc:'SemVer timeline + git tags', color:'#a078ff', icon:<Tag size={15}/>, view:'versions' as View },
+        ].map(item=>(
+          <Card key={item.label} onClick={()=>setView(item.view)} style={{ cursor:'pointer' }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:6 }}>
+              <span style={{ color:item.color }}>{item.icon}</span>
+              <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700, color:'#fff' }}>{item.label}</span>
+            </div>
+            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:11, color:'#545f72', lineHeight:1.5 }}>{item.desc}</div>
+          </Card>
+        ))}
+      </div>
+
       {/* stat cards */}
       <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10, marginBottom:20 }}>
         {[
           { label:'Total Builds',  value: projBuilds.length.toString(), mono:true },
           { label:'Success Rate',  value: projBuilds.length?`${Math.round(projBuilds.filter(b=>b.status==='success').length/projBuilds.length*100)}%`:'—', color:'#00e5a0', mono:true },
-          { label:'Avg Duration',  value: formatDuration(projBuilds.filter(b=>b.duration??b.duration_ms).reduce((a,b)=>a+(b.duration??b.duration_ms??0),0)/Math.max(projBuilds.filter(b=>b.duration??b.duration_ms).length,1)), mono:true },
+          { label:'Avg Duration',  value: formatDuration(projBuilds.filter(b=>b.duration).reduce((a,b)=>a+b.duration,0)/Math.max(projBuilds.filter(b=>b.duration).length,1)), mono:true },
           { label:'Status',        value: sel?.status??'—', badge:true },
         ].map(s=>(
           <Card key={s.label}>
@@ -732,94 +891,42 @@ export default function App() {
         ))}
       </div>
 
-      {/* quick-access */}
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10, marginBottom:20 }}>
-        {[
-          { label:'Configure Pipeline', desc:'Environments, notifications, deploy chain', color:'#00d4ff', icon:<GitBranch size={15}/>, v:'pipeline' as View },
-          { label:'Version History',    desc:'SemVer timeline + git tags',                 color:'#a078ff', icon:<Tag size={15}/>,      v:'versions' as View },
-          { label:'Run Build',          desc:'Trigger a new build now',                    color:'#00e5a0', icon:<Play size={15}/>,     v:null },
-        ].map(item=>(
-          <button key={item.label} onClick={()=>item.v ? setView(item.v) : triggerBuild()}
-            style={{ background:'rgba(255,255,255,0.02)', border:`1px solid ${item.color}20`,
-              borderRadius:10, padding:'14px 16px', cursor:'pointer', textAlign:'left',
-              display:'flex', alignItems:'center', gap:12, transition:'border-color 0.15s' }}
-            onMouseEnter={e=>(e.currentTarget.style.borderColor=item.color+'50')}
-            onMouseLeave={e=>(e.currentTarget.style.borderColor=item.color+'20')}>
-            <div style={{ width:34, height:34, borderRadius:8, background:`${item.color}15`,
-              display:'flex', alignItems:'center', justifyContent:'center',
-              border:`1px solid ${item.color}30`, color:item.color, flexShrink:0 }}>
-              {item.icon}
-            </div>
-            <div>
-              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600,
-                color:'#fff', marginBottom:2 }}>{item.label}</div>
-              <div style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>{item.desc}</div>
-            </div>
-          </button>
-        ))}
-      </div>
-
       {/* recent builds */}
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12 }}>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-          letterSpacing:'0.1em', textTransform:'uppercase' }}>Recent Builds</span>
-        <button onClick={()=>setView('builds')} style={{ background:'none', border:'none',
-          cursor:'pointer', color:'#545f72', fontSize:12, fontFamily:"'Figtree',sans-serif' " }}>
-          View all →
-        </button>
-      </div>
-      <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-        {projBuilds.slice(0,5).map(b=>(
-          <Card key={b.id} onClick={()=>{ setView('builds'); setSelBuild(b); }} style={{ padding:'12px 18px' }}>
-            <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+      <Card>
+        <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+          letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:16 }}>Recent Builds</div>
+        {projBuilds.length===0
+          ? <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72', fontSize:13 }}>No builds yet — click Run Build</div>
+          : projBuilds.slice(0,6).map((b,i)=>(
+            <div key={b.id} onClick={()=>{ setSelBuild(b); setView('builds'); }}
+              style={{ display:'flex', alignItems:'center', gap:14, padding:'12px 0',
+                borderBottom: i<Math.min(projBuilds.length,6)-1?'1px solid rgba(255,255,255,0.07)':'none',
+                cursor:'pointer' }}>
               <Badge status={b.status}/>
               <div style={{ flex:1, minWidth:0 }}>
-                <div style={{ fontSize:13, color:'#fff', fontWeight:500,
+                <div style={{ fontSize:13, color:'#fff', fontWeight:500, marginBottom:2,
                   overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
                   fontFamily:"'Figtree',sans-serif" }}>{b.commit_message}</div>
-                <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72',
-                  display:'flex', gap:10, marginTop:2 }}>
-                  <span>{b.commit_sha?.slice(0,7)}</span><span>{b.branch}</span><span>{timeAgo(b.created_at)}</span>
+                <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
+                  {b.commit_sha?.slice(0,7)} · {b.branch}
                 </div>
               </div>
-              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#545f72', flexShrink:0 }}>
-                {b.duration?formatDuration(b.duration):'—'}
+              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                color:'#545f72', textAlign:'right', flexShrink:0 }}>
+                {b.duration?formatDuration(b.duration):'—'}<br/>{timeAgo(b.created_at)}
               </div>
-              <ChevronRight size={13} style={{ color:'#545f72' }}/>
             </div>
-          </Card>
-        ))}
-        {projBuilds.length===0 && (
-          <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72',
-            fontSize:13, fontFamily:"'Figtree',sans-serif" }}>
-            No builds yet — click Run Build to trigger the first one
-          </div>
-        )}
-      </div>
+          ))
+        }
+      </Card>
     </div>
   );
 
   /* ── builds ───────────────────────────────────────────────────────────────── */
   function Builds() {
-    const [buildSubTab, setBuildSubTab] = useState<'builds'|'environments'>('builds');
-
-    // ── Builds sub-tab state
     const [jobs, setJobs] = useState<any[]>([]);
     const [steps, setSteps] = useState({} as Record<string, any[]>);
     const [expanded, setExpanded] = useState({} as Record<string, boolean>);
-
-    // ── Environments sub-tab state
-    const [envs, setEnvs] = useState<any[]>([]);
-    const [deployments, setDeployments] = useState<any[]>([]);
-    const [selDep, setSelDep] = useState<any|null>(null);
-    const [deploying, setDeploying] = useState<string|null>(null);
-    const [deployTarget, setDeployTarget] = useState<{envId:string;envName:string}|null>(null);
-    const [pickedVersion, setPickedVersion] = useState('');
-    const [showAddEnv, setShowAddEnv] = useState(false);
-    const [newEnv, setNewEnv] = useState({ name:'', description:'', color:'#00e5a0', auto_deploy:false, requires_approval:false });
-
-    const projBuilds = sel ? builds.filter(b => b.project_id === sel.id) : [];
-    const ENV_COLORS: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455', production:'#ff4455' };
 
     useEffect(() => {
       if (!selBuild || selBuild.status === 'running') return;
@@ -844,165 +951,25 @@ export default function App() {
       load();
     }, [selBuild?.id, selBuild?.status]);
 
-    useEffect(() => {
-      if (!sel || buildSubTab !== 'environments') return;
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`).then(r=>r.json()).then(d=>setEnvs(Array.isArray(d)?d:[])).catch(()=>{});
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
-    }, [sel?.id, buildSubTab]);
-
-    const reloadDeployments = () => {
-      if (!sel) return;
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>{
-        if (!Array.isArray(d)) return;
-        setDeployments(d);
-        // Also refresh selDep so the log viewer badge updates
-        setSelDep((prev: any) => prev ? (d.find((x: any) => x.id === prev.id) ?? prev) : null);
-      }).catch(()=>{});
-    };
-
-    const openDeployModal = (envId: string, envName: string) => {
-      const latestSuccess = projBuilds.find(b=>b.status==='success');
-      setPickedVersion(latestSuccess?.id ?? '');
-      setDeployTarget({ envId, envName });
-    };
-
-    const confirmDeploy = async () => {
-      if (!sel || !deployTarget || !pickedVersion) return;
-      const buildNum = projBuilds.find(b=>b.id===pickedVersion)?.number ?? '';
-      setDeploying(deployTarget.envId);
-      setDeployTarget(null);
-      try {
-        const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${deployTarget.envId}/deploy`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ build_id: pickedVersion, strategy:'direct', notes:`Deploy build #${buildNum}` })
-        });
-        if (r.ok) {
-          const d = await r.json();
-          setDeployments(ds=>[d,...ds]);
-          setSelDep(d);
-        }
-      } catch {}
-      setDeploying(null);
-    };
-
-    const dur = (b: Build) => b.duration ?? b.duration_ms ?? 0;
-
-    // Deploy-specific log viewer — uses dep.id as WS channel
-    function DeployLog({ dep }: { dep: any }) {
-      const [lines, setLines] = useState<{msg:string;color:string}[]>([]);
-      const bottomRef = useRef<HTMLDivElement>(null);
-      const envForDep = envs.find((e:any) => e.id === dep.environment_id);
-      const statusColor = dep.status==='success'?'#00e5a0':dep.status==='failed'?'#ff4455':dep.status==='running'?'#00d4ff':'#f5c542';
-      const envColor = ENV_COLORS[(envForDep?.name??'').toLowerCase()] ?? '#00e5a0';
-
-      useEffect(() => {
-        setLines([]);
-        if (dep.status !== 'running') {
-          fetch(`http://localhost:8080/api/v1/deployments/${dep.id}/log`)
-            .then(r=>r.json()).then(d=>{
-              if (d.log) setLines(d.log.split('\n').filter(Boolean).map((msg:string)=>({
-                msg,
-                color: (msg.includes('✖')||msg.toLowerCase().includes('failed')) ? '#ff4455'
-                  : (msg.includes('✔')||msg.toLowerCase().includes('success')) ? '#00e5a0'
-                  : (msg.startsWith('╔')||msg.startsWith('╚')||msg.startsWith('✦')) ? '#a078ff'
-                  : msg.startsWith('▶') ? '#00d4ff' : '#8892a4'
-              })));
-            }).catch(()=>{});
-          return;
-        }
-        const proto = window.location.protocol==='https:'?'wss':'ws';
-        const ws = new WebSocket(`${proto}://localhost:8080/ws?build_id=${dep.id}`);
-        let cleanedUp = false;
-        ws.onopen = () => { if (!cleanedUp) setLines([]); };
-        ws.onmessage = (e) => {
-          if (cleanedUp) return;
-          try {
-            const msg = JSON.parse(e.data);
-            if (msg.type==='log' && msg.payload?.line) {
-              const raw: string = msg.payload.line;
-              setLines(l=>[...l,{msg:raw,
-                color: (raw.startsWith('✖')||raw.toLowerCase().includes('failed')) ? '#ff4455'
-                  : (raw.startsWith('✔')||raw.toLowerCase().includes('success')) ? '#00e5a0'
-                  : (raw.startsWith('╔')||raw.startsWith('╚')||raw.startsWith('✦')) ? '#a078ff'
-                  : raw.startsWith('▶') ? '#00d4ff' : '#8892a4'
-              }]);
-            }
-            if (msg.type==='deployment_status') { setTimeout(reloadDeployments, 600); }
-          } catch {}
-        };
-        ws.onerror = ()=>{}; ws.onclose = ()=>{};
-        return () => { cleanedUp=true; ws.close(); };
-      }, [dep.id, dep.status]);
-
-      useEffect(() => { bottomRef.current?.scrollIntoView({behavior:'smooth'}); }, [lines]);
-
-      return (
-        <div style={{ flex:1 }}>
-          <div style={{ marginBottom:14, display:'flex', alignItems:'center', gap:10 }}>
-            <span style={{ width:8, height:8, borderRadius:'50%', background:statusColor, flexShrink:0,
-              boxShadow:dep.status==='running'?`0 0 8px ${statusColor}`:'none' }}/>
-            <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>
-              Deploy → <span style={{color:envColor}}>{envForDep?.name ?? 'env'}</span>
-            </span>
-            <Badge status={dep.status}/>
-            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', marginLeft:'auto' }}>
-              {timeAgo(dep.created_at)}
-            </span>
-          </div>
-          <div style={{ background:'#080a0f', borderRadius:8, padding:16, maxHeight:440, overflowY:'auto',
-            fontFamily:"'IBM Plex Mono',monospace", fontSize:12, lineHeight:2,
-            border:'1px solid rgba(255,255,255,0.06)' }}>
-            {lines.length===0 && dep.status==='running' && <span style={{color:'#545f72'}}>Connecting…</span>}
-            {lines.length===0 && dep.status!=='running' && <span style={{color:'#545f72'}}>No log stored for this deployment.</span>}
-            {lines.map((l,i)=><div key={i} style={{color:l.color}}>{l.msg}</div>)}
-            <div ref={bottomRef}/>
-          </div>
-        </div>
-      );
-    }
+    const dur = (b: Build) => b.duration_ms || b.duration;
 
     return (
     <div style={{ padding:28 }}>
-      {/* Header with sub-tab switcher */}
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
-        <div style={{ display:'flex', alignItems:'center', gap:14 }}>
-          <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
-            color:'#fff', letterSpacing:'-0.03em', margin:0 }}>
-            {buildSubTab==='builds' ? 'Build History' : 'Environments'}
-          </h2>
-          <div style={{ display:'flex', background:'rgba(255,255,255,0.04)', borderRadius:7, padding:3, gap:2 }}>
-            {(['builds','environments'] as const).map(t=>(
-              <button key={t} onClick={()=>setBuildSubTab(t)} style={{
-                padding:'5px 14px', borderRadius:5, border:'none', cursor:'pointer',
-                background:buildSubTab===t?'rgba(0,212,255,0.12)':'transparent',
-                color:buildSubTab===t?'#00d4ff':'#545f72',
-                fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:buildSubTab===t?600:400,
-                transition:'all 0.15s'
-              }}>{t==='builds'?'Builds':'Environments'}</button>
-            ))}
-          </div>
-        </div>
-        <div style={{ display:'flex', gap:8 }}>
-          {buildSubTab==='environments' && (
-            <button onClick={()=>setShowAddEnv(s=>!s)} style={{ display:'flex', alignItems:'center', gap:6,
-              padding:'7px 14px', background:'rgba(0,229,160,0.08)', border:'1px solid rgba(0,229,160,0.2)',
-              borderRadius:7, color:'#00e5a0', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-              <Plus size={12}/> Add Env
-            </button>
-          )}
-          <button onClick={triggerBuild} style={{ display:'flex', alignItems:'center', gap:8,
-            padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
-            borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
-            fontFamily:"'Figtree',sans-serif" }}>
-            <Play size={13} fill="#000"/> Run Build
-          </button>
-        </div>
+      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
+          color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Builds</h2>
+        <button onClick={()=>setRunModal(true)} style={{ display:'flex', alignItems:'center', gap:7,
+          padding:'9px 20px', background:'#00d4ff', color:'#000', border:'none',
+          borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
+          fontFamily:"'Figtree',sans-serif" }}>
+          <Play size={13} fill="#000"/> Run Build
+        </button>
       </div>
 
-      {/* ══ BUILDS SUB-TAB ══════════════════════════════════════════════════════ */}
-      {buildSubTab === 'builds' && (<>
       {selBuild ? (
         <div style={{ display:'flex', gap:16, alignItems:'flex-start' }}>
+
+          {/* ── Left: build history sidebar ── */}
           <div style={{ width:176, flexShrink:0 }}>
             <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
               letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:10, paddingLeft:4 }}>
@@ -1015,14 +982,14 @@ export default function App() {
                 return (
                   <div key={b.id} onClick={()=>{ setSelBuild(b); setJobs([]); setSteps({}); }}
                     style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 10px', borderRadius:6, cursor:'pointer',
-                      background:active?'rgba(0,212,255,0.08)':' rgba(255,255,255,0.02)',
+                      background:active?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
                       border:`1px solid ${active?'rgba(0,212,255,0.2)':'rgba(255,255,255,0.06)'}` }}>
                     <span style={{ width:7, height:7, borderRadius:'50%', background:col, flexShrink:0,
                       boxShadow:b.status==='running'?`0 0 6px ${col}`:'none' }}/>
                     <div style={{ flex:1, minWidth:0 }}>
                       <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
                         color:active?'#00d4ff':'#e8eaf0', fontWeight:active?700:400 }}>
-                        #{b.number ?? b.id.slice(0,4)}
+                        #{b.number || b.id.slice(0,4)}
                       </div>
                       <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:9,
                         color:'#545f72', marginTop:1 }}>{timeAgo(b.created_at)}</div>
@@ -1043,6 +1010,7 @@ export default function App() {
             </button>
           </div>
 
+          {/* ── Right: build detail ── */}
           <div style={{ flex:1, minWidth:0 }}>
             <Card style={{ marginBottom:12 }}>
               <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:16, marginBottom:16 }}>
@@ -1062,13 +1030,39 @@ export default function App() {
               <div style={{ fontSize:13, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{selBuild.commit_message}</div>
             </Card>
 
+            {/* Running build — live log */}
             {selBuild.status === 'running' && (
               <Card style={{ marginBottom:12 }}>
                 <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
                   <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
                     letterSpacing:'0.1em', textTransform:'uppercase' }}>Live Log</span>
-                  <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:6,
-                    padding:'5px 12px', background:'rgba(160,120,255,0.08)', border:'1px solid rgba(160,120,255,0.2)',
+                  <button onClick={async () => {
+                    if (!selBuild) return;
+                    setAiOpen(true); setLoading(true);
+                    let logText = '';
+                    try {
+                      const jr = await fetch(`http://localhost:8080/api/v1/builds/${selBuild.id}/jobs`);
+                      const js = await jr.json();
+                      for (const job of (Array.isArray(js)?js:[])) {
+                        const sr = await fetch(`http://localhost:8080/api/v1/jobs/${job.id}/steps`);
+                        const ss = await sr.json();
+                        for (const step of (Array.isArray(ss)?ss:[])) {
+                          logText += `[${step.name}] ${step.status}\n${step.log||''}\n`;
+                        }
+                      }
+                    } catch { logText = 'Could not retrieve logs'; }
+                    setMsgs(m=>[...m,{role:'user',content:`Explain this build failure for "${sel?.name}":\n\n${logText||'No log output available.'}`}]);
+                    try {
+                      const r = await fetch('http://localhost:8080/api/v1/ai/explain-build', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({ build_id: selBuild.id, logs: logText, pipeline: '' }),
+                      });
+                      const d = await r.json();
+                      setMsgs(m=>[...m,{role:'assistant',content:d.explanation||'No explanation returned.'}]);
+                    } catch { setMsgs(m=>[...m,{role:'assistant',content:'Backend offline.'}]); }
+                    setLoading(false);
+                  }} style={{ display:'flex', alignItems:'center', gap:6, padding:'5px 12px',
+                    background:'rgba(160,120,255,0.08)', border:'1px solid rgba(160,120,255,0.2)',
                     borderRadius:5, color:'#a078ff', cursor:'pointer', fontSize:12,
                     fontFamily:"'Figtree',sans-serif" }}>
                     <Sparkles size={12}/> AI Explain
@@ -1093,6 +1087,7 @@ export default function App() {
               </Card>
             )}
 
+            {/* Completed build — step breakdown */}
             {selBuild.status !== 'running' && (
               <div>
                 {selBuild.status === 'failed' && (
@@ -1124,6 +1119,7 @@ export default function App() {
                     </button>
                   </div>
                 )}
+
                 {jobs.length === 0 && (
                   <Card>
                     <div style={{ textAlign:'center', padding:'24px 0', color:'#545f72',
@@ -1132,6 +1128,7 @@ export default function App() {
                     </div>
                   </Card>
                 )}
+
                 {jobs.map(job => {
                   const jobSteps = steps[job.id] || [];
                   const isExpanded = expanded[job.id] !== false;
@@ -1164,19 +1161,7 @@ export default function App() {
                       </div>
                       {isExpanded && (
                         <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
-                          {jobSteps.map(step => <StepRow key={step.id} step={step} onExplain={(name, log) => {
-                            setAiOpen(true); setLoading(true);
-                            const msg = `Explain why the "${name}" step failed in build #${selBuild.number} for project "${sel?.name}":\n\n${log||'No log output.'}`;
-                            setMsgs(m=>[...m,{role:'user',content:msg}]);
-                            fetch('http://localhost:8080/api/v1/ai/explain-build', {
-                              method:'POST', headers:{'Content-Type':'application/json'},
-                              body: JSON.stringify({ build_id: selBuild.id, logs: log, pipeline: '' }),
-                            }).then(r=>r.json()).then(d=>{
-                              setMsgs(m=>[...m,{role:'assistant',content:d.explanation||'No explanation returned.'}]);
-                            }).catch(()=>{
-                              setMsgs(m=>[...m,{role:'assistant',content:'Could not reach backend.'}]);
-                            }).finally(()=>setLoading(false));
-                          }}/>)}
+                          {jobSteps.map(step => <StepRow key={step.id} step={step}/>)}
                         </div>
                       )}
                     </Card>
@@ -1198,13 +1183,14 @@ export default function App() {
                     fontFamily:"'Figtree',sans-serif" }}>{b.commit_message}</div>
                   <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72',
                     display:'flex', gap:12 }}>
+                    <span>#{b.number||''}</span>
                     <span>{b.commit_sha?.slice(0,7)}</span>
                     <span>{b.branch}</span>
                     <span>{timeAgo(b.created_at)}</span>
                   </div>
                 </div>
                 <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#545f72', flexShrink:0 }}>
-                  {b.duration?formatDuration(b.duration):'—'}
+                  {dur(b)?formatDuration(dur(b)):'—'}
                 </div>
                 <ChevronRight size={14} style={{ color:'#545f72' }}/>
               </div>
@@ -1212,1119 +1198,375 @@ export default function App() {
           ))}
         </div>
       )}
-      </>)}
-
-      {/* ══ ENVIRONMENTS SUB-TAB ════════════════════════════════════════════════ */}
-      {buildSubTab === 'environments' && (<>
-        {/* Add env form */}
-        {showAddEnv && (
-          <Card style={{ marginBottom:16, padding:16 }}>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
-              {[['Name','name','text'],['Description','description','text']].map(([lbl,field])=>(
-                <div key={field}>
-                  <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', letterSpacing:'0.08em', textTransform:'uppercase', marginBottom:6 }}>{lbl}</div>
-                  <input value={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.value}))}
-                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)', borderRadius:6, padding:'8px 10px', color:'#e8eaf0', outline:'none', fontFamily:"'Figtree',sans-serif", fontSize:13, boxSizing:'border-box' as const }}/>
-                </div>
-              ))}
-              <div style={{ display:'flex', gap:8, alignItems:'center', marginTop:4 }}>
-                <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#8892a4' }}>
-                  <input type="checkbox" checked={newEnv.auto_deploy} onChange={e=>setNewEnv(n=>({...n,auto_deploy:e.target.checked}))}/> Auto deploy
-                </label>
-                <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#8892a4' }}>
-                  <input type="checkbox" checked={newEnv.requires_approval} onChange={e=>setNewEnv(n=>({...n,requires_approval:e.target.checked}))}/> Requires approval
-                </label>
-              </div>
-              <button onClick={async ()=>{
-                if(!sel||!newEnv.name.trim()) return;
-                const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`,{
-                  method:'POST', headers:{'Content-Type':'application/json'},
-                  body: JSON.stringify({...newEnv, color: ENV_COLORS[newEnv.name.toLowerCase()]??'#00e5a0'})
-                });
-                if(r.ok){ const e=await r.json(); setEnvs(es=>[...es,e]); setNewEnv({name:'',description:'',color:'#00e5a0',auto_deploy:false,requires_approval:false}); setShowAddEnv(false); }
-              }} style={{ padding:'8px 18px', background:'#00e5a0', color:'#000', border:'none', borderRadius:6, fontWeight:700, cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, marginTop:4 }}>
-                Create Environment
-              </button>
-            </div>
-          </Card>
-        )}
-
-        {envs.length === 0 ? (
-          <Card style={{ textAlign:'center', padding:'40px 0' }}>
-            <Globe size={28} style={{ color:'#545f72', marginBottom:10 }}/>
-            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, color:'#545f72' }}>No environments yet</div>
-            <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#3a4050', marginTop:4 }}>Click Add Env to create test, staging or production environments</div>
-          </Card>
-        ) : (
-          <div style={{ display:'flex', gap:16, alignItems:'flex-start' }}>
-            {/* Left: env list */}
-            <div style={{ width:300, flexShrink:0, display:'flex', flexDirection:'column', gap:8 }}>
-              {envs.map((env:any) => {
-                const envDeps = deployments.filter(d=>d.environment_id===env.id);
-                const latestDep = envDeps[0] ?? null;
-                const envCol = ENV_COLORS[env.name?.toLowerCase()] ?? env.color ?? '#00e5a0';
-                return (
-                  <Card key={env.id} style={{ padding:0 }}>
-                    {/* Env header */}
-                    <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px', borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
-                      <span style={{ width:8, height:8, borderRadius:'50%', background:envCol, flexShrink:0 }}/>
-                      <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700, color:'#fff', flex:1 }}>{env.name}</span>
-                      {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'rgba(0,229,160,0.1)', color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
-                      {env.requires_approval && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4, background:'rgba(245,197,66,0.1)', color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
-                      <button onClick={()=>openDeployModal(env.id, env.name)} disabled={!!deploying}
-                        style={{ display:'flex', alignItems:'center', gap:5, padding:'4px 10px', background:'rgba(0,212,255,0.1)', border:'1px solid rgba(0,212,255,0.25)', borderRadius:5, color:'#00d4ff', cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
-                        <Rocket size={10}/> Deploy
-                      </button>
-                    </div>
-                    {/* Currently deployed */}
-                    {latestDep && latestDep.status==='success' && (
-                      <div style={{ padding:'8px 14px', borderBottom:'1px solid rgba(255,255,255,0.04)', display:'flex', alignItems:'center', gap:8 }}>
-                        <span style={{ width:6, height:6, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#00e5a0' }}>
-                          live: build #{projBuilds.find(b=>b.id===latestDep.build_id)?.number??'?'}
-                        </span>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', marginLeft:'auto' }}>{timeAgo(latestDep.created_at)}</span>
-                      </div>
-                    )}
-                    {/* Deployment history */}
-                    <div style={{ display:'flex', flexDirection:'column', gap:2, padding:'6px 8px' }}>
-                      {envDeps.slice(0,5).map((d:any)=>{
-                        const isSelected = selDep?.id === d.id;
-                        const dCol = d.status==='success'?'#00e5a0':d.status==='failed'?'#ff4455':d.status==='running'?'#00d4ff':'#f5c542';
-                        const bNum = projBuilds.find(b=>b.id===d.build_id)?.number;
-                        return (
-                          <div key={d.id} onClick={()=>setSelDep(d)}
-                            style={{ display:'flex', alignItems:'center', gap:8, padding:'5px 6px', borderRadius:5, cursor:'pointer',
-                              background:isSelected?'rgba(0,212,255,0.07)':'transparent',
-                              border:`1px solid ${isSelected?'rgba(0,212,255,0.15)':'transparent'}`,
-                              transition:'background 0.12s' }}
-                            onMouseEnter={e=>{ if(!isSelected)(e.currentTarget as HTMLElement).style.background='rgba(255,255,255,0.03)'; }}
-                            onMouseLeave={e=>{ if(!isSelected)(e.currentTarget as HTMLElement).style.background='transparent'; }}>
-                            <span style={{ width:6, height:6, borderRadius:'50%', background:dCol, flexShrink:0 }}/>
-                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:dCol, width:48, flexShrink:0 }}>{d.status}</span>
-                            {bNum && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>#{bNum}</span>}
-                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', marginLeft:'auto' }}>{timeAgo(d.created_at)}</span>
-                            {d.status==='pending' && (
-                              <button onClick={async e=>{ e.stopPropagation();
-                                await fetch(`http://localhost:8080/api/v1/deployments/${d.id}/approve`,{method:'POST'});
-                                setTimeout(reloadDeployments, 800);
-                              }} style={{ padding:'2px 8px', background:'rgba(245,197,66,0.12)', border:'1px solid rgba(245,197,66,0.3)', borderRadius:4, color:'#f5c542', cursor:'pointer', fontSize:10, fontFamily:"'Figtree',sans-serif" }}>
-                                Approve
-                              </button>
-                            )}
-                          </div>
-                        );
-                      })}
-                      {envDeps.length===0 && <div style={{ padding:'8px 6px', fontSize:11, color:'#3a4050', fontFamily:"'Figtree',sans-serif", fontStyle:'italic' }}>No deployments yet</div>}
-                    </div>
-                  </Card>
-                );
-              })}
-            </div>
-
-            {/* Right: deploy log viewer */}
-            <div style={{ flex:1, minWidth:0 }}>
-              {selDep ? (
-                <Card><DeployLog dep={selDep}/></Card>
-              ) : (
-                <Card style={{ textAlign:'center', padding:'60px 0' }}>
-                  <Rocket size={28} style={{ color:'#545f72', marginBottom:10 }}/>
-                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, color:'#545f72' }}>Select a deployment to view logs</div>
-                  <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#3a4050', marginTop:4 }}>Or click Deploy to push a build to an environment</div>
-                </Card>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* Deploy version picker modal */}
-        {deployTarget && (
-          <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center', justifyContent:'center',
-            background:'rgba(0,0,0,0.7)', backdropFilter:'blur(8px)' }} onClick={()=>setDeployTarget(null)}>
-            <div style={{ background:'#111620', border:'1px solid rgba(255,255,255,0.1)', borderRadius:12, padding:28, width:480, maxHeight:'80vh', overflowY:'auto' }}
-              onClick={e=>e.stopPropagation()}>
-              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:17, fontWeight:700, color:'#fff', marginBottom:4 }}>
-                Deploy to <span style={{ color: ENV_COLORS[deployTarget.envName.toLowerCase()]??'#00e5a0' }}>{deployTarget.envName}</span>
-              </div>
-              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#545f72', marginBottom:18 }}>Pick a successful build to deploy</div>
-              <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:20 }}>
-                {projBuilds.filter(b=>b.status==='success').map(b=>(
-                  <div key={b.id} onClick={()=>setPickedVersion(b.id)}
-                    style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 12px', borderRadius:7, cursor:'pointer',
-                      background:pickedVersion===b.id?'rgba(0,212,255,0.08)':'rgba(255,255,255,0.02)',
-                      border:`1px solid ${pickedVersion===b.id?'rgba(0,212,255,0.25)':'rgba(255,255,255,0.06)'}` }}>
-                    <span style={{ width:7, height:7, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
-                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00e5a0', fontWeight:600 }}>#{b.number??b.id.slice(0,4)}</span>
-                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>{(b.commit??b.commit_sha??'').slice(0,7)}</span>
-                    <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif", flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{b.commit_message}</span>
-                    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', flexShrink:0 }}>{timeAgo(b.created_at)}</span>
-                  </div>
-                ))}
-                {projBuilds.filter(b=>b.status==='success').length===0 && (
-                  <div style={{ textAlign:'center', padding:'20px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>No successful builds yet — run a build first</div>
-                )}
-              </div>
-              <div style={{ display:'flex', gap:10, justifyContent:'flex-end' }}>
-                <button onClick={()=>setDeployTarget(null)} style={{ padding:'9px 18px', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.1)', borderRadius:7, color:'#8892a4', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
-                <button onClick={confirmDeploy} disabled={!pickedVersion}
-                  style={{ padding:'9px 22px', background: pickedVersion?'#00d4ff':'rgba(0,212,255,0.3)', color:pickedVersion?'#000':'#545f72', border:'none', borderRadius:7, fontWeight:700, cursor:pickedVersion?'pointer':'default', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
-                  Deploy Build #{projBuilds.find(b=>b.id===pickedVersion)?.number ?? '—'}
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-      </>)}
     </div>
-    );
-  }
+    ); }
 
-  /* ════════════════════════════════════════════════════════════════════════════
-     PIPELINE — Jenkins-style job config
-     Tabs: General | Triggers | Steps | AI | Environments | Notifications
-  ════════════════════════════════════════════════════════════════════════════ */
-  const Pipeline = () => {
-    type PipelineTab = 'general' | 'triggers' | 'steps' | 'ai' | 'environments' | 'notifications';
-    const [tab, setTab] = useState<PipelineTab>('general');
+  /* ── pipeline config (Jenkins-style) ──────────────────────────────────────── */
+  function Pipeline() {
+    const [tab, setTab] = useState<'config'|'yaml'>('config');
+    const [yaml, setYaml] = useState('');
     const [saving, setSaving] = useState(false);
-    const [saved, setSaved]   = useState(false);
+    const [saveMsg, setSaveMsg] = useState('');
 
-    // ── General
-    const [pName,     setPName]     = useState(sel?.name ?? '');
-    const [pDesc,     setPDesc]     = useState('');
-    const [pRepo,     setPRepo]     = useState(sel?.repo_url ?? '');
-    const [pBranch,   setPBranch]   = useState(sel?.branch ?? 'main');
-    const [pImage,    setPImage]    = useState('callahan:latest');
-    const [pTimeout,  setPTimeout]  = useState('30');
+    // CI config state
+    const [pipelineName, setPipelineName] = useState(sel?.name || '');
+    const [triggerBranches, setTriggerBranches] = useState('main');
+    const [aiReview, setAiReview] = useState(true);
+    const [aiSecurity, setAiSecurity] = useState(true);
+    type JobConfig = { name: string; steps: { name: string; run: string }[] };
+    const [jobs, setJobs] = useState<JobConfig[]>([
+      { name: 'test', steps: [{ name: 'Run tests', run: 'npm test' }] },
+      { name: 'build', steps: [{ name: 'Build', run: 'npm run build' }] },
+    ]);
 
-    // ── Triggers
-    const [tPush,    setTPush]    = useState(true);
-    const [tPR,      setTPR]      = useState(true);
-    const [tManual,  setTManual]  = useState(true);
-    const [tCron,    setTCron]    = useState('');
+    // Deploy chain state
+    type DeployConfig = { name: string; auto: boolean; gate: string; requiresApproval: boolean; notify: string[]; steps: { name: string; run: string }[] };
+    const [deployStages, setDeployStages] = useState<DeployConfig[]>([]);
 
-    // ── Steps
-    type Step = { id: string; name: string; run: string; continueOnError: boolean };
-    const [steps, setSteps] = useState<Step[]>([]);
-    const addStep = () => setSteps(s=>[...s,{ id:Date.now().toString(), name:'', run:'', continueOnError:false }]);
-    const delStep = (id:string) => setSteps(s=>s.filter(x=>x.id!==id));
-    const updateStep = (id:string, field:keyof Step, val:string|boolean) =>
-      setSteps(s=>s.map(x=>x.id===id?{...x,[field]:val}:x));
-
-    // ── Steps toolbar (AI generate + YAML editor)
-    const [aiPrompt,     setAiPrompt]     = useState('');
-    const [aiGenerating, setAiGenerating] = useState(false);
-    const [showAiBox,    setShowAiBox]    = useState(false);
-    const [showYaml,     setShowYaml]     = useState(false);
-    const [yamlText,     setYamlText]     = useState('');
-
-    const applyYaml = (yaml: string) => {
-      const lines = yaml.split('\n');
-      const parsed: Step[] = [];
-      let i = 0;
-      while (i < lines.length) {
-        const nameLine = lines[i].match(/^\s*-\s+name:\s*(.+)$/);
-        if (nameLine) {
-          const name = nameLine[1].trim();
-          let run = ''; let continueOnError = false;
-          i++;
-          while (i < lines.length && !lines[i].match(/^\s*-\s+name:/)) {
-            const runLine = lines[i].match(/^\s+run:\s*(.+)$/);
-            const coeLine = lines[i].match(/^\s+continue-on-error:\s*true/);
-            if (runLine) run = runLine[1].trim();
-            if (coeLine) continueOnError = true;
-            i++;
-          }
-          if (name && run) parsed.push({ id: Date.now().toString()+parsed.length, name, run, continueOnError });
-        } else { i++; }
-      }
-      if (parsed.length > 0) setSteps(parsed);
-    };
-
-    const generateSteps = async () => {
-      if (!aiPrompt.trim() || !sel) return;
-      setAiGenerating(true);
-      try {
-        const r = await fetch('http://localhost:8080/api/v1/ai/generate-pipeline', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ description: aiPrompt, language: sel.language||'', framework: sel.framework||'' })
-        });
-        const d = await r.json();
-        if (d.content) {
-          applyYaml(d.content);
-          setShowAiBox(false);
-          setAiPrompt('');
-        }
-      } catch {}
-      setAiGenerating(false);
-    };
-
-    // ── AI
-    const [aiReview,    setAiReview]    = useState(true);
-    const [aiSecurity,  setAiSecurity]  = useState(true);
-    const [aiExplain,   setAiExplain]   = useState(true);
-    const [aiModel,     setAiModel]     = useState('');
-
-    // ── Environments
-    const [envs,        setEnvs]        = useState<any[]>([]);
-    const [deployments, setDeployments] = useState<any[]>([]);
-    const [showAddEnv,  setShowAddEnv]  = useState(false);
-    const [newEnv, setNewEnv] = useState({ name:'', description:'', color:'#00e5a0', auto_deploy:false, requires_approval:false, branch_filter:'' });
-    const [deploying,   setDeploying]   = useState<string|null>(null);
-    const [guardResult, setGuardResult] = useState<{safe:boolean;concerns:string[]}|null>(null);
-    // Version picker modal
-    const [deployTarget, setDeployTarget] = useState<{envId:string;envName:string}|null>(null);
-    const [versions,     setVersions]     = useState<any[]>([]);
-    const [pickedVersion, setPickedVersion] = useState<string>('latest');
-
-    const ENV_COLORS: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455' };
-
-    // ── Notifications
-    const [channels,    setChannels]    = useState<any[]>([]);
-    const [showAddCh,   setShowAddCh]   = useState(false);
-    const [chPlatform,  setChPlatform]  = useState('slack');
-    const [chName,      setChName]      = useState('');
-    const [chWebhook,   setChWebhook]   = useState('');
-    const [chOnSuccess, setChOnSuccess] = useState(true);
-    const [chOnFailure, setChOnFailure] = useState(true);
-    const [chOnCancel,  setChOnCancel]  = useState(false);
-    const [chAiMsg,     setChAiMsg]     = useState(true);
-    const [chSaving,    setChSaving]    = useState(false);
-    const [notifPreviewing, setNotifPreviewing] = useState(false);
-    const [notifPreview,    setNotifPreview]    = useState('');
-
+    // Load existing pipeline
     useEffect(() => {
       if (!sel) return;
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`).then(r=>r.json()).then(d=>setEnvs(Array.isArray(d)?d:[])).catch(()=>{});
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`).then(r=>r.json()).then(d=>setChannels(Array.isArray(d)?d:[])).catch(()=>{});
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/versions`).then(r=>r.json()).then(d=>setVersions(Array.isArray(d)?d:[])).catch(()=>{});
-      // Load saved pipeline and parse steps
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`).then(r=>r.json()).then(d=>{
-        if (!d.content) return;
-        const lines = d.content.split('\n');
-        const parsed: Step[] = [];
-        let i = 0;
-        while (i < lines.length) {
-          const nameLine = lines[i].match(/^\s*-\s+name:\s*(.+)$/);
-          if (nameLine) {
-            const name = nameLine[1].trim();
-            let run = '';
-            let continueOnError = false;
-            i++;
-            while (i < lines.length && !lines[i].match(/^\s*-\s+name:/)) {
-              const runLine = lines[i].match(/^\s+run:\s*(.+)$/);
-              const coeLine = lines[i].match(/^\s+continue-on-error:\s*true/);
-              if (runLine) run = runLine[1].trim();
-              if (coeLine) continueOnError = true;
-              i++;
-            }
-            if (name && run) parsed.push({ id: Date.now().toString() + parsed.length, name, run, continueOnError });
-          } else { i++; }
-        }
-        if (parsed.length > 0) setSteps(parsed);
-      }).catch(()=>{});
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`)
+        .then(r=>r.json())
+        .then(d=>{
+          if (!d.content) return;
+          setYaml(d.content);
+          // Parse YAML into form state
+          try {
+            const lines = d.content.split('\n');
+            const nameMatch = lines.find((l:string) => l.startsWith('name:'));
+            if (nameMatch) setPipelineName(nameMatch.replace('name:','').trim());
+
+            // Check for ai config
+            const hasAiReview = d.content.includes('review: true') || d.content.includes('review:true');
+            const hasAiSecurity = d.content.includes('security-scan: true') || d.content.includes('security-scan:true');
+            setAiReview(hasAiReview);
+            setAiSecurity(hasAiSecurity);
+
+            // Parse branches
+            const branchMatch = d.content.match(/branches:\s*\[([^\]]+)\]/);
+            if (branchMatch) setTriggerBranches(branchMatch[1].replace(/\s/g,''));
+          } catch {}
+        })
+        .catch(()=>{});
     }, [sel?.id]);
 
-    const savePipeline = async () => {
-      if (!sel) return;
-      setSaving(true);
-      const yaml = [
-        `name: ${pName}`,
-        `on:${[tPush&&' push',tPR&&' pull_request',tManual&&' manual'].filter(Boolean).join(',')}`,
-        tCron ? `  schedule: "${tCron}"` : null,
-        `\njobs:\n  build:`,
-        `    runs-on: ${pImage}`,
-        `    timeout: ${pTimeout}m`,
-        `    steps:`,
-        ...steps.map(s=>`      - name: ${s.name}\n        run: ${s.run}${s.continueOnError?'\n        continue-on-error: true':''}`),
-        `\n    ai:`,
-        `      review: ${aiReview}`,
-        `      security-scan: ${aiSecurity}`,
-        `      explain-failures: ${aiExplain}`,
-      ].filter(x=>x!==null).join('\n');
-      try {
-        await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`, {
-          method:'PUT', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ content: yaml })
+    // Generate YAML from form state
+    const generateYaml = () => {
+      let y = `name: ${pipelineName || sel?.name || 'pipeline'}\n`;
+      y += `on:\n  push:\n    branches: [${triggerBranches}]\n`;
+      y += `\njobs:\n`;
+      jobs.forEach(job => {
+        y += `  ${job.name}:\n    runs-on: local\n    steps:\n`;
+        job.steps.forEach(step => {
+          y += `      - name: ${step.name}\n        run: ${step.run}\n`;
         });
-      } catch {}
-      setSaving(false); setSaved(true); setTimeout(()=>setSaved(false), 2000);
-    };
-
-    // Env helpers
-    const createEnv = async () => {
-      if (!sel || !newEnv.name) return;
-      const color = ENV_COLORS[newEnv.name.toLowerCase()] || newEnv.color;
-      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({...newEnv, color})
       });
-      if (r.ok) { const d = await r.json(); setEnvs(e=>[...e,d]); setShowAddEnv(false); setNewEnv({name:'',description:'',color:'#00e5a0',auto_deploy:false,requires_approval:false,branch_filter:''}); }
-    };
-    const deleteEnv = async (id: string) => {
-      await fetch(`http://localhost:8080/api/v1/environments/${id}`, {method:'DELETE'});
-      setEnvs(e=>e.filter(x=>x.id!==id));
-    };
-    const openDeployModal = (envId: string, envName: string) => {
-      const latestSuccess = projBuilds.find(b=>b.status==='success');
-      setPickedVersion(latestSuccess?.id ?? '');
-      setDeployTarget({ envId, envName });
-    };
-    const confirmDeploy = async () => {
-      if (!sel || !deployTarget || !pickedVersion) return;
-      const buildId = pickedVersion; // pickedVersion is now always a build ID
-      const buildNum = projBuilds.find(b=>b.id===buildId)?.number ?? '';
-      setDeploying(deployTarget.envId);
-      setDeployTarget(null);
-      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${deployTarget.envId}/deploy`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ build_id: buildId, strategy:'direct', notes:`Deploy build #${buildNum} — Manual` })
-      });
-      if (r.ok) {
-        const d = await r.json(); setDeployments(ds=>[d,...ds]);
-        setTimeout(() => {
-          fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`)
-            .then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
-        }, 3200);
+      if (aiReview || aiSecurity) {
+        y += `\nai:\n`;
+        if (aiReview) y += `  review: true\n`;
+        if (aiSecurity) y += `  security-scan: true\n`;
       }
-      setDeploying(null);
-    };
-    const lastDepForEnv = (envId: string) => deployments.find(d=>d.environment_id===envId);
-
-    // Notification helpers
-    const saveChannel = async () => {
-      if (!sel || !chName || !chWebhook) return;
-      setChSaving(true);
-      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ name:chName, platform:chPlatform, config:{ webhook_url:chWebhook },
-          on_success:chOnSuccess, on_failure:chOnFailure, on_cancel:chOnCancel, ai_message:chAiMsg, enabled:true })
-      });
-      if (r.ok) { const d=await r.json(); setChannels(c=>[...c,d]); setShowAddCh(false); setChName(''); setChWebhook(''); }
-      setChSaving(false);
-    };
-    const deleteChannel = async (id: string) => {
-      await fetch(`http://localhost:8080/api/v1/notifications/${id}`, {method:'DELETE'});
-      setChannels(c=>c.filter(x=>x.id!==id));
-    };
-    const generatePreview = async () => {
-      setNotifPreviewing(true);
-      try {
-        const r = await fetch('http://localhost:8080/api/v1/ai/notification-preview', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ platform:chPlatform, status:'success' })
+      if (deployStages.length > 0) {
+        y += `\ndeploy:\n`;
+        deployStages.forEach(stage => {
+          y += `  - name: ${stage.name}\n`;
+          if (stage.auto) y += `    auto: true\n`;
+          if (stage.gate === 'manual') y += `    gate: manual\n`;
+          if (stage.requiresApproval) y += `    requires_approval: true\n`;
+          if (stage.steps.length > 0) {
+            y += `    steps:\n`;
+            stage.steps.forEach(s => { y += `      - name: ${s.name}\n        run: ${s.run}\n`; });
+          }
+          if (stage.notify.length > 0) y += `    notify:\n${stage.notify.map(n=>`      - ${n}`).join('\n')}\n`;
         });
-        if(r.ok){ const d=await r.json(); setNotifPreview(d.message||''); }
-      } catch{}
-      setNotifPreviewing(false);
+      }
+      return y;
     };
 
-    const PLATFORMS = [
-      { id:'slack',     name:'Slack',       color:'#4a154b', desc:'Webhook URL from Slack app settings' },
-      { id:'teams',     name:'Teams',       color:'#6264a7', desc:'Incoming webhook connector URL' },
-      { id:'discord',   name:'Discord',     color:'#5865f2', desc:'Discord channel webhook URL' },
-      { id:'jira',      name:'Jira',        color:'#0052cc', desc:'Jira Cloud base URL + API token' },
-      { id:'azuredevops',name:'Azure DevOps',color:'#0078d4',desc:'Azure DevOps PAT + work item ID' },
-      { id:'webhook',   name:'Webhook',     color:'#00e5a0', desc:'Any POST endpoint — JSON payload' },
-    ];
-    const pInfo = PLATFORMS.find(p=>p.id===chPlatform);
+    // Sync form → yaml when switching tabs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    useEffect(() => { if (tab === 'yaml') setYaml(generateYaml()); }, [tab]);
 
-    const TABS: { id: PipelineTab; label: string; icon: React.ReactNode }[] = [
-      { id:'general',      label:'General',      icon:<Settings size={13}/> },
-      { id:'triggers',     label:'Triggers',     icon:<Zap size={13}/> },
-      { id:'steps',        label:'Steps',        icon:<Terminal size={13}/> },
-      { id:'ai',           label:'AI',           icon:<Sparkles size={13}/> },
-      { id:'notifications',label:'Notifications',icon:<Bell size={13}/> },
-    ];
+    const save = async () => {
+      if (!sel) return;
+      setSaving(true); setSaveMsg('');
+      const content = tab === 'yaml' ? yaml : generateYaml();
+      try {
+        const res = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/pipeline`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content }),
+        });
+        const d = await res.json();
+        setSaveMsg(res.ok ? (d.message || '\u2714 Saved to git') : ('\u2716 ' + (d.error || 'Save failed')));
+      } catch { setSaveMsg('\u2716 Backend offline'); }
+      setSaving(false);
+      setTimeout(() => setSaveMsg(''), 4000);
+    };
+
+    // Helpers
+    const addJob = () => setJobs(j=>[...j,{ name:`job-${j.length+1}`, steps:[{ name:'Step 1', run:'echo hello' }] }]);
+    const removeJob = (i:number) => setJobs(j=>j.filter((_,idx)=>idx!==i));
+    const updateJob = (i:number, field:string, val:string) => setJobs(j=>j.map((job,idx)=>idx===i?{...job,[field]:val}:job));
+    const addStep = (ji:number) => setJobs(j=>j.map((job,idx)=>idx===ji?{...job,steps:[...job.steps,{name:'New step',run:''}]}:job));
+    const removeStep = (ji:number,si:number) => setJobs(j=>j.map((job,idx)=>idx===ji?{...job,steps:job.steps.filter((_,s)=>s!==si)}:job));
+    const updateStep = (ji:number,si:number,field:string,val:string) =>
+      setJobs(j=>j.map((job,idx)=>idx===ji?{...job,steps:job.steps.map((s,sidx)=>sidx===si?{...s,[field]:val}:s)}:job));
+
+    const addDeploy = () => setDeployStages(d=>[...d,{ name:'dev', auto:true, gate:'auto', requiresApproval:false, notify:[], steps:[] }]);
+    const removeDeploy = (i:number) => setDeployStages(d=>d.filter((_,idx)=>idx!==i));
+    const updateDeploy = (i:number, updates:Partial<DeployConfig>) => setDeployStages(d=>d.map((s,idx)=>idx===i?{...s,...updates}:s));
+    const addDeployStep = (di:number) => setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,steps:[...s.steps,{name:'Deploy step',run:''}]}:s));
+    const removeDeployStep = (di:number,si:number) => setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,steps:s.steps.filter((_,sidx)=>sidx!==si)}:s));
+    const updateDeployStep = (di:number,si:number,field:string,val:string) =>
+      setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,steps:s.steps.map((st,sidx)=>sidx===si?{...st,[field]:val}:st)}:s));
+    const addNotify = (di:number) => setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,notify:[...s.notify,'']}:s));
+    const updateNotify = (di:number,ni:number,val:string) => setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,notify:s.notify.map((n,nidx)=>nidx===ni?val:n)}:s));
+    const removeNotify = (di:number,ni:number) => setDeployStages(d=>d.map((s,idx)=>idx===di?{...s,notify:s.notify.filter((_,nidx)=>nidx!==ni)}:s));
 
     const inputStyle = { width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-      borderRadius:6, padding:'9px 12px', color:'#e8eaf0', outline:'none', boxSizing:'border-box' as const,
-      fontFamily:"'Figtree',sans-serif", fontSize:13 };
-    const monoInput = { ...inputStyle, fontFamily:"'IBM Plex Mono',monospace", fontSize:12 };
+      borderRadius:6, padding:'8px 12px', color:'#e8eaf0', fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' } as const;
+    const labelStyle = { fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif", display:'block' } as const;
+    const sectionTitle = (text:string, color:string) => (
+      <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color, letterSpacing:'0.1em', textTransform:'uppercase' as const, marginBottom:14 }}>{text}</div>
+    );
 
     return (
-      <div style={{ display:'flex', flexDirection:'column', height:'100%' }}>
-
-        {/* ── page header */}
-        <div style={{ padding:'20px 28px 0', borderBottom:'1px solid rgba(255,255,255,0.07)' }}>
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 }}>
-            <div>
-              <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:20, fontWeight:800,
-                color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Pipeline Configuration</h2>
-              <p style={{ color:'#545f72', fontSize:12, fontFamily:"'Figtree',sans-serif", margin:'3px 0 0' }}>
-                {sel?.name} — configure build, deploy, and notification behaviour
-              </p>
-            </div>
-            <div style={{ display:'flex', gap:8 }}>
-              <button onClick={()=>setAiOpen(true)} style={{ display:'flex', alignItems:'center', gap:7,
-                padding:'8px 14px', background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
-                borderRadius:7, color:'#a078ff', cursor:'pointer', fontSize:12,
-                fontFamily:"'Figtree',sans-serif" }}>
-                <Sparkles size={12}/> Generate with AI
-              </button>
-              <button onClick={savePipeline} disabled={saving} style={{ padding:'8px 18px',
-                background: saved?'#00e5a0':'#00d4ff', color:'#000', border:'none',
-                borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
-                fontFamily:"'Figtree',sans-serif", transition:'background 0.2s', opacity:saving?0.7:1 }}>
-                {saving ? 'Saving…' : saved ? '✔ Saved' : 'Save'}
-              </button>
-            </div>
-          </div>
-
-          {/* tabs */}
-          <div style={{ display:'flex', gap:0, overflowX:'auto' }}>
-            {TABS.map(t=>(
-              <button key={t.id} onClick={()=>setTab(t.id)} style={{ display:'flex', alignItems:'center', gap:6,
-                padding:'9px 16px', background:'none', border:'none', borderBottom:`2px solid ${tab===t.id?'#00d4ff':'transparent'}`,
-                color: tab===t.id?'#00d4ff':'#545f72', cursor:'pointer', fontSize:13, fontWeight: tab===t.id?600:400,
-                fontFamily:"'Figtree',sans-serif", whiteSpace:'nowrap', transition:'color 0.15s' }}>
-                {t.icon}{t.label}
-              </button>
-            ))}
+      <div style={{ padding:28 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
+          <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Pipeline Configuration</h2>
+          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+            {saveMsg && <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color: saveMsg.startsWith('\u2716') ? '#ff4455' : '#00e5a0' }}>{saveMsg}</span>}
+            <button onClick={()=>sendAiMessage(`Generate a Callahanfile.yaml pipeline for my ${sel?.language??'Go'} project called ${sel?.name??'my-project'}. Return only the YAML, no explanation.`)}
+              style={{ display:'flex', alignItems:'center', gap:7, padding:'8px 14px', background:'rgba(0,212,255,0.08)',
+                border:'1px solid rgba(0,212,255,0.2)', borderRadius:7, color:'#00d4ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+              <Sparkles size={12}/> Generate with AI
+            </button>
+            <button onClick={save} disabled={saving} style={{ padding:'8px 16px', background:saving?'#111620':'#00d4ff',
+              color:saving?'#545f72':'#000', border:'none', borderRadius:7, fontSize:12, fontWeight:700,
+              cursor:saving?'wait':'pointer', fontFamily:"'Figtree',sans-serif" }}>{saving?'Saving\u2026':'Save & Push'}</button>
           </div>
         </div>
 
-        {/* ── tab content */}
-        <div style={{ flex:1, overflowY:'auto', padding:28 }}>
+        {/* Tab switcher */}
+        <div style={{ display:'flex', gap:4, marginBottom:20, background:'#080a0f', borderRadius:8, padding:3, width:'fit-content' }}>
+          {(['config','yaml'] as const).map(t=>(
+            <button key={t} onClick={()=>setTab(t)} style={{ padding:'7px 16px', borderRadius:6, border:'none', fontSize:12,
+              fontFamily:"'Figtree',sans-serif", fontWeight:600, cursor:'pointer',
+              background:tab===t?'rgba(0,212,255,0.12)':'transparent', color:tab===t?'#00d4ff':'#545f72' }}>
+              {t==='config'?'Visual Config':'YAML Editor'}
+            </button>
+          ))}
+        </div>
 
-          {/* ── GENERAL ─────────────────────────────────────────────── */}
-          {tab==='general' && (
-            <div style={{ maxWidth:640 }}>
-              <SectionLabel>Project</SectionLabel>
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14, marginBottom:14 }}>
-                <Field label="Pipeline Name">
-                  <input style={inputStyle} value={pName} onChange={e=>setPName(e.target.value)} placeholder={sel?.name}/>
-                </Field>
-                <Field label="Default Branch">
-                  <input style={inputStyle} value={pBranch} onChange={e=>setPBranch(e.target.value)} placeholder="main"/>
-                </Field>
-              </div>
-              <Field label="Repository URL">
-                <input style={inputStyle} value={pRepo} onChange={e=>setPRepo(e.target.value)} placeholder="https://github.com/org/repo"/>
-              </Field>
-              <Field label="Description">
-                <textarea value={pDesc} onChange={e=>setPDesc(e.target.value)} placeholder="What does this pipeline build?"
-                  style={{ ...inputStyle, resize:'vertical', minHeight:72 }}/>
-              </Field>
-              <div style={{ height:1, background:'rgba(255,255,255,0.07)', margin:'20px 0' }}/>
-              <SectionLabel>Runtime</SectionLabel>
+        {tab === 'yaml' ? (
+          <Card>
+            <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:12 }}>Callahanfile.yaml</div>
+            <textarea value={yaml} onChange={e=>setYaml(e.target.value)} style={{ width:'100%', minHeight:420, background:'#080a0f',
+              border:'1px solid rgba(255,255,255,0.12)', borderRadius:8, padding:20, fontFamily:"'IBM Plex Mono',monospace",
+              fontSize:13, color:'#8892a4', lineHeight:1.9, resize:'vertical', outline:'none' }}/>
+          </Card>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+
+            {/* ── General ── */}
+            <Card>
+              {sectionTitle('General', '#00d4ff')}
               <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:14 }}>
-                <Field label="Docker Image" hint="Used for all steps unless overridden">
-                  <input style={monoInput} value={pImage} onChange={e=>setPImage(e.target.value)} placeholder="callahan:latest"/>
-                </Field>
-                <Field label="Timeout (minutes)">
-                  <input type="number" min="1" max="180" style={monoInput} value={pTimeout} onChange={e=>setPTimeout(e.target.value)}/>
-                </Field>
-              </div>
-            </div>
-          )}
-
-          {/* ── TRIGGERS ─────────────────────────────────────────────── */}
-          {tab==='triggers' && (
-            <div style={{ maxWidth:540 }}>
-              <SectionLabel>Build Triggers</SectionLabel>
-              <Card style={{ marginBottom:14 }}>
-                <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-                  <Toggle checked={tPush}   onChange={setTPush}   label="Push to branch"/>
-                  <Toggle checked={tPR}     onChange={setTPR}     label="Pull Request / Merge Request"/>
-                  <Toggle checked={tManual} onChange={setTManual} label="Manual trigger (Run Build button)"/>
+                <div>
+                  <label style={labelStyle}>Pipeline Name</label>
+                  <input value={pipelineName} onChange={e=>setPipelineName(e.target.value)} style={inputStyle} placeholder="my-pipeline"/>
                 </div>
-              </Card>
-              <Field label="Cron Schedule (optional)" hint='e.g. "0 2 * * *" runs nightly at 02:00 UTC'>
-                <input style={monoInput} value={tCron} onChange={e=>setTCron(e.target.value)} placeholder='0 2 * * *'/>
-              </Field>
-            </div>
-          )}
+                <div>
+                  <label style={labelStyle}>Trigger Branches</label>
+                  <input value={triggerBranches} onChange={e=>setTriggerBranches(e.target.value)} style={inputStyle} placeholder="main, develop"/>
+                </div>
+              </div>
+            </Card>
 
-          {/* ── STEPS ─────────────────────────────────────────────────── */}
-          {tab==='steps' && (
-            <div style={{ maxWidth:720 }}>
-              {/* toolbar */}
+            {/* ── CI Jobs ── */}
+            <Card>
               <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-                <SectionLabel>Build Steps</SectionLabel>
-                <div style={{ display:'flex', gap:8 }}>
-                  <button onClick={()=>{ setShowYaml(v=>!v); setYamlText(steps.map(s=>`      - name: ${s.name}\n        run: ${s.run}${s.continueOnError?'\n        continue-on-error: true':''}`).join('\n')); }}
-                    style={{ display:'flex', alignItems:'center', gap:5,
-                      padding:'6px 12px', background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.1)',
-                      borderRadius:6, color:'#8892a4', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                    {showYaml ? 'Form view' : 'Edit YAML'}
-                  </button>
-                  <button onClick={()=>setShowAiBox(v=>!v)} style={{ display:'flex', alignItems:'center', gap:5,
-                    padding:'6px 12px', background:'rgba(160,120,255,0.08)', border:'1px solid rgba(160,120,255,0.2)',
-                    borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                    <Sparkles size={11}/> Generate with AI
-                  </button>
-                  {!showYaml && <button onClick={addStep} style={{ display:'flex', alignItems:'center', gap:5,
-                    padding:'6px 12px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
-                    borderRadius:6, color:'#00d4ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                    <Plus size={12}/> Add Step
-                  </button>}
-                </div>
-              </div>
-
-              {/* AI prompt box */}
-              {showAiBox && (
-                <Card style={{ marginBottom:14, padding:'14px 16px' }}>
-                  <div style={{ fontSize:12, color:'#a078ff', fontWeight:600, marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>
-                    ✦ Describe your pipeline in plain English
-                  </div>
-                  <textarea value={aiPrompt} onChange={e=>setAiPrompt(e.target.value)}
-                    placeholder="e.g. Test and build a Go CLI tool, run go vet, go test, then go build"
-                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(160,120,255,0.2)',
-                      borderRadius:6, padding:'10px 12px', color:'#e8eaf0', outline:'none',
-                      fontFamily:"'Figtree',sans-serif", fontSize:13, resize:'vertical', minHeight:72,
-                      boxSizing:'border-box' }}/>
-                  <div style={{ display:'flex', gap:8, marginTop:10 }}>
-                    <button onClick={()=>setShowAiBox(false)} style={{ padding:'7px 14px', background:'transparent',
-                      border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72',
-                      cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Cancel</button>
-                    <button onClick={generateSteps} disabled={aiGenerating||!aiPrompt.trim()} style={{ display:'flex', alignItems:'center', gap:6,
-                      padding:'7px 18px', background:'#a078ff', border:'none', borderRadius:6,
-                      color:'#000', cursor:aiGenerating?'wait':'pointer', fontSize:12,
-                      fontFamily:"'Figtree',sans-serif", fontWeight:700, opacity:aiGenerating?0.6:1 }}>
-                      {aiGenerating ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Generating…</> : <><Sparkles size={12}/> Generate</>}
-                    </button>
-                  </div>
-                </Card>
-              )}
-
-              {/* YAML editor */}
-              {showYaml ? (
-                <Card style={{ padding:'14px 16px' }}>
-                  <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>
-                    Paste or edit YAML steps — then click Apply
-                  </div>
-                  <textarea value={yamlText} onChange={e=>setYamlText(e.target.value)}
-                    style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)',
-                      borderRadius:6, padding:'12px', color:'#e8eaf0', outline:'none',
-                      fontFamily:"'IBM Plex Mono',monospace", fontSize:12, resize:'vertical', minHeight:180,
-                      boxSizing:'border-box', lineHeight:1.6 }}/>
-                  <button onClick={()=>{ applyYaml(yamlText); setShowYaml(false); }}
-                    style={{ marginTop:10, padding:'7px 18px', background:'#00d4ff', border:'none',
-                      borderRadius:6, color:'#000', cursor:'pointer', fontSize:12,
-                      fontFamily:"'Figtree',sans-serif", fontWeight:700 }}>
-                    Apply YAML
-                  </button>
-                </Card>
-              ) : (
-                <>
-                  <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
-                    {steps.map((s, idx)=>(
-                      <Card key={s.id} style={{ padding:'14px 18px' }}>
-                        <div style={{ display:'flex', alignItems:'flex-start', gap:12 }}>
-                          <div style={{ width:24, height:24, borderRadius:6, background:'rgba(0,212,255,0.1)',
-                            border:'1px solid rgba(0,212,255,0.2)', display:'flex', alignItems:'center',
-                            justifyContent:'center', flexShrink:0, marginTop:2 }}>
-                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#00d4ff' }}>{idx+1}</span>
-                          </div>
-                          <div style={{ flex:1, display:'grid', gridTemplateColumns:'1fr 2fr', gap:10 }}>
-                            <div>
-                              <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Step Name</div>
-                              <input style={{ ...inputStyle, fontSize:12 }} value={s.name} placeholder="e.g. Install"
-                                onChange={e=>updateStep(s.id,'name',e.target.value)}/>
-                            </div>
-                            <div>
-                              <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>Command</div>
-                              <input style={{ ...monoInput }} value={s.run} placeholder="e.g. go test ./..."
-                                onChange={e=>updateStep(s.id,'run',e.target.value)}/>
-                            </div>
-                          </div>
-                          <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:6 }}>
-                            <label style={{ display:'flex', alignItems:'center', gap:5, cursor:'pointer' }}>
-                              <input type="checkbox" checked={s.continueOnError}
-                                onChange={e=>updateStep(s.id,'continueOnError',e.target.checked)}/>
-                              <span style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif", whiteSpace:'nowrap' }}>
-                                Continue on error
-                              </span>
-                            </label>
-                            <button onClick={()=>delStep(s.id)} style={{ background:'none', border:'none',
-                              cursor:'pointer', color:'#545f72', lineHeight:0, padding:4 }}
-                              onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
-                              onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
-                              <Trash2 size={13}/>
-                            </button>
-                          </div>
-                        </div>
-                      </Card>
-                    ))}
-                  </div>
-                  {steps.length===0 && (
-                    <div style={{ textAlign:'center', padding:'32px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
-                      No steps yet — click Add Step, Generate with AI, or Edit YAML
-                    </div>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-
-          {/* ── AI ─────────────────────────────────────────────────────── */}
-          {tab==='ai' && (
-            <div style={{ maxWidth:560 }}>
-              <SectionLabel>AI Features</SectionLabel>
-              <Card style={{ marginBottom:14 }}>
-                <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
-                  <Toggle checked={aiReview}   onChange={setAiReview}   label="Code review on every build"/>
-                  <Toggle checked={aiSecurity} onChange={setAiSecurity} label="Security scan (Semgrep / secret detection)"/>
-                  <Toggle checked={aiExplain}  onChange={setAiExplain}  label="AI explain on build failure"/>
-                </div>
-              </Card>
-              <Field label="Override AI Model" hint="Leave blank to use the globally configured model">
-                <input style={monoInput} value={aiModel} onChange={e=>setAiModel(e.target.value)} placeholder="e.g. llama-3.3-70b-versatile"/>
-              </Field>
-              <div style={{ marginTop:8, padding:'12px 14px', background:'rgba(160,120,255,0.06)',
-                border:'1px solid rgba(160,120,255,0.18)', borderRadius:8,
-                fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#8892a4', lineHeight:1.6 }}>
-                <span style={{ color:'#a078ff', fontWeight:600 }}>✦ How it works:</span> Code review and security scan run as job cards after your steps complete. Results appear in the Build Log. AI explain triggers automatically when a step exits non-zero.
-              </div>
-            </div>
-          )}
-
-          {/* ── ENVIRONMENTS ──────────────────────────────────────────── */}
-          {tab==='environments' && (
-            <div style={{ maxWidth:900 }}>
-              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-                <SectionLabel>Deploy Environments</SectionLabel>
-                <button onClick={()=>setShowAddEnv(s=>!s)} style={{ display:'flex', alignItems:'center', gap:6,
-                  padding:'6px 14px', background:'rgba(0,229,160,0.08)', border:'1px solid rgba(0,229,160,0.2)',
-                  borderRadius:6, color:'#00e5a0', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                  <Plus size={12}/> Add Environment
+                {sectionTitle('CI Jobs', '#00d4ff')}
+                <button onClick={addJob} style={{ display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
+                  background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)', borderRadius:6,
+                  color:'#00d4ff', cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                  <Plus size={11}/> Add Job
                 </button>
               </div>
-
-              {/* Add env form */}
-              {showAddEnv && (
-                <Card style={{ marginBottom:16 }}>
-                  <SectionLabel>New Environment</SectionLabel>
-                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
-                    {([['Name','name','e.g. staging'],['Branch Filter','branch_filter','e.g. main']] as [string,string,string][]).map(([label,field,ph])=>(
-                      <div key={field}>
-                        <div style={{ fontSize:11, color:'#545f72', marginBottom:4, fontFamily:"'Figtree',sans-serif" }}>{label}</div>
-                        <input value={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.value}))}
-                          placeholder={ph} style={inputStyle}/>
-                      </div>
-                    ))}
+              {jobs.map((job, ji) => (
+                <div key={ji} style={{ background:'#080a0f', borderRadius:8, padding:14, marginBottom:10,
+                  border:'1px solid rgba(255,255,255,0.07)' }}>
+                  <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10 }}>
+                    <input value={job.name} onChange={e=>updateJob(ji,'name',e.target.value)}
+                      style={{ ...inputStyle, flex:1, fontWeight:700, fontSize:13, color:'#fff' }} placeholder="Job name"/>
+                    <button onClick={()=>removeJob(ji)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4 }}
+                      onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')} onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                      <Trash2 size={13}/>
+                    </button>
                   </div>
-                  <div style={{ display:'flex', gap:20, marginBottom:14 }}>
-                    <Toggle checked={newEnv.auto_deploy} onChange={v=>setNewEnv(n=>({...n,auto_deploy:v}))} label="Auto-deploy on green build"/>
-                    <Toggle checked={newEnv.requires_approval} onChange={v=>setNewEnv(n=>({...n,requires_approval:v}))} label="Require approval"/>
-                  </div>
-                  <div style={{ display:'flex', gap:8 }}>
-                    <button onClick={()=>setShowAddEnv(false)} style={{ flex:1, padding:'8px', background:'transparent',
-                      border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer',
-                      fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
-                    <button onClick={createEnv} style={{ flex:2, padding:'8px', background:'#00e5a0',
-                      border:'none', borderRadius:6, color:'#000', cursor:'pointer',
-                      fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>Create Environment</button>
-                  </div>
-                </Card>
-              )}
-
-              {/* Quick create */}
-              {envs.length===0 && !showAddEnv && (
-                <div style={{ marginBottom:16 }}>
-                  <div style={{ fontSize:12, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>Quick create standard environments:</div>
-                  <div style={{ display:'flex', gap:8 }}>
-                    {['dev','test','staging','prod'].map(name=>(
-                      <button key={name} onClick={async ()=>{
-                        if(!sel) return;
-                        const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`,{
-                          method:'POST',headers:{'Content-Type':'application/json'},
-                          body:JSON.stringify({name,color:ENV_COLORS[name],auto_deploy:name!=='prod',requires_approval:name==='prod'})
-                        });
-                        if(r.ok){const d=await r.json();setEnvs(e=>[...e,d]);}
-                      }} style={{ padding:'7px 14px', borderRadius:6, cursor:'pointer',
-                        background:`${ENV_COLORS[name]}15`, border:`1px solid ${ENV_COLORS[name]}40`,
-                        color:ENV_COLORS[name], fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
-                        + {name}
+                  {job.steps.map((step, si) => (
+                    <div key={si} style={{ display:'flex', gap:8, marginBottom:6, marginLeft:12 }}>
+                      <input value={step.name} onChange={e=>updateStep(ji,si,'name',e.target.value)}
+                        style={{ ...inputStyle, flex:'0 0 180px' }} placeholder="Step name"/>
+                      <input value={step.run} onChange={e=>updateStep(ji,si,'run',e.target.value)}
+                        style={{ ...inputStyle, flex:1 }} placeholder="Command to run"/>
+                      <button onClick={()=>removeStep(ji,si)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4, flexShrink:0 }}
+                        onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')} onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+                        <X size={12}/>
                       </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Guardrail warning */}
-              {guardResult && !guardResult.safe && (
-                <div style={{ marginBottom:14, padding:14, background:'rgba(255,68,85,0.08)',
-                  border:'1px solid rgba(255,68,85,0.25)', borderRadius:8 }}>
-                  <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8,
-                    color:'#ff4455', fontWeight:700, fontFamily:"'Figtree',sans-serif" }}>
-                    <AlertTriangle size={14}/> AI Deployment Guardrail — Concerns Detected
-                  </div>
-                  {guardResult.concerns.map((c,i)=>(
-                    <div key={i} style={{ fontSize:12, color:'#ff8888', fontFamily:"'Figtree',sans-serif", marginLeft:22 }}>• {c}</div>
+                    </div>
                   ))}
-                  <button onClick={()=>setGuardResult(null)} style={{ marginTop:8, padding:'5px 12px',
-                    background:'transparent', border:'1px solid rgba(255,68,85,0.3)', borderRadius:6,
-                    color:'#ff4455', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Dismiss</button>
+                  <button onClick={()=>addStep(ji)} style={{ marginLeft:12, marginTop:4, display:'flex', alignItems:'center', gap:4,
+                    background:'none', border:'1px dashed rgba(255,255,255,0.12)', borderRadius:5, padding:'4px 10px',
+                    color:'#545f72', cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                    <Plus size={10}/> Add Step
+                  </button>
                 </div>
-              )}
+              ))}
+            </Card>
 
-              {/* Env cards */}
-              <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
-                {envs.map(env=>{
-                  const envDeps = deployments.filter(d=>d.environment_id===env.id).slice(0,5);
-                  const latestDep = envDeps[0];
-                  const deployedBuild = latestDep ? projBuilds.find(b=>b.id===latestDep.build_id) : null;
-                  const isDeploying = deploying===env.id;
-                  return (
-                    <Card key={env.id} style={{ borderLeft:`3px solid ${env.color||'#545f72'}`, padding:0, overflow:'hidden' }}>
-                      {/* Header row */}
-                      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
-                        padding:'14px 16px', borderBottom:'1px solid rgba(255,255,255,0.06)' }}>
-                        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                          <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>{env.name}</span>
-                          {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4,
-                            background:'rgba(0,229,160,0.1)', color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
-                          {env.requires_approval && <span style={{ fontSize:10, padding:'2px 7px', borderRadius:4,
-                            background:'rgba(245,197,66,0.1)', color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
-                          {env.branch_filter && <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>branch: {env.branch_filter}</span>}
-                        </div>
-                        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                          <button onClick={()=>openDeployModal(env.id, env.name)} disabled={isDeploying}
-                            style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 14px',
-                              background: isDeploying?'rgba(0,212,255,0.05)':'rgba(0,212,255,0.12)',
-                              border:`1px solid ${isDeploying?'rgba(0,212,255,0.1)':'rgba(0,212,255,0.3)'}`,
-                              borderRadius:6, color:isDeploying?'#545f72':'#00d4ff', cursor:isDeploying?'wait':'pointer',
-                              fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
-                            {isDeploying ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Deploying…</> : <><Rocket size={12}/> Deploy</>}
-                          </button>
-                          <button onClick={()=>deleteEnv(env.id)} style={{ background:'none', border:'none',
-                            cursor:'pointer', color:'#545f72', lineHeight:0 }}
-                            onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
-                            onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
+            {/* ── AI Settings ── */}
+            <Card>
+              {sectionTitle('AI Agents', '#a078ff')}
+              <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+                {[
+                  { label:'AI Code Review', desc:'Runs an AI review after every successful build', val:aiReview, set:setAiReview, icon:<Search size={14}/> },
+                  { label:'AI Security Scan', desc:'Scans source code for vulnerabilities and hardcoded secrets', val:aiSecurity, set:setAiSecurity, icon:<Shield size={14}/> },
+                ].map(item=>(
+                  <div key={item.label} onClick={()=>item.set(!item.val)} style={{ display:'flex', alignItems:'center', gap:12,
+                    padding:'10px 14px', borderRadius:8, cursor:'pointer', background:item.val?'rgba(160,120,255,0.06)':'rgba(255,255,255,0.02)',
+                    border:`1px solid ${item.val?'rgba(160,120,255,0.25)':'rgba(255,255,255,0.07)'}`, transition:'all 0.15s' }}>
+                    <div style={{ width:32, height:32, borderRadius:6, display:'flex', alignItems:'center', justifyContent:'center',
+                      background:item.val?'rgba(160,120,255,0.15)':'rgba(255,255,255,0.05)', color:item.val?'#a078ff':'#545f72' }}>
+                      {item.icon}
+                    </div>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600, color:item.val?'#fff':'#8892a4' }}>{item.label}</div>
+                      <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:11, color:'#545f72', marginTop:2 }}>{item.desc}</div>
+                    </div>
+                    <div style={{ width:36, height:20, borderRadius:10, background:item.val?'#a078ff':'#1a1f2e', transition:'background 0.2s',
+                      position:'relative' as const }}>
+                      <div style={{ width:16, height:16, borderRadius:8, background:'#fff', position:'absolute' as const,
+                        top:2, left:item.val?18:2, transition:'left 0.2s' }}/>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            {/* ── Deploy Chain ── */}
+            <Card>
+              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+                {sectionTitle('Deploy Chain', '#00e5a0')}
+                <button onClick={addDeploy} style={{ display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
+                  background:'rgba(0,229,160,0.08)', border:'1px solid rgba(0,229,160,0.2)', borderRadius:6,
+                  color:'#00e5a0', cursor:'pointer', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                  <Plus size={11}/> Add Environment
+                </button>
+              </div>
+              {deployStages.length === 0 ? (
+                <div style={{ textAlign:'center', padding:'24px 0', color:'#545f72', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
+                  No deploy stages configured. Add an environment to create a CD pipeline.
+                </div>
+              ) : (
+                <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+                  {deployStages.map((stage, di) => {
+                    const envColors: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455' };
+                    const color = envColors[stage.name.toLowerCase()] || '#8892a4';
+                    return (
+                      <div key={di} style={{ background:'#080a0f', borderRadius:8, padding:14,
+                        borderLeft:`3px solid ${color}`, border:`1px solid rgba(255,255,255,0.07)`, borderLeftWidth:3, borderLeftColor:color }}>
+                        {/* Stage header */}
+                        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:12 }}>
+                          <select value={stage.name} onChange={e=>updateDeploy(di,{name:e.target.value})}
+                            style={{ ...inputStyle, flex:'0 0 120px', fontWeight:700, color }}>
+                            {['dev','test','staging','prod','custom'].map(n=><option key={n} value={n}>{n}</option>)}
+                          </select>
+                          <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                            <label style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>Gate:</label>
+                            <select value={stage.auto?'auto':'manual'} onChange={e=>{
+                              const isAuto = e.target.value==='auto';
+                              updateDeploy(di, { auto:isAuto, gate:isAuto?'auto':'manual' });
+                            }} style={{ ...inputStyle, width:100 }}>
+                              <option value="auto">Auto</option>
+                              <option value="manual">Manual</option>
+                            </select>
+                          </div>
+                          {!stage.auto && (
+                            <div style={{ display:'flex', alignItems:'center', gap:4 }} onClick={()=>updateDeploy(di,{requiresApproval:!stage.requiresApproval})}>
+                              <div style={{ width:14, height:14, borderRadius:3, border:`1px solid ${stage.requiresApproval?'#f5c542':'rgba(255,255,255,0.2)'}`,
+                                background:stage.requiresApproval?'rgba(245,197,66,0.2)':'transparent', display:'flex', alignItems:'center',
+                                justifyContent:'center', cursor:'pointer' }}>
+                                {stage.requiresApproval && <CheckCircle size={10} color="#f5c542"/>}
+                              </div>
+                              <span style={{ fontSize:11, color:'#545f72', fontFamily:"'Figtree',sans-serif", cursor:'pointer' }}>Requires approval</span>
+                            </div>
+                          )}
+                          <div style={{ flex:1 }}/>
+                          <button onClick={()=>removeDeploy(di)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4 }}
+                            onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')} onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
                             <Trash2 size={13}/>
                           </button>
                         </div>
-                      </div>
-
-                      {/* Currently deployed */}
-                      <div style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,0.04)',
-                        background:'rgba(255,255,255,0.015)' }}>
-                        <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
-                          fontFamily:"'IBM Plex Mono',monospace", marginBottom:6 }}>Currently Deployed</div>
-                        {deployedBuild && latestDep?.status === 'success' ? (
-                          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-                            <span style={{ width:7, height:7, borderRadius:'50%', background:'#00e5a0', flexShrink:0 }}/>
-                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00e5a0', fontWeight:600 }}>
-                              #{deployedBuild.number ?? '?'}
-                            </span>
-                            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
-                              {deployedBuild.commit?.slice(0,7) ?? deployedBuild.commit_sha?.slice(0,7) ?? ''}
-                            </span>
-                            <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif",
-                              flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-                              {deployedBuild.commit_message ?? deployedBuild.commitMsg ?? ''}
-                            </span>
-                            <span style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
-                              {timeAgo(latestDep.created_at)}
-                            </span>
-                          </div>
-                        ) : (
-                          <div style={{ fontSize:12, color:'#545f72', fontFamily:"'Figtree',sans-serif", fontStyle:'italic' }}>
-                            {latestDep ? `Last deploy: ${latestDep.status}` : 'Nothing deployed yet'}
+                        {/* Deploy steps */}
+                        {stage.steps.length > 0 && (
+                          <div style={{ marginBottom:8 }}>
+                            <div style={{ fontSize:10, color:'#545f72', marginBottom:6, fontFamily:"'IBM Plex Mono',monospace", letterSpacing:'0.05em' }}>DEPLOY STEPS</div>
+                            {stage.steps.map((s,si)=>(
+                              <div key={si} style={{ display:'flex', gap:8, marginBottom:4, marginLeft:8 }}>
+                                <input value={s.name} onChange={e=>updateDeployStep(di,si,'name',e.target.value)} style={{...inputStyle,flex:'0 0 150px'}} placeholder="Step name"/>
+                                <input value={s.run} onChange={e=>updateDeployStep(di,si,'run',e.target.value)} style={{...inputStyle,flex:1}} placeholder="Command"/>
+                                <button onClick={()=>removeDeployStep(di,si)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4 }}>
+                                  <X size={12}/>
+                                </button>
+                              </div>
+                            ))}
                           </div>
                         )}
-                      </div>
-
-                      {/* Deployment history */}
-                      {envDeps.length > 0 && (
-                        <div style={{ padding:'10px 16px' }}>
-                          <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
-                            fontFamily:"'IBM Plex Mono',monospace", marginBottom:8 }}>Deployment History</div>
-                          <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
-                            {envDeps.map((d,i)=>{
-                              const b = projBuilds.find(b=>b.id===d.build_id);
-                              const statusColor = d.status==='success'?'#00e5a0':d.status==='running'?'#00d4ff':d.status==='pending'?'#f5c542':'#ff4455';
-                              return (
-                                <div key={d.id}
-                                  onClick={b ? ()=>{ setView('builds'); setSelBuild(b); } : undefined}
-                                  style={{ display:'flex', alignItems:'center', gap:10,
-                                  padding:'6px 8px', borderRadius:5, cursor: b ? 'pointer' : 'default',
-                                  background: i===0 ? 'rgba(255,255,255,0.025)' : 'transparent',
-                                  transition:'background 0.12s' }}
-                                  onMouseEnter={b?e=>(e.currentTarget.style.background='rgba(255,255,255,0.04)'):undefined}
-                                  onMouseLeave={b?e=>(e.currentTarget.style.background=i===0?'rgba(255,255,255,0.025)':'transparent'):undefined}>
-                                  <span style={{ width:6, height:6, borderRadius:'50%', background:statusColor, flexShrink:0 }}/>
-                                  <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:statusColor, width:52, flexShrink:0 }}>{d.status}</span>
-                                  {b && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:52, flexShrink:0 }}>
-                                    build #{b.number ?? '?'}
-                                  </span>}
-                                  {b && <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:52, flexShrink:0 }}>
-                                    {(b.commit??b.commit_sha??'').slice(0,7)}
-                                  </span>}
-                                  {b && <span style={{ fontSize:11, color:'#8892a4', fontFamily:"'Figtree',sans-serif",
-                                    flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-                                    {b.commit_message ?? b.commitMsg ?? ''}
-                                  </span>}
-                                  <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
-                                    {timeAgo(d.created_at)}
-                                  </span>
-                                  {d.status==='pending' && (
-                                    <button onClick={async ()=>{
-                                      await fetch(`http://localhost:8080/api/v1/deployments/${d.id}/approve`,{method:'POST'});
-                                      setTimeout(()=>fetch(`http://localhost:8080/api/v1/projects/${sel!.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{}), 3200);
-                                    }} style={{ padding:'3px 10px', background:'rgba(245,197,66,0.12)',
-                                      border:'1px solid rgba(245,197,66,0.3)', borderRadius:5,
-                                      color:'#f5c542', cursor:'pointer', fontSize:11,
-                                      fontFamily:"'Figtree',sans-serif", flexShrink:0 }}>
-                                      Approve
-                                    </button>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                    </Card>
-                  );
-                })}
-              </div>
-
-              {/* Deploy chain legend */}
-              {envs.length >= 2 && (
-                <div style={{ marginTop:20, padding:'12px 16px', background:'rgba(0,212,255,0.04)',
-                  border:'1px solid rgba(0,212,255,0.1)', borderRadius:8,
-                  fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#545f72' }}>
-                  <span style={{ color:'#00d4ff', fontWeight:600 }}>Deploy Chain: </span>
-                  {envs.map((e,i)=>(
-                    <span key={e.id}>
-                      <span style={{ color: e.requires_approval ? '#f5c542' : '#00e5a0' }}>{e.name}</span>
-                      {i < envs.length-1 && <span style={{ color:'#545f72' }}> → </span>}
-                    </span>
-                  ))}
-                  <span style={{ marginLeft:8, color:'#545f72' }}> · <span style={{ color:'#00e5a0' }}>green</span> = auto · <span style={{ color:'#f5c542' }}>yellow</span> = needs approval</span>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* ── NOTIFICATIONS ─────────────────────────────────────────── */}
-          {tab==='notifications' && (
-            <div style={{ maxWidth:680 }}>
-              <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-                <SectionLabel>Notification Channels</SectionLabel>
-                <button onClick={()=>setShowAddCh(s=>!s)} style={{ display:'flex', alignItems:'center', gap:6,
-                  padding:'6px 14px', background:'rgba(245,197,66,0.08)', border:'1px solid rgba(245,197,66,0.2)',
-                  borderRadius:6, color:'#f5c542', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                  <Plus size={12}/> Add Channel
-                </button>
-              </div>
-
-              {showAddCh && (
-                <Card style={{ marginBottom:16 }}>
-                  <SectionLabel>New Notification Channel</SectionLabel>
-                  {/* platform picker */}
-                  <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:6, marginBottom:14 }}>
-                    {PLATFORMS.map(p=>(
-                      <button key={p.id} onClick={()=>setChPlatform(p.id)} style={{ padding:'7px 8px', borderRadius:6,
-                        cursor:'pointer', textAlign:'left',
-                        background: chPlatform===p.id?`${p.color}20`:'transparent',
-                        border:`1px solid ${chPlatform===p.id?p.color+'50':'rgba(255,255,255,0.08)'}` }}>
-                        <div style={{ fontSize:12, fontWeight:600, fontFamily:"'Figtree',sans-serif",
-                          color: chPlatform===p.id?p.color:'#8892a4' }}>{p.name}</div>
-                      </button>
-                    ))}
-                  </div>
-                  <div style={{ fontSize:11, color:'#545f72', marginBottom:12, fontFamily:"'Figtree',sans-serif" }}>{pInfo?.desc}</div>
-                  <div style={{ display:'grid', gridTemplateColumns:'1fr 2fr', gap:10, marginBottom:12 }}>
-                    <Field label="Channel Name">
-                      <input style={inputStyle} value={chName} onChange={e=>setChName(e.target.value)} placeholder="#builds"/>
-                    </Field>
-                    <Field label="Webhook URL">
-                      <input type="password" style={monoInput} value={chWebhook} onChange={e=>setChWebhook(e.target.value)} placeholder="https://hooks.slack.com/…"/>
-                    </Field>
-                  </div>
-                  <div style={{ display:'flex', gap:20, flexWrap:'wrap', marginBottom:12 }}>
-                    <Toggle checked={chOnSuccess} onChange={setChOnSuccess} label="On success"/>
-                    <Toggle checked={chOnFailure} onChange={setChOnFailure} label="On failure"/>
-                    <Toggle checked={chOnCancel}  onChange={setChOnCancel}  label="On cancel"/>
-                    <Toggle checked={chAiMsg}     onChange={setChAiMsg}     label="AI-written message"/>
-                  </div>
-                  {/* AI preview */}
-                  <div style={{ marginBottom:12 }}>
-                    <button onClick={generatePreview} disabled={notifPreviewing} style={{ display:'flex', alignItems:'center', gap:6,
-                      padding:'6px 12px', background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
-                      borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                      {notifPreviewing ? <Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> : <Sparkles size={12}/>}
-                      {notifPreviewing ? 'Generating…' : 'AI Message Preview'}
-                    </button>
-                    {notifPreview && (
-                      <div style={{ marginTop:8, padding:'10px 14px', background:'rgba(255,255,255,0.03)',
-                        border:'1px solid rgba(255,255,255,0.08)', borderRadius:6,
-                        fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#e8eaf0', whiteSpace:'pre-wrap' }}>
-                        {notifPreview}
-                      </div>
-                    )}
-                  </div>
-                  <div style={{ display:'flex', gap:8 }}>
-                    <button onClick={()=>setShowAddCh(false)} style={{ flex:1, padding:'8px', background:'transparent',
-                      border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer',
-                      fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
-                    <button onClick={saveChannel} disabled={chSaving} style={{ flex:2, padding:'8px',
-                      background:'#f5c542', border:'none', borderRadius:6, color:'#000', cursor:'pointer',
-                      fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
-                      {chSaving ? 'Saving…' : 'Save Channel'}
-                    </button>
-                  </div>
-                </Card>
-              )}
-
-              {channels.length===0 && !showAddCh ? (
-                <div style={{ textAlign:'center', padding:'48px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
-                  <Bell size={30} style={{ opacity:0.3, marginBottom:10 }}/>
-                  <div style={{ fontSize:14 }}>No notification channels yet</div>
-                  <div style={{ fontSize:12, marginTop:4 }}>Add Slack, Teams, Discord, Jira, or Azure DevOps</div>
-                </div>
-              ) : (
-                <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-                  {channels.map(ch=>{
-                    const pDef = PLATFORMS.find(p=>p.id===ch.platform);
-                    return (
-                      <Card key={ch.id} style={{ padding:'14px 18px' }}>
-                        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                          <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-                            <div style={{ width:34, height:34, borderRadius:8, background:`${pDef?.color||'#545f72'}20`,
-                              display:'flex', alignItems:'center', justifyContent:'center',
-                              border:`1px solid ${pDef?.color||'#545f72'}40` }}>
-                              <Bell size={14} color={pDef?.color||'#545f72'}/>
-                            </div>
-                            <div>
-                              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:600, color:'#fff' }}>{ch.name}</div>
-                              <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
-                                {ch.platform} · {[ch.on_success&&'✔ success',ch.on_failure&&'✖ fail',ch.ai_message&&'✦ AI'].filter(Boolean).join(' · ')}
+                        <button onClick={()=>addDeployStep(di)} style={{ display:'flex', alignItems:'center', gap:4, marginBottom:8,
+                          background:'none', border:'1px dashed rgba(255,255,255,0.1)', borderRadius:5, padding:'3px 10px',
+                          color:'#545f72', cursor:'pointer', fontSize:10, fontFamily:"'Figtree',sans-serif" }}>
+                          <Plus size={9}/> Add Deploy Step
+                        </button>
+                        {/* Notifications */}
+                        {stage.notify.length > 0 && (
+                          <div style={{ marginBottom:6 }}>
+                            <div style={{ fontSize:10, color:'#545f72', marginBottom:6, fontFamily:"'IBM Plex Mono',monospace", letterSpacing:'0.05em' }}>NOTIFICATIONS</div>
+                            {stage.notify.map((n,ni)=>(
+                              <div key={ni} style={{ display:'flex', gap:8, marginBottom:4, marginLeft:8 }}>
+                                <input value={n} onChange={e=>updateNotify(di,ni,e.target.value)} style={{...inputStyle,flex:1}} placeholder="slack:#channel or email:ops@co.com"/>
+                                <button onClick={()=>removeNotify(di,ni)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:4 }}>
+                                  <X size={12}/>
+                                </button>
                               </div>
-                            </div>
+                            ))}
                           </div>
-                          <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-                            <span style={{ width:7, height:7, borderRadius:'50%',
-                              background: ch.enabled?'#00e5a0':'#545f72', display:'inline-block' }}/>
-                            <button onClick={()=>deleteChannel(ch.id)} style={{ background:'none', border:'none',
-                              cursor:'pointer', color:'#545f72', lineHeight:0 }}
-                              onMouseEnter={e=>(e.currentTarget.style.color='#ff4455')}
-                              onMouseLeave={e=>(e.currentTarget.style.color='#545f72')}>
-                              <Trash2 size={13}/>
-                            </button>
-                          </div>
-                        </div>
-                      </Card>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* ── Deploy version picker modal */}
-        {deployTarget && (() => {
-          const successBuilds = projBuilds.filter(b=>b.status==='success');
-          const envForModal = envs.find(e=>e.id===deployTarget.envId);
-          const currentDep = deployments.find(d=>d.environment_id===deployTarget.envId && d.status==='success');
-          const currentBuild = currentDep ? projBuilds.find(b=>b.id===currentDep.build_id) : null;
-          return (
-          <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'center',
-            justifyContent:'center', background:'rgba(0,0,0,0.7)', backdropFilter:'blur(6px)' }}
-            onClick={()=>setDeployTarget(null)}>
-            <div style={{ width:520, background:'#0d1117', border:'1px solid rgba(255,255,255,0.14)',
-              borderRadius:12, padding:24, boxShadow:'0 32px 80px rgba(0,0,0,0.7)', maxHeight:'85vh', display:'flex', flexDirection:'column' }}
-              onClick={e=>e.stopPropagation()}>
-
-              {/* Header */}
-              <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:16 }}>
-                <div>
-                  <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:17, fontWeight:700, color:'#fff', margin:'0 0 4px' }}>
-                    Deploy to <span style={{ color: envForModal?.color||'#00d4ff' }}>{deployTarget.envName}</span>
-                  </h3>
-                  {currentBuild ? (
-                    <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72' }}>
-                      Currently running: build #{currentBuild.number} · {(currentBuild.commit??currentBuild.commit_sha??'').slice(0,7)}
-                    </div>
-                  ) : (
-                    <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:12, color:'#545f72' }}>Nothing deployed yet</div>
-                  )}
-                </div>
-                <button onClick={()=>setDeployTarget(null)} style={{ background:'none', border:'none',
-                  cursor:'pointer', color:'#545f72', lineHeight:0 }}><X size={15}/></button>
-              </div>
-
-              {/* Build list */}
-              <div style={{ fontSize:10, letterSpacing:'0.08em', color:'#545f72', textTransform:'uppercase',
-                fontFamily:"'IBM Plex Mono',monospace", marginBottom:8 }}>Select Build to Deploy</div>
-
-              {successBuilds.length === 0 ? (
-                <div style={{ padding:'20px', textAlign:'center', color:'#545f72',
-                  fontFamily:"'Figtree',sans-serif", fontSize:13, fontStyle:'italic' }}>
-                  No successful builds yet — run a build first
-                </div>
-              ) : (
-                <div style={{ overflowY:'auto', display:'flex', flexDirection:'column', gap:4, flex:1, minHeight:0 }}>
-                  {successBuilds.map(b=>{
-                    const bid = b.id;
-                    const isSelected = pickedVersion === bid;
-                    const isCurrent = currentBuild?.id === bid;
-                    const sha = (b.commit??b.commit_sha??'').slice(0,7);
-                    const msg = b.commit_message ?? b.commitMsg ?? '';
-                    return (
-                      <div key={bid} onClick={()=>setPickedVersion(bid)}
-                        style={{ display:'flex', alignItems:'center', gap:10, padding:'10px 12px',
-                          borderRadius:7, cursor:'pointer',
-                          background: isSelected ? 'rgba(0,212,255,0.06)' : 'rgba(255,255,255,0.02)',
-                          border:`1px solid ${isSelected ? 'rgba(0,212,255,0.3)' : 'rgba(255,255,255,0.07)'}` }}>
-                        <div style={{ width:11, height:11, borderRadius:'50%', border:'2px solid', flexShrink:0,
-                          borderColor: isSelected ? '#00d4ff' : '#545f72',
-                          background: isSelected ? '#00d4ff' : 'transparent' }}/>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:'#00d4ff', fontWeight:700, width:52, flexShrink:0 }}>
-                          #{b.number}
-                        </span>
-                        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:'#545f72', width:48, flexShrink:0 }}>
-                          {sha}
-                        </span>
-                        <span style={{ fontSize:12, color: isSelected?'#fff':'#8892a4', fontFamily:"'Figtree',sans-serif",
-                          flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
-                          {msg || b.branch}
-                        </span>
-                        <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace", flexShrink:0 }}>
-                          {timeAgo(b.created_at)}
-                        </span>
-                        {isCurrent && <span style={{ fontSize:10, padding:'2px 6px', borderRadius:4, flexShrink:0,
-                          background:'rgba(0,229,160,0.1)', color:'#00e5a0',
-                          fontFamily:"'IBM Plex Mono',monospace" }}>live</span>}
+                        )}
+                        <button onClick={()=>addNotify(di)} style={{ display:'flex', alignItems:'center', gap:4,
+                          background:'none', border:'1px dashed rgba(255,255,255,0.1)', borderRadius:5, padding:'3px 10px',
+                          color:'#545f72', cursor:'pointer', fontSize:10, fontFamily:"'Figtree',sans-serif" }}>
+                          <Bell size={9}/> Add Notification
+                        </button>
+                        {/* Chain arrow */}
+                        {di < deployStages.length - 1 && (
+                          <div style={{ textAlign:'center', marginTop:10, color:'#545f72', fontSize:18 }}>\u2193</div>
+                        )}
                       </div>
                     );
                   })}
                 </div>
               )}
+            </Card>
 
-              <div style={{ display:'flex', gap:10, marginTop:16 }}>
-                <button onClick={()=>setDeployTarget(null)} style={{ flex:1, padding:'10px',
-                  background:'transparent', border:'1px solid rgba(255,255,255,0.12)',
-                  borderRadius:7, color:'#8892a4', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>
-                  Cancel
-                </button>
-                <button onClick={confirmDeploy} disabled={!pickedVersion || successBuilds.length===0}
-                  style={{ flex:2, padding:'10px', display:'flex', alignItems:'center', justifyContent:'center', gap:8,
-                  background: (!pickedVersion || successBuilds.length===0) ? 'rgba(0,212,255,0.2)' : '#00d4ff',
-                  border:'none', borderRadius:7, color:'#000', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700,
-                  cursor: (!pickedVersion || successBuilds.length===0) ? 'not-allowed' : 'pointer' }}>
-                  <Rocket size={13}/>
-                  {pickedVersion && successBuilds.find(b=>b.id===pickedVersion)
-                    ? `Deploy Build #${successBuilds.find(b=>b.id===pickedVersion)!.number}`
-                    : 'Select a build'}
-                </button>
-              </div>
-            </div>
           </div>
-          );
-        })()}
+        )}
       </div>
     );
   };
 
   /* ── secrets ──────────────────────────────────────────────────────────────── */
-  const Secrets = () => {
+  function Secrets() {
     const [list, setList]   = useState<{key:string;updated:string}[]>([]);
     const [adding, setAdding] = useState(false);
     const [newKey, setNewKey] = useState('');
@@ -2336,39 +1578,33 @@ export default function App() {
       setList(l=>[...l,{key:newKey.trim().toUpperCase().replace(/\s+/g,'_'), updated:'just now'}]);
       setNewKey(''); setNewVal(''); setAdding(false);
     };
-
-    useEffect(()=>{
-      if(!sel) return;
-      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/secrets`)
-        .then(r=>r.json()).then(d=>setList(Array.isArray(d)?d:[])).catch(()=>{});
-    },[sel?.id]);
-
     return (
-      <div style={{ padding:28, maxWidth:640 }}>
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+      <div style={{ padding:28 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:20 }}>
           <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
             color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Secrets</h2>
-          <button onClick={()=>setAdding(true)} style={{ display:'flex', alignItems:'center', gap:7,
-            padding:'9px 16px', background:'rgba(0,212,255,0.08)', border:'1px solid rgba(0,212,255,0.2)',
-            borderRadius:7, color:'#00d4ff', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
-            <Plus size={14}/> Add Secret
-          </button>
+          {!adding && <button onClick={()=>setAdding(true)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 18px', background:'#00d4ff', color:'#000', border:'none',
+            borderRadius:7, fontSize:13, fontWeight:700, cursor:'pointer',
+            fontFamily:"'Figtree',sans-serif" }}><Plus size={14}/> Add Secret</button>}
         </div>
         {adding && (
-          <Card style={{ marginBottom:14 }}>
-            <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-              letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:14 }}>New Secret</div>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 2fr', gap:10, marginBottom:14 }}>
+          <Card style={{ marginBottom:12 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+              fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>New Secret</div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10, marginBottom:14 }}>
               <div>
-                <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Key</div>
-                <input ref={keyRef} value={newKey} onChange={e=>setNewKey(e.target.value)} placeholder="API_KEY"
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Key Name</div>
+                <input ref={keyRef} value={newKey} onChange={e=>setNewKey(e.target.value)}
+                  onKeyDown={e=>e.key==='Enter'&&save()} placeholder="MY_API_KEY"
                   style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
                     borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
                     fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
               </div>
               <div>
-                <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Value</div>
-                <input type="password" value={newVal} onChange={e=>setNewVal(e.target.value)} placeholder="sk-…"
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Value</div>
+                <input type="password" value={newVal} onChange={e=>setNewVal(e.target.value)}
+                  onKeyDown={e=>e.key==='Enter'&&save()} placeholder="sk-..."
                   style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
                     borderRadius:6, padding:'9px 12px', color:'#e8eaf0',
                     fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
@@ -2413,7 +1649,6 @@ export default function App() {
     );
   };
 
-  /* ── settings ─────────────────────────────────────────────────────────────── */
   const SettingsView = () => {
     const [name,   setName]   = useState(sel?.name     ?? '');
     const [repo,   setRepo]   = useState(sel?.repo_url ?? '');
@@ -2431,14 +1666,6 @@ export default function App() {
         .catch(()=>{});
     }, []);
 
-    const save = () => {
-      if(!sel) return;
-      api.updateProject(sel.id, { name, repo_url: repo, branch } as any).catch(()=>{});
-      setProjects(p=>p.map(x=>x.id===sel.id?{...x,name,repo_url:repo,branch}:x));
-      setSel(s=>s?{...s,name,repo_url:repo,branch}:s);
-      setSaved(true); setTimeout(()=>setSaved(false),2000);
-    };
-
     const saveRetention = () => {
       fetch('http://localhost:8080/api/v1/settings/retention', {
         method:'PUT', headers:{'Content-Type':'application/json'},
@@ -2446,6 +1673,13 @@ export default function App() {
       }).then(()=>{ setRetSaved(true); setTimeout(()=>setRetSaved(false),2000); }).catch(()=>{});
     };
 
+    const save = () => {
+      if(!sel) return;
+      setProjects(p=>p.map(x=>x.id===sel.id?{...x,name,repo_url:repo,branch}:x));
+      setSel(s=>s?{...s,name,repo_url:repo,branch}:s);
+      api.updateProject(sel.id, { name, repo_url: repo, branch } as any).catch(()=>{});
+      setSaved(true); setTimeout(()=>setSaved(false),2000);
+    };
     return (
       <div style={{ padding:28 }}>
         <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
@@ -2526,161 +1760,408 @@ export default function App() {
     );
   };
 
-  /* ── AI panel ─────────────────────────────────────────────────────────────── */
-  const AiPanel = () => {
-    const [localInput, setLocalInput] = useState('');
-    const inputRef = useRef<HTMLInputElement>(null);
 
-    useEffect(() => { setTimeout(()=>inputRef.current?.focus(), 80); }, []);
+  /* ── environments ──────────────────────────────────────────────────────── */
+  const EnvironmentsView = () => {
+    const [envs, setEnvs] = useState<any[]>([]);
+    const [deployments, setDeployments] = useState<any[]>([]);
+    const [showAdd, setShowAdd] = useState(false);
+    const [newEnv, setNewEnv] = useState({ name:'', description:'', color:'#00e5a0', auto_deploy:false, requires_approval:false, branch_filter:'' });
+    const [deploying, setDeploying] = useState<string|null>(null);
+    const [guardResult, setGuardResult] = useState<{safe:boolean;concerns:string[]}|null>(null);
 
-    const send = async () => {
-      const msg = localInput.trim();
-      if (!msg || loading) return;
-      setLocalInput('');
-      setMsgs(m=>[...m,{role:'user',content:msg}]);
-      setLoading(true);
-      try {
-        const r = await api.aiChat(msg, sel?.id);
-        setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
-      } catch {
-        setMsgs(m=>[...m,{role:'assistant',content:'Backend offline — run `go run ./cmd/callahan` then try again.'}]);
-      }
-      setLoading(false);
+    const ENV_COLORS: Record<string,string> = { dev:'#00d4ff', test:'#00e5a0', staging:'#f5c542', prod:'#ff4455' };
+
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`).then(r=>r.json()).then(d=>setEnvs(Array.isArray(d)?d:[])).catch(()=>{});
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/deployments`).then(r=>r.json()).then(d=>setDeployments(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id]);
+
+    const createEnv = async () => {
+      if (!sel || !newEnv.name) return;
+      const color = ENV_COLORS[newEnv.name.toLowerCase()] || newEnv.color;
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({...newEnv, color})
+      });
+      if (r.ok) { const d = await r.json(); setEnvs(e=>[...e,d]); setShowAdd(false); setNewEnv({name:'',description:'',color:'#00e5a0',auto_deploy:false,requires_approval:false,branch_filter:''}); }
     };
 
+    const deleteEnv = async (id: string) => {
+      await fetch(`http://localhost:8080/api/v1/environments/${id}`, {method:'DELETE'});
+      setEnvs(e=>e.filter(x=>x.id!==id));
+    };
+
+    const deploy = async (envId: string, envName: string) => {
+      if (!sel) return;
+      setDeploying(envId);
+      // AI guardrail check first
+      const guard = await fetch('http://localhost:8080/api/v1/ai/deployment-check', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ environment: envName, diff:'', changelog:'' })
+      });
+      if (guard.ok) { const g = await guard.json(); setGuardResult(g); if(!g.safe) { setDeploying(null); return; } }
+
+      const lastBuild = builds[0];
+      if (!lastBuild) { setDeploying(null); return; }
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments/${envId}/deploy`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ build_id: lastBuild.id, strategy:'direct', notes:'Manual deploy from UI' })
+      });
+      if (r.ok) { const d = await r.json(); setDeployments(ds=>[d,...ds]); }
+      setDeploying(null); setGuardResult(null);
+    };
+
+    const lastDepForEnv = (envId: string) => deployments.find(d=>d.environment_id===envId);
+
     return (
-    <div style={{ position:'fixed', inset:0, zIndex:50, display:'flex' }}>
-      <div onClick={()=>setAiOpen(false)} style={{ flex:1, background:'rgba(0,0,0,0.5)', backdropFilter:'blur(4px)' }}/>
-      <div style={{ width:380, background:'#0d1117', borderLeft:'1px solid rgba(255,255,255,0.12)',
-        display:'flex', flexDirection:'column', height:'100%' }}>
-        <div style={{ padding:'16px 20px', borderBottom:'1px solid rgba(255,255,255,0.07)',
-          display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            <Logo size={26}/>
-            <div>
-              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:700, color:'#fff' }}>Callahan AI</div>
-              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>ai assistant</div>
-            </div>
+      <div style={{ padding:28, maxWidth:820 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+          <div>
+            <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Environments</h2>
+            <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif", margin:'4px 0 0' }}>
+              {sel ? `Deployment targets for ${sel.name}` : 'Select a project to manage environments'}
+            </p>
           </div>
-          <button onClick={()=>setAiOpen(false)} style={{ background:'none', border:'none',
-            cursor:'pointer', color:'#545f72', padding:4, lineHeight:0 }}><X size={16}/></button>
+          <button onClick={()=>setShowAdd(s=>!s)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 16px', background:'rgba(0,229,160,0.1)', border:'1px solid rgba(0,229,160,0.25)',
+            borderRadius:7, color:'#00e5a0', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+            <Plus size={14}/> New Environment
+          </button>
         </div>
 
-        {msgs.length<=1 && (
-          <div style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,0.07)',
-            display:'flex', flexDirection:'column', gap:6 }}>
-            {['Generate a pipeline for my Next.js app','Why did my last build fail?',
-              'Review my code for security issues','Explain this error in plain English'].map(s=>(
-              <button key={s} onClick={()=>{ setMsgs(m=>[...m,{role:'user',content:s}]); }}
-                style={{ padding:'8px 12px', background:'rgba(255,255,255,0.03)',
-                  border:'1px solid rgba(255,255,255,0.08)', borderRadius:7,
-                  color:'#8892a4', cursor:'pointer', textAlign:'left',
-                  fontSize:12, fontFamily:"'Figtree',sans-serif" }}>
-                {s}
-              </button>
+        {/* Add env form */}
+        {showAdd && (
+          <Card style={{ marginBottom:20 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>New Environment</div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12, marginBottom:12 }}>
+              {[['Environment Name','name','e.g. staging'],['Branch Filter','branch_filter','e.g. main, feature/*']].map(([label,field,ph])=>(
+                <div key={field}>
+                  <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{label}</div>
+                  <input value={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.value}))}
+                    placeholder={ph} style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)',
+                      borderRadius:6, padding:'8px 12px', color:'#e8eaf0', fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+                </div>
+              ))}
+            </div>
+            <div style={{ display:'flex', gap:16, marginBottom:14 }}>
+              {[['auto_deploy','Auto-deploy on green build'],['requires_approval','Require manual approval']].map(([field,label])=>(
+                <label key={field} style={{ display:'flex', alignItems:'center', gap:7, cursor:'pointer' }}>
+                  <input type="checkbox" checked={(newEnv as any)[field]} onChange={e=>setNewEnv(n=>({...n,[field]:e.target.checked}))}/>
+                  <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{label}</span>
+                </label>
+              ))}
+            </div>
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>setShowAdd(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+              <button onClick={createEnv} style={{ flex:2, padding:'8px', background:'#00e5a0', border:'none', borderRadius:6, color:'#000', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>Create Environment</button>
+            </div>
+          </Card>
+        )}
+
+        {/* Guardrail warning */}
+        {guardResult && !guardResult.safe && (
+          <div style={{ marginBottom:16, padding:16, background:'rgba(255,68,85,0.08)', border:'1px solid rgba(255,68,85,0.25)', borderRadius:8 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8, color:'#ff4455', fontWeight:700, fontFamily:"'Figtree',sans-serif" }}>
+              <AlertTriangle size={15}/> AI Deployment Guardrail — Concerns Detected
+            </div>
+            {guardResult.concerns.map((c,i)=>(
+              <div key={i} style={{ fontSize:12, color:'#ff8888', fontFamily:"'Figtree',sans-serif", marginLeft:23 }}>• {c}</div>
             ))}
+            <button onClick={()=>setGuardResult(null)} style={{ marginTop:10, padding:'6px 14px', background:'transparent', border:'1px solid rgba(255,68,85,0.3)', borderRadius:6, color:'#ff4455', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif" }}>Dismiss</button>
           </div>
         )}
 
-        <div style={{ flex:1, overflowY:'auto', padding:'16px 20px', display:'flex', flexDirection:'column', gap:12 }}>
-          {msgs.map((m,i)=>(
-            <div key={i} style={{ display:'flex', flexDirection:'column',
-              alignItems: m.role==='user' ? 'flex-end' : 'flex-start' }}>
-              <div style={{
-                maxWidth:'85%', padding:'10px 14px', borderRadius: m.role==='user' ? '12px 12px 2px 12px' : '12px 12px 12px 2px',
-                background: m.role==='user' ? 'rgba(0,212,255,0.12)' : 'rgba(255,255,255,0.05)',
-                border: `1px solid ${m.role==='user' ? 'rgba(0,212,255,0.2)' : 'rgba(255,255,255,0.08)'}`,
-                color:'#e8eaf0', fontSize:13, lineHeight:1.65, fontFamily:"'Figtree',sans-serif",
-                whiteSpace:'pre-wrap' }}>
-                {m.content}
-              </div>
+        {/* Quick create buttons */}
+        {envs.length === 0 && !showAdd && (
+          <div style={{ marginBottom:20 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:10, fontFamily:"'Figtree',sans-serif" }}>Quick create standard environments:</div>
+            <div style={{ display:'flex', gap:8 }}>
+              {['dev','test','staging','prod'].map(name=>(
+                <button key={name} onClick={async ()=>{
+                  if(!sel) return;
+                  const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/environments`,{
+                    method:'POST',headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({name,color:ENV_COLORS[name],auto_deploy:name!=='prod',requires_approval:name==='prod'})
+                  });
+                  if(r.ok){const d=await r.json();setEnvs(e=>[...e,d]);}
+                }} style={{ padding:'8px 16px', borderRadius:6, cursor:'pointer',
+                  background:`${ENV_COLORS[name]}15`, border:`1px solid ${ENV_COLORS[name]}40`,
+                  color:ENV_COLORS[name], fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
+                  + {name}
+                </button>
+              ))}
             </div>
-          ))}
-          {loading && (
-            <div style={{ display:'flex', alignItems:'flex-start' }}>
-              <div style={{ padding:'10px 14px', borderRadius:'12px 12px 12px 2px',
-                background:'rgba(255,255,255,0.05)', border:'1px solid rgba(255,255,255,0.08)',
-                display:'flex', gap:4, alignItems:'center' }}>
-                {[0,1,2].map(i=>(
-                  <span key={i} style={{ width:6, height:6, borderRadius:'50%', background:'#545f72',
-                    display:'inline-block', animation:`blink 1.2s ease-in-out ${i*0.2}s infinite` }}/>
-                ))}
-              </div>
-            </div>
-          )}
-          <div ref={chatEnd}/>
+          </div>
+        )}
+
+        {/* Environment cards */}
+        <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+          {envs.map(env=>{
+            const dep = lastDepForEnv(env.id);
+            const isDeploying = deploying === env.id;
+            return (
+              <Card key={env.id} style={{ borderLeft:`3px solid ${env.color}` }}>
+                <div style={{ display:'flex', alignItems:'flex-start', justifyContent:'space-between', marginBottom:12 }}>
+                  <div>
+                    <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
+                      <span style={{ width:8, height:8, borderRadius:'50%', background:env.color, display:'inline-block' }}/>
+                      <span style={{ fontFamily:"'Figtree',sans-serif", fontSize:15, fontWeight:700, color:'#fff' }}>{env.name}</span>
+                      {env.requires_approval && <span style={{ fontSize:10, padding:'2px 6px', background:'rgba(245,197,66,0.1)', border:'1px solid rgba(245,197,66,0.2)', borderRadius:4, color:'#f5c542', fontFamily:"'IBM Plex Mono',monospace" }}>approval</span>}
+                      {env.auto_deploy && <span style={{ fontSize:10, padding:'2px 6px', background:'rgba(0,229,160,0.1)', border:'1px solid rgba(0,229,160,0.2)', borderRadius:4, color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>auto</span>}
+                    </div>
+                    {env.branch_filter && <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>branch: {env.branch_filter}</div>}
+                  </div>
+                  <button onClick={()=>deleteEnv(env.id)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', padding:2, lineHeight:0 }}><Trash2 size={13}/></button>
+                </div>
+
+                {dep && (
+                  <div style={{ padding:'8px 10px', background:'rgba(255,255,255,0.03)', borderRadius:6, marginBottom:12, fontSize:12, fontFamily:"'IBM Plex Mono',monospace" }}>
+                    <div style={{ color: dep.status==='success'?'#00e5a0':dep.status==='failed'?'#ff4455':'#f5c542', marginBottom:3 }}>
+                      {dep.status==='success'?'✔':dep.status==='failed'?'✖':'⏳'} Last: {dep.status} · {dep.strategy}
+                    </div>
+                    <div style={{ color:'#545f72' }}>build: {dep.build_id?.slice(0,8)}{dep.version_id?' · '+dep.version_id:''}</div>
+                  </div>
+                )}
+                {!dep && <div style={{ color:'#545f72', fontSize:12, fontFamily:"'Figtree',sans-serif", marginBottom:12 }}>No deployments yet</div>}
+
+                <div style={{ display:'flex', gap:8 }}>
+                  <button onClick={()=>deploy(env.id, env.name)} disabled={isDeploying||!sel||builds.length===0}
+                    style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', gap:6,
+                      padding:'8px', background: isDeploying?'rgba(0,229,160,0.05)':'rgba(0,229,160,0.1)',
+                      border:`1px solid ${env.color}40`, borderRadius:6,
+                      color: isDeploying?'#545f72':env.color, cursor: isDeploying?'wait':'pointer',
+                      fontFamily:"'Figtree',sans-serif", fontSize:12, fontWeight:600 }}>
+                    {isDeploying ? <><Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> Deploying…</> : <><Rocket size={12}/> Deploy</>}
+                  </button>
+                  {dep?.status==='success' && (
+                    <button style={{ padding:'8px 12px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:12 }}>
+                      <RotateCcw size={12}/>
+                    </button>
+                  )}
+                </div>
+              </Card>
+            );
+          })}
         </div>
 
-        <div style={{ padding:'12px 16px', borderTop:'1px solid rgba(255,255,255,0.07)',
-          display:'flex', gap:8, alignItems:'center' }}>
-          <input ref={inputRef} value={localInput} onChange={e=>setLocalInput(e.target.value)}
-            onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();} }}
-            placeholder="Ask anything about your pipeline…"
-            style={{ flex:1, background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-              borderRadius:8, padding:'10px 14px', color:'#e8eaf0', outline:'none',
-              fontSize:13, fontFamily:"'Figtree',sans-serif" }}/>
-          <button onClick={send} disabled={loading} style={{ width:36, height:36,
-            background: loading?'#111620':'#00d4ff', color: loading?'#545f72':'#000',
-            border:'none', borderRadius:8, cursor: loading?'not-allowed':'pointer', lineHeight:0,
-            transition:'all 0.15s' }}>
-            <Send size={14}/>
-          </button>
-        </div>
+        {/* Deployment history */}
+        {deployments.length > 0 && (
+          <div style={{ marginTop:28 }}>
+            <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:700, color:'#e8eaf0', marginBottom:14 }}>Deployment History</h3>
+            <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+              {deployments.slice(0,10).map(d=>(
+                <div key={d.id} style={{ display:'flex', alignItems:'center', gap:12, padding:'10px 14px',
+                  background:'rgba(255,255,255,0.02)', border:'1px solid rgba(255,255,255,0.06)', borderRadius:7,
+                  fontFamily:"'IBM Plex Mono',monospace", fontSize:12 }}>
+                  <span style={{ color:d.status==='success'?'#00e5a0':d.status==='failed'?'#ff4455':'#f5c542' }}>
+                    {d.status==='success'?'✔':d.status==='failed'?'✖':'⏳'}
+                  </span>
+                  <span style={{ color:'#8892a4', flex:1 }}>build {d.build_id?.slice(0,8)} → {d.environment_id?.slice(0,8)}</span>
+                  <span style={{ color:'#545f72' }}>{d.strategy}</span>
+                  <span style={{ color:'#545f72' }}>{new Date(d.created_at).toLocaleString()}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
-    </div>
     );
   };
 
-  /* ── command palette ──────────────────────────────────────────────────────── */
-  const CmdPalette = () => {
-    const cmds = [
-      { label:'Connect Repository',  icon:<Plus size={14}/>,      fn:()=>{setAddProj(true);setCmdOpen(false);} },
-      { label:'Run Build',           icon:<Play size={14}/>,      fn:()=>{if(sel){triggerBuild();}setCmdOpen(false);} },
-      { label:'Open Callahan AI',    icon:<Sparkles size={14}/>,  fn:()=>{setAiOpen(true);setCmdOpen(false);} },
-      { label:'View Builds',         icon:<Zap size={14}/>,       fn:()=>{setView('builds');setCmdOpen(false);} },
-      { label:'Configure Pipeline',  icon:<FileCode size={14}/>,  fn:()=>{setView('pipeline');setCmdOpen(false);} },
-      { label:'Version History',     icon:<Tag size={14}/>,       fn:()=>{setView('versions');setCmdOpen(false);} },
-      { label:'Manage Secrets',      icon:<Lock size={14}/>,      fn:()=>{setView('secrets');setCmdOpen(false);} },
-      { label:'Settings',            icon:<Settings size={14}/>,  fn:()=>{setView('settings');setCmdOpen(false);} },
-      { label:'Configure AI / LLM',  icon:<Sparkles size={14}/>,  fn:()=>{setView('llm-config');setCmdOpen(false);} },
-    ].filter(c=>!cmdQ||c.label.toLowerCase().includes(cmdQ.toLowerCase()));
+  /* ── Notifications View ───────────────────────────────────────────────────── */
+
+
+  /* ── notifications ─────────────────────────────────────────────────────── */
+  const NotificationsView = () => {
+    const [channels, setChannels] = useState<any[]>([]);
+    const [showAdd, setShowAdd] = useState(false);
+    const [platform, setPlatform] = useState('slack');
+    const [chName, setChName] = useState('');
+    const [webhookURL, setWebhookURL] = useState('');
+    const [onSuccess, setOnSuccess] = useState(true);
+    const [onFailure, setOnFailure] = useState(true);
+    const [onCancel, setOnCancel] = useState(false);
+    const [aiMsg, setAiMsg] = useState(false);
+    const [preview, setPreview] = useState('');
+    const [previewing, setPreviewing] = useState(false);
+    const [saving, setSaving] = useState(false);
+
+    useEffect(() => {
+      if (!sel) return;
+      fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`).then(r=>r.json()).then(d=>setChannels(Array.isArray(d)?d:[])).catch(()=>{});
+    }, [sel?.id]);
+
+    const PLATFORMS = [
+      { id:'slack', name:'Slack', color:'#e01e5a', desc:'Channel webhook messages with rich build status' },
+      { id:'teams', name:'Microsoft Teams', color:'#6264a7', desc:'Adaptive cards with status, PR link, actions' },
+      { id:'jira', name:'Jira', color:'#0052cc', desc:'Auto-comment on linked issues with build status' },
+      { id:'azuredevops', name:'Azure DevOps', color:'#0078d4', desc:'Update work items with build links and comments' },
+      { id:'discord', name:'Discord', color:'#5865f2', desc:'Embedded messages with color-coded status' },
+      { id:'webhook', name:'Custom Webhook', color:'#545f72', desc:'POST JSON payload to any URL' },
+    ];
+
+    const generatePreview = async () => {
+      if (!sel) return;
+      setPreviewing(true);
+      try {
+        const r = await fetch('http://localhost:8080/api/v1/ai/notification-preview', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ platform, build_num:42, status:'success', branch:'main',
+            project_name: sel.name, version_tag:'v1.2.3', duration_ms:45000 })
+        });
+        if(r.ok){ const d=await r.json(); setPreview(d.message||''); }
+      } catch{}
+      setPreviewing(false);
+    };
+
+    const save = async () => {
+      if (!sel || !chName) return;
+      setSaving(true);
+      const config: Record<string,string> = {};
+      if (platform==='slack'||platform==='teams'||platform==='discord') config.webhook_url = webhookURL;
+      else if (platform==='webhook') config.url = webhookURL;
+      const r = await fetch(`http://localhost:8080/api/v1/projects/${sel.id}/notifications`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ platform, name:chName, enabled:true, config, on_success:onSuccess, on_failure:onFailure, on_cancel:onCancel, ai_message:aiMsg })
+      });
+      if(r.ok){ const d=await r.json(); setChannels(c=>[...c,d]); setShowAdd(false); setChName(''); setWebhookURL(''); }
+      setSaving(false);
+    };
+
+    const del = async (id: string) => {
+      await fetch(`http://localhost:8080/api/v1/notifications/${id}`, {method:'DELETE'});
+      setChannels(c=>c.filter(x=>x.id!==id));
+    };
+
+    const pInfo = PLATFORMS.find(p=>p.id===platform);
 
     return (
-      <div style={{ position:'fixed', inset:0, zIndex:200, display:'flex', alignItems:'flex-start',
-        justifyContent:'center', paddingTop:120, background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
-        onClick={()=>setCmdOpen(false)}>
-        <div style={{ width:520, background:'#0d1117', border:'1px solid rgba(255,255,255,0.15)',
-          borderRadius:12, boxShadow:'0 32px 80px rgba(0,0,0,0.7)', overflow:'hidden' }}
-          onClick={e=>e.stopPropagation()}>
-          <div style={{ display:'flex', alignItems:'center', gap:10, padding:'14px 16px',
-            borderBottom:'1px solid rgba(255,255,255,0.08)' }}>
-            <Search size={15} style={{ color:'#545f72', flexShrink:0 }}/>
-            <input ref={cmdRef} value={cmdQ} onChange={e=>setCmdQ(e.target.value)}
-              onKeyDown={e=>{ if(e.key==='Escape'){setCmdOpen(false);} if(e.key==='Enter'&&cmds.length>0){cmds[0].fn();} }}
-              placeholder="Type a command…"
-              style={{ flex:1, background:'none', border:'none', outline:'none',
-                color:'#e8eaf0', fontSize:14, fontFamily:"'Figtree',sans-serif" }}/>
-            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-              background:'#111620', padding:'2px 7px', borderRadius:3 }}>ESC</span>
+      <div style={{ padding:28, maxWidth:720 }}>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:24 }}>
+          <div>
+            <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800, color:'#fff', letterSpacing:'-0.03em', margin:0 }}>Notifications</h2>
+            <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif", margin:'4px 0 0' }}>Post-pipeline notifications to your team channels</p>
           </div>
-          <div style={{ padding:'8px 8px', maxHeight:320, overflowY:'auto' }}>
-            {cmds.map((c,i)=>(
-              <button key={i} onClick={c.fn} style={{ display:'flex', alignItems:'center', gap:10,
-                width:'100%', padding:'10px 12px', background:'none',
-                border:'1px solid transparent', borderRadius:7, cursor:'pointer', textAlign:'left',
-                color:'#e8eaf0', fontSize:13, fontFamily:"'Figtree',sans-serif" }}
-                onMouseEnter={e=>{ e.currentTarget.style.background='rgba(255,255,255,0.04)'; e.currentTarget.style.borderColor='rgba(255,255,255,0.08)'; }}
-                onMouseLeave={e=>{ e.currentTarget.style.background='none'; e.currentTarget.style.borderColor='transparent'; }}>
-                <span style={{ color:'#545f72' }}>{c.icon}</span>{c.label}
-              </button>
-            ))}
-          </div>
+          <button onClick={()=>setShowAdd(s=>!s)} style={{ display:'flex', alignItems:'center', gap:7,
+            padding:'9px 16px', background:'rgba(245,197,66,0.1)', border:'1px solid rgba(245,197,66,0.25)',
+            borderRadius:7, color:'#f5c542', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:600 }}>
+            <Plus size={14}/> Add Channel
+          </button>
         </div>
+
+        {/* Add channel form */}
+        {showAdd && (
+          <Card style={{ marginBottom:20 }}>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>New Notification Channel</div>
+
+            {/* Platform picker */}
+            <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:6, marginBottom:16 }}>
+              {PLATFORMS.map(p=>(
+                <button key={p.id} onClick={()=>setPlatform(p.id)}
+                  style={{ padding:'8px 10px', borderRadius:7, cursor:'pointer', textAlign:'left',
+                    background: platform===p.id?`${p.color}15`:'transparent',
+                    border:`1px solid ${platform===p.id?p.color+'50':'rgba(255,255,255,0.08)'}` }}>
+                  <div style={{ fontSize:12, fontWeight:600, color: platform===p.id?p.color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{p.name}</div>
+                </button>
+              ))}
+            </div>
+
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:14, fontFamily:"'Figtree',sans-serif" }}>{pInfo?.desc}</div>
+
+            {[['Channel Name','text',chName,(v:string)=>setChName(v),'e.g. #builds'],
+              ['Webhook URL','password',webhookURL,(v:string)=>setWebhookURL(v),'https://hooks.slack.com/…']].map(([label,type,val,setter,ph])=>(
+              <div key={String(label)} style={{ marginBottom:12 }}>
+                <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{String(label)}</div>
+                <input type={String(type)} value={String(val)} onChange={e=>(setter as Function)(e.target.value)} placeholder={String(ph)}
+                  style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6,
+                    padding:'8px 12px', color:'#e8eaf0', fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+              </div>
+            ))}
+
+            <div style={{ display:'flex', gap:16, marginBottom:14 }}>
+              {[['on_success','On success',onSuccess,setOnSuccess],['on_failure','On failure',onFailure,setOnFailure],
+                ['on_cancel','On cancel',onCancel,setOnCancel],['ai_message','AI-written message',aiMsg,setAiMsg]].map(([k,label,val,setter])=>(
+                <label key={String(k)} style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer' }}>
+                  <input type="checkbox" checked={Boolean(val)} onChange={e=>(setter as Function)(e.target.checked)}/>
+                  <span style={{ fontSize:12, color:'#8892a4', fontFamily:"'Figtree',sans-serif" }}>{String(label)}</span>
+                </label>
+              ))}
+            </div>
+
+            {/* AI Preview */}
+            <div style={{ marginBottom:14 }}>
+              <button onClick={generatePreview} disabled={previewing} style={{ padding:'6px 14px',
+                background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
+                borderRadius:6, color:'#a078ff', cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif",
+                display:'flex', alignItems:'center', gap:6 }}>
+                {previewing ? <Loader2 size={12} style={{animation:'spin 1s linear infinite'}}/> : <Sparkles size={12}/>}
+                {previewing ? 'Generating…' : 'AI Message Preview'}
+              </button>
+              {preview && (
+                <div style={{ marginTop:8, padding:'10px 14px', background:'rgba(255,255,255,0.03)',
+                  border:'1px solid rgba(255,255,255,0.08)', borderRadius:6,
+                  fontFamily:"'Figtree',sans-serif", fontSize:13, color:'#e8eaf0', whiteSpace:'pre-wrap' }}>
+                  {preview}
+                </div>
+              )}
+            </div>
+
+            <div style={{ display:'flex', gap:8 }}>
+              <button onClick={()=>setShowAdd(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
+              <button onClick={save} disabled={saving} style={{ flex:2, padding:'8px', background:'#f5c542', border:'none', borderRadius:6, color:'#000', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
+                {saving ? 'Saving…' : 'Save Channel'}
+              </button>
+            </div>
+          </Card>
+        )}
+
+        {/* Channel list */}
+        {channels.length === 0 && !showAdd ? (
+          <div style={{ textAlign:'center', padding:'48px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
+            <Bell size={32} style={{ opacity:0.3, marginBottom:12 }}/>
+            <div style={{ fontSize:14 }}>No notification channels yet</div>
+            <div style={{ fontSize:12, marginTop:4 }}>Add Slack, Teams, Jira, or Azure DevOps to get post-build notifications</div>
+          </div>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+            {channels.map(ch=>{
+              const pDef = PLATFORMS.find(p=>p.id===ch.platform);
+              return (
+                <Card key={ch.id}>
+                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+                    <div style={{ display:'flex', alignItems:'center', gap:12 }}>
+                      <div style={{ width:36, height:36, borderRadius:8, background:`${pDef?.color||'#545f72'}20`,
+                        display:'flex', alignItems:'center', justifyContent:'center',
+                        border:`1px solid ${pDef?.color||'#545f72'}40` }}>
+                        <Bell size={15} color={pDef?.color||'#545f72'}/>
+                      </div>
+                      <div>
+                        <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:600, color:'#fff' }}>{ch.name}</div>
+                        <div style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
+                          {ch.platform} · {[ch.on_success&&'✔ success',ch.on_failure&&'✖ fail',ch.ai_message&&'✦ AI'].filter(Boolean).join(' · ')}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                      <span style={{ width:7, height:7, borderRadius:'50%', background: ch.enabled?'#00e5a0':'#545f72', display:'inline-block' }}/>
+                      <button onClick={()=>del(ch.id)} style={{ background:'none', border:'none', cursor:'pointer', color:'#545f72', lineHeight:0 }}><Trash2 size={13}/></button>
+                    </div>
+                  </div>
+                </Card>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
 
-  /* ── Versions View (read-only timeline) ──────────────────────────────────── */
+  /* ── Versions View ────────────────────────────────────────────────────────── */
+
+
+  /* ── versions ──────────────────────────────────────────────────────────── */
   const VersionsView = () => {
     const [versions, setVersions] = useState<any[]>([]);
     const [showManual, setShowManual] = useState(false);
@@ -2732,9 +2213,11 @@ export default function App() {
           </button>
         </div>
 
+        {/* Manual version form */}
         {showManual && (
           <Card style={{ marginBottom:20 }}>
             <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase', fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>Create Version</div>
+
             <div style={{ marginBottom:14 }}>
               <div style={{ fontSize:11, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>Bump Type</div>
               <div style={{ display:'flex', gap:8 }}>
@@ -2748,12 +2231,15 @@ export default function App() {
                 ))}
               </div>
             </div>
+
             <div style={{ marginBottom:14 }}>
               <div style={{ fontSize:11, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Changelog (optional)</div>
               <textarea value={changelog} onChange={e=>setChangelog(e.target.value)} rows={4} placeholder="## Changes&#10;- Fixed login bug&#10;- Added dark mode"
                 style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6,
                   padding:'8px 12px', color:'#e8eaf0', fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none', resize:'vertical' }}/>
             </div>
+
+            {/* AI advice */}
             <div style={{ marginBottom:14 }}>
               <button onClick={askAI} disabled={advising} style={{ padding:'6px 14px',
                 background:'rgba(160,120,255,0.1)', border:'1px solid rgba(160,120,255,0.25)',
@@ -2772,6 +2258,7 @@ export default function App() {
                 </div>
               )}
             </div>
+
             <div style={{ display:'flex', gap:8 }}>
               <button onClick={()=>setShowManual(false)} style={{ flex:1, padding:'8px', background:'transparent', border:'1px solid rgba(255,255,255,0.1)', borderRadius:6, color:'#545f72', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13 }}>Cancel</button>
               <button onClick={createVersion} disabled={builds.length===0} style={{ flex:2, padding:'8px', background:'#a078ff', border:'none', borderRadius:6, color:'#fff', cursor:'pointer', fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700 }}>
@@ -2781,6 +2268,7 @@ export default function App() {
           </Card>
         )}
 
+        {/* Version timeline */}
         {versions.length === 0 ? (
           <div style={{ textAlign:'center', padding:'48px 0', color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
             <Tag size={32} style={{ opacity:0.3, marginBottom:12 }}/>
@@ -2790,7 +2278,7 @@ export default function App() {
         ) : (
           <div style={{ position:'relative' }}>
             <div style={{ position:'absolute', left:15, top:0, bottom:0, width:1, background:'rgba(255,255,255,0.07)' }}/>
-            {versions.map((v)=>(
+            {versions.map((v,i)=>(
               <div key={v.id} style={{ display:'flex', gap:16, marginBottom:16 }}>
                 <div style={{ width:30, height:30, borderRadius:'50%', background:`${BUMP_COLORS[v.bump_type]||'#545f72'}20`,
                   border:`2px solid ${BUMP_COLORS[v.bump_type]||'#545f72'}`,
@@ -2805,9 +2293,6 @@ export default function App() {
                         background:`${BUMP_COLORS[v.bump_type]||'#545f72'}20`,
                         color:BUMP_COLORS[v.bump_type]||'#545f72',
                         fontFamily:"'IBM Plex Mono',monospace", fontWeight:600 }}>{v.bump_type}</span>
-                      {v.build_id && (() => { const bNum = projBuilds.find((b:any)=>b.id===v.build_id)?.number; return bNum ? (
-                        <span style={{ fontSize:10, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>build #{bNum}</span>
-                      ) : null; })()}
                       {v.git_tagged && <span style={{ fontSize:10, color:'#00e5a0', fontFamily:"'IBM Plex Mono',monospace" }}>⬧ git tagged</span>}
                     </div>
                     <span style={{ fontSize:11, color:'#545f72', fontFamily:"'IBM Plex Mono',monospace" }}>
@@ -2830,162 +2315,155 @@ export default function App() {
     );
   };
 
-  /* ── LLM config ───────────────────────────────────────────────────────────── */
-  const LLMConfigView = () => {
-    const PROVIDERS = [
-      { id:'groq',      name:'Groq',      color:'#f55036', models:['llama-3.3-70b-versatile','llama-3.1-8b-instant','mixtral-8x7b-32768'] },
-      { id:'openai',    name:'OpenAI',    color:'#10a37f', models:['gpt-4o','gpt-4o-mini','gpt-4-turbo','gpt-3.5-turbo'] },
-      { id:'anthropic', name:'Anthropic', color:'#d97757', models:['claude-opus-4-5','claude-sonnet-4-5','claude-haiku-4-5'] },
-      { id:'ollama',    name:'Ollama',    color:'#888',    models:['llama3','codellama','mistral','deepseek-coder'] },
-    ];
-    const [provider, setProvider] = useState('groq');
-    const [model,    setModel]    = useState('llama-3.3-70b-versatile');
-    const [apiKey,   setApiKey]   = useState('');
-    const [ollamaURL,setOllamaURL]= useState('http://localhost:11434');
-    const [showKey,  setShowKey]  = useState(false);
-    const [saving,   setSaving]   = useState(false);
-    const [testing,  setTesting]  = useState(false);
-    const [status,   setStatus]   = useState<{ok:boolean;msg:string}|null>(null);
+  /* ── render ───────────────────────────────────────────────────────────────── */
 
-    useEffect(() => {
-      fetch('http://localhost:8080/api/v1/settings/llm').then(r=>r.json()).then(d=>{
-        if(d.provider) setProvider(d.provider);
-        if(d.model) setModel(d.model);
-        if(d.ollama_url) setOllamaURL(d.ollama_url);
-      }).catch(()=>{});
-    },[]);
 
-    const prov = PROVIDERS.find(p=>p.id===provider);
+  /* ── AI panel ─────────────────────────────────────────────────────────────── */
+  function AiPanel() {
+    const [localInput, setLocalInput] = useState('');
+    const inputRef = useRef<HTMLInputElement>(null);
 
-    const save = async () => {
-      setSaving(true);
+    useEffect(() => { setTimeout(()=>inputRef.current?.focus(), 80); }, []);
+
+    const send = async () => {
+      const msg = localInput.trim();
+      if (!msg || loading) return;
+      setLocalInput('');
+      setMsgs(m=>[...m,{role:'user',content:msg}]);
+      setLoading(true);
       try {
-        await fetch('http://localhost:8080/api/v1/settings/llm', {
-          method:'PUT', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ provider, model, api_key:apiKey, ollama_url:ollamaURL })
-        });
-        setStatus({ok:true, msg:'Configuration saved successfully.'});
-      } catch { setStatus({ok:false,msg:'Failed to save — is the backend running?'}); }
-      setSaving(false);
-      setTimeout(()=>setStatus(null),3000);
-    };
-
-    const testConnection = async () => {
-      setTesting(true); setStatus(null);
-      try {
-        const r = await fetch('http://localhost:8080/api/v1/settings/llm/test', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ provider, model, api_key:apiKey, ollama_url:ollamaURL })
-        });
-        const d = await r.json();
-        setStatus(d.ok ? {ok:true,msg:`Connected — ${d.model||model}`} : {ok:false,msg:d.error||'Connection failed'});
-      } catch { setStatus({ok:false,msg:'Backend offline'}); }
-      setTesting(false);
+        const r = await api.aiChat(msg, sel?.id);
+        setMsgs(m=>[...m,{role:'assistant',content:r.message}]);
+      } catch {
+        setMsgs(m=>[...m,{role:'assistant',content:'Backend offline — run `go run ./cmd/callahan` then try again.'}]);
+      }
+      setLoading(false);
     };
 
     return (
-      <div style={{ padding:28, maxWidth:640 }}>
-        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
-          color:'#fff', letterSpacing:'-0.03em', marginBottom:24 }}>Configure AI / LLM</h2>
+    <div style={{ position:'fixed', inset:0, zIndex:50, display:'flex' }}>
+      <div onClick={()=>setAiOpen(false)} style={{ flex:1, background:'rgba(0,0,0,0.5)', backdropFilter:'blur(4px)' }}/>
+      <div style={{ width:380, background:'#0d1117', borderLeft:'1px solid rgba(255,255,255,0.12)',
+        display:'flex', flexDirection:'column', height:'100%' }}>
+        <div style={{ padding:'16px 20px', borderBottom:'1px solid rgba(255,255,255,0.07)',
+          display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            <Logo size={26}/>
+            <div>
+              <div style={{ fontFamily:"'Figtree',sans-serif", fontSize:14, fontWeight:700, color:'#fff' }}>Callahan AI</div>
+              <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72' }}>ai assistant</div>
+            </div>
+          </div>
+          <button onClick={()=>setAiOpen(false)} style={{ background:'none', border:'none',
+            cursor:'pointer', color:'#545f72', padding:4, lineHeight:0 }}><X size={16}/></button>
+        </div>
 
-        {/* Provider picker */}
-        <Card style={{ marginBottom:14 }}>
-          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
-            letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:16 }}>Provider</div>
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:8, marginBottom:20 }}>
-            {PROVIDERS.map(p=>(
-              <button key={p.id} onClick={()=>{ setProvider(p.id); setModel(p.models[0]); }}
-                style={{ padding:'10px 8px', borderRadius:8, cursor:'pointer', textAlign:'center',
-                  background: provider===p.id?`${p.color}15`:'transparent',
-                  border:`1px solid ${provider===p.id?p.color+'50':'rgba(255,255,255,0.1)'}`,
-                  display:'flex', flexDirection:'column', alignItems:'center', gap:4 }}>
-                <div style={{ fontSize:13, fontWeight:600, fontFamily:"'Figtree',sans-serif",
-                  color: provider===p.id?p.color:'#8892a4' }}>{p.name}</div>
-              </button>
+        {msgs.length<=1 && (
+          <div style={{ padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,0.07)',
+            display:'flex', flexDirection:'column', gap:6 }}>
+            {['Generate a pipeline for my Next.js app','Why did my last build fail?',
+              'Review my code for security issues','Explain this error in plain English'].map(s=>(
+              <button key={s} onClick={()=>{ setLocalInput(s); inputRef.current?.focus(); }}
+                style={{ padding:'8px 12px', background:'#111620', border:'1px solid rgba(255,255,255,0.12)',
+                  borderRadius:7, color:'#8892a4', cursor:'pointer', fontSize:12,
+                  textAlign:'left', fontFamily:"'Figtree',sans-serif" }}>{s}</button>
             ))}
-          </div>
-
-          {/* Model picker */}
-          <div style={{ marginBottom:16 }}>
-            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
-              fontFamily:"'IBM Plex Mono',monospace", marginBottom:10 }}>Model</div>
-            <div style={{ display:'flex', flexWrap:'wrap', gap:6 }}>
-              {prov?.models.map(m=>(
-                <button key={m} onClick={()=>setModel(m)} style={{ padding:'6px 12px', borderRadius:6,
-                  cursor:'pointer', background: model===m?`${prov.color}15`:'transparent',
-                  border:`1px solid ${model===m?prov.color+'50':'rgba(255,255,255,0.1)'}`,
-                  color: model===m?prov.color:'#545f72',
-                  fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>{m}</button>
-              ))}
-            </div>
-          </div>
-
-          {/* API key / Ollama URL */}
-          {provider==='ollama' ? (<>
-            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
-              fontFamily:"'IBM Plex Mono',monospace", marginBottom:8 }}>Ollama URL</div>
-            <input value={ollamaURL} onChange={e=>setOllamaURL(e.target.value)}
-              placeholder="http://localhost:11434"
-              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
-                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
-            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
-              Make sure Ollama is running locally: <code style={{ color:'#00d4ff' }}>ollama serve</code>
-            </div>
-          </>) : (<>
-            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
-              <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
-                fontFamily:"'IBM Plex Mono',monospace" }}>API Key</div>
-              <button onClick={()=>setShowKey(k=>!k)} style={{ background:'none', border:'none',
-                cursor:'pointer', color:'#545f72', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
-                {showKey ? 'hide' : 'show'}
-              </button>
-            </div>
-            <input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)}
-              placeholder={`Enter your ${prov?.name} API key…`}
-              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
-                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
-            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
-              {provider==='anthropic' && <>Get your key at <span style={{color:'#00d4ff'}}>console.anthropic.com</span></>}
-              {provider==='openai' && <>Get your key at <span style={{color:'#00d4ff'}}>platform.openai.com/api-keys</span></>}
-              {provider==='groq' && <>Get your key at <span style={{color:'#00d4ff'}}>console.groq.com</span></>}
-            </div>
-          </>)}
-        </Card>
-
-        {status && (
-          <div style={{ marginBottom:14, padding:'12px 16px', borderRadius:8,
-            background: status.ok ? 'rgba(0,229,160,0.08)' : 'rgba(255,68,85,0.08)',
-            border: `1px solid ${status.ok ? 'rgba(0,229,160,0.2)' : 'rgba(255,68,85,0.2)'}`,
-            fontFamily:"'Figtree',sans-serif", fontSize:13,
-            color: status.ok ? '#00e5a0' : '#ff4455' }}>
-            {status.msg}
           </div>
         )}
 
-        <div style={{ display:'flex', gap:10 }}>
-          <button onClick={testConnection} disabled={testing}
-            style={{ flex:1, padding:'10px 20px', background:'transparent',
-              border:'1px solid rgba(255,255,255,0.15)', borderRadius:7,
-              color: testing ? '#545f72' : '#e8eaf0', cursor: testing ? 'wait' : 'pointer',
-              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:500 }}>
-            {testing ? 'Testing…' : 'Test Connection'}
+        <div style={{ flex:1, overflowY:'auto', padding:16 }}>
+          {msgs.map((m,i)=>(
+            <div key={i} style={{ marginBottom:14, display:'flex', flexDirection:'column',
+              alignItems: m.role==='user'?'flex-end':'flex-start' }}>
+              <div style={{ maxWidth:'85%', padding:'10px 14px',
+                borderRadius: m.role==='user'?'10px 10px 2px 10px':'10px 10px 10px 2px',
+                background: m.role==='user'?'#00d4ff':'#111620',
+                border: m.role==='assistant'?'1px solid rgba(255,255,255,0.12)':'none',
+                color: m.role==='user'?'#000':'#e8eaf0',
+                fontSize:13, lineHeight:1.65, fontFamily:"'Figtree',sans-serif",
+                fontWeight: m.role==='user'?600:400, whiteSpace:'pre-wrap' }}>
+                {m.content}
+              </div>
+            </div>
+          ))}
+          {loading && (
+            <div style={{ display:'flex', gap:8, alignItems:'center', color:'#545f72', fontSize:12,
+              fontFamily:"'Figtree',sans-serif" }}>
+              <Loader2 size={13} style={{ animation:'spin 1s linear infinite' }}/> Thinking…
+            </div>
+          )}
+          <div ref={chatEnd}/>
+        </div>
+
+        <div style={{ padding:'12px 16px', borderTop:'1px solid rgba(255,255,255,0.07)',
+          display:'flex', gap:8 }}>
+          <input
+            ref={inputRef}
+            value={localInput}
+            onChange={e=>setLocalInput(e.target.value)}
+            onKeyDown={e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); }}}
+            placeholder="Ask anything…"
+            style={{ flex:1, background:'#111620', border:'1px solid rgba(255,255,255,0.12)',
+              borderRadius:8, padding:'10px 14px', color:'#e8eaf0',
+              fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          <button onClick={send} disabled={loading}
+            style={{ padding:'10px 14px', background: loading?'#111620':'#00d4ff', color: loading?'#545f72':'#000',
+              border:'none', borderRadius:8, cursor: loading?'not-allowed':'pointer', lineHeight:0,
+              transition:'all 0.15s' }}>
+            <Send size={14}/>
           </button>
-          <button onClick={save} disabled={saving}
-            style={{ flex:2, padding:'10px 20px', background:'#a078ff',
-              border:'none', borderRadius:7, color:'#fff', cursor: saving ? 'wait' : 'pointer',
-              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700,
-              opacity: saving ? 0.7 : 1 }}>
-            {saving ? 'Saving…' : 'Save Configuration'}
-          </button>
+        </div>
+      </div>
+    </div>
+    );
+  };
+
+  /* ── command palette ──────────────────────────────────────────────────────── */
+  function CmdPalette() {
+    const cmds = [
+      { label:'Connect Repository',  icon:<Plus size={14}/>,      fn:()=>{setAddProj(true);setCmdOpen(false);} },
+      { label:'Run Build',           icon:<Play size={14}/>,      fn:()=>{if(sel){triggerBuild();}setCmdOpen(false);} },
+      { label:'Open Callahan AI',    icon:<Sparkles size={14}/>,  fn:()=>{setAiOpen(true);setCmdOpen(false);} },
+      { label:'View Builds',         icon:<Zap size={14}/>,       fn:()=>{setView('builds');setCmdOpen(false);} },
+      { label:'Edit Pipeline',       icon:<FileCode size={14}/>,  fn:()=>{setView('pipeline');setCmdOpen(false);} },
+      { label:'Manage Secrets',      icon:<Lock size={14}/>,      fn:()=>{setView('secrets');setCmdOpen(false);} },
+      { label:'Settings',            icon:<Settings size={14}/>,  fn:()=>{setView('settings');setCmdOpen(false);} },
+      { label:'Configure AI / LLM',  icon:<Sparkles size={14}/>,  fn:()=>{setView('llm-config');setCmdOpen(false);} },
+    ].filter(c=>!cmdQ||c.label.toLowerCase().includes(cmdQ.toLowerCase()));
+    return (
+      <div style={{ position:'fixed', inset:0, zIndex:100, display:'flex', alignItems:'flex-start',
+        justifyContent:'center', paddingTop:100, background:'rgba(0,0,0,0.6)', backdropFilter:'blur(8px)' }}
+        onClick={()=>setCmdOpen(false)}>
+        <div style={{ width:520, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:12, overflow:'hidden', boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
+          onClick={e=>e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', gap:10, padding:'14px 16px',
+            borderBottom:'1px solid rgba(255,255,255,0.07)' }}>
+            <Search size={15} style={{ color:'#545f72' }}/>
+            <input ref={cmdRef} value={cmdQ} onChange={e=>setCmdQ(e.target.value)}
+              placeholder="Search commands…"
+              style={{ flex:1, background:'none', border:'none', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:14, outline:'none' }}/>
+            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:10, color:'#545f72',
+              padding:'2px 7px', borderRadius:4, border:'1px solid rgba(255,255,255,0.12)' }}>ESC</span>
+          </div>
+          {cmds.map(c=>(
+            <button key={c.label} onClick={c.fn} style={{ display:'flex', alignItems:'center', gap:12,
+              width:'100%', padding:'12px 16px', background:'none', border:'none',
+              color:'#8892a4', cursor:'pointer', fontSize:14, fontFamily:"'Figtree',sans-serif",
+              textAlign:'left', borderBottom:'1px solid rgba(255,255,255,0.07)' }}
+              onMouseEnter={e=>{e.currentTarget.style.background='rgba(0,212,255,0.06)'; e.currentTarget.style.color='#fff';}}
+              onMouseLeave={e=>{e.currentTarget.style.background='none'; e.currentTarget.style.color='#8892a4';}}>
+              <span style={{ color:'#00d4ff', lineHeight:0 }}>{c.icon}</span>{c.label}
+            </button>
+          ))}
         </div>
       </div>
     );
   };
 
   /* ── add project modal ────────────────────────────────────────────────────── */
-  const AddProject = () => {
+  function AddProject() {
     const [name, setName] = useState('');
     const [repo, setRepo] = useState('');
     const [branch, setBranch] = useState('main');
@@ -3005,9 +2483,7 @@ export default function App() {
         if (res.ok) { const d = await res.json(); id = d.id; }
       } catch {}
       const p: Project = { id, name: name.trim(), repo_url: repo,
-        provider:'github', branch: branch||'main', status:'active',
-        description:'', language:'', framework:'', health_score:0,
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+        provider:'github', branch: branch||'main', status:'active', created_at: new Date().toISOString() };
       setProjects(prev => [...prev, p]);
       if (folderId) setFolders(fs => fs.map(f => f.id===folderId ? { ...f, projects:[...f.projects,p] } : f));
       setSel(p);
@@ -3022,6 +2498,8 @@ export default function App() {
         <div style={{ width:480, background:'#0d1117', border:'1px solid rgba(255,255,255,0.12)',
           borderRadius:12, padding:28, boxShadow:'0 32px 80px rgba(0,0,0,0.6)' }}
           onClick={e=>e.stopPropagation()}>
+
+          {/* header */}
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:6 }}>
             <h3 style={{ fontFamily:"'Figtree',sans-serif", fontSize:18, fontWeight:700,
               color:'#fff', margin:0, letterSpacing:'-0.02em' }}>Connect Repository</h3>
@@ -3030,6 +2508,8 @@ export default function App() {
               <X size={16}/>
             </button>
           </div>
+
+          {/* folder context hint */}
           {folderId && (
             <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:20,
               padding:'6px 10px', background:'rgba(0,212,255,0.06)',
@@ -3041,18 +2521,38 @@ export default function App() {
             </div>
           )}
           {!folderId && <div style={{ marginBottom:20 }}/>}
-          {([['Project Name','my-service',name,setName],
-             ['Repository URL','github.com/org/repo',repo,setRepo],
-             ['Default Branch','main',branch,setBranch]] as [string,string,string,(v:string)=>void][]).map(([l,ph,v,s])=>(
-            <div key={l} style={{ marginBottom:14 }}>
-              <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>{l}</div>
-              <input ref={l==='Project Name'?nameRef:undefined} value={v} onChange={e=>s(e.target.value)}
-                onKeyDown={e=>e.key==='Enter'&&submit()} placeholder={ph}
-                style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
-                  borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
-                  fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
-            </div>
-          ))}
+
+          {/* project name */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Project Name</div>
+            <input ref={nameRef} value={name} onChange={e=>setName(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="my-service"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+
+          {/* repo url */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Repository URL</div>
+            <input value={repo} onChange={e=>setRepo(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="github.com/org/repo"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+
+          {/* branch */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ fontSize:12, color:'#545f72', marginBottom:5, fontFamily:"'Figtree',sans-serif" }}>Default Branch</div>
+            <input value={branch} onChange={e=>setBranch(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&submit()} placeholder="main"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'Figtree',sans-serif", fontSize:13, outline:'none' }}/>
+          </div>
+
+          {/* GitHub PAT */}
           <div style={{ marginBottom:14 }}>
             <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:5 }}>
               <div style={{ fontSize:12, color:'#545f72', fontFamily:"'Figtree',sans-serif" }}>
@@ -3069,9 +2569,11 @@ export default function App() {
                 borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
                 fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
             <div style={{ fontSize:11, color:'#545f72', marginTop:4, fontFamily:"'Figtree',sans-serif", lineHeight:1.5 }}>
-              Stored as GIT_TOKEN secret. Generate at GitHub → Settings → Developer settings → Personal access tokens.
+              Stored as GIT_TOKEN secret. Generate at GitHub → Settings → Developer settings → Personal access tokens → Fine-grained → repo read access.
             </div>
           </div>
+
+          {/* folder picker — only show if folders exist and not already pre-selected */}
           {folders.length > 0 && (
             <div style={{ marginBottom:20 }}>
               <div style={{ fontSize:12, color:'#545f72', marginBottom:8, fontFamily:"'Figtree',sans-serif" }}>Add to Folder</div>
@@ -3087,7 +2589,8 @@ export default function App() {
                 {folders.map(f=>(
                   <button key={f.id} onClick={()=>setFolderId(f.id)}
                     style={{ display:'flex', alignItems:'center', gap:5, padding:'5px 12px',
-                      borderRadius:6, cursor:'pointer', fontSize:12, fontFamily:"'Figtree',sans-serif",
+                      borderRadius:6, cursor:'pointer', fontSize:12,
+                      fontFamily:"'Figtree',sans-serif",
                       background: folderId===f.id ? 'rgba(0,212,255,0.08)' : 'transparent',
                       border: `1px solid ${folderId===f.id ? 'rgba(0,212,255,0.3)' : 'rgba(255,255,255,0.1)'}`,
                       color: folderId===f.id ? '#00d4ff' : '#545f72' }}>
@@ -3097,6 +2600,7 @@ export default function App() {
               </div>
             </div>
           )}
+
           <div style={{ display:'flex', gap:10 }}>
             <button onClick={()=>{ setAddProj(false); setAddProjToFolder(null); }}
               style={{ flex:1, padding:10, background:'transparent',
@@ -3117,7 +2621,7 @@ export default function App() {
   };
 
   /* ── add folder modal ────────────────────────────────────────────────────── */
-  const AddFolderModal = () => {
+  function AddFolderModal() {
     const [name, setName] = useState('');
     const [assignProj, setAssignProj] = useState<string[]>([]);
     const inputRef = useRef<HTMLInputElement>(null);
@@ -3191,12 +2695,189 @@ export default function App() {
     );
   };
 
+  /* ── LLM Config ──────────────────────────────────────────────────────────── */
+  function LLMConfigView() {
+    const [provider, setProvider] = useState('anthropic');
+    const [model, setModel]       = useState('claude-sonnet-4-5');
+    const [apiKey, setApiKey]     = useState('');
+    const [ollamaURL, setOllamaURL] = useState('http://localhost:11434');
+    const [showKey, setShowKey]   = useState(false);
+    const [status, setStatus]     = useState<null|{ok:boolean;msg:string}>(null);
+    const [testing, setTesting]   = useState(false);
+    const [saving, setSaving]     = useState(false);
+
+    useEffect(() => {
+      fetch('http://localhost:8080/api/v1/settings/llm')
+        .then(r=>r.json()).then(d=>{
+          if(d.provider) setProvider(d.provider);
+          if(d.model) setModel(d.model);
+          if(d.ollama_url) setOllamaURL(d.ollama_url);
+        }).catch(()=>{});
+    }, []);
+
+    const PROVIDERS = [
+      { id:'anthropic', name:'Anthropic', models:['claude-opus-4-5','claude-sonnet-4-5','claude-haiku-4-5-20251001'] },
+      { id:'openai',    name:'OpenAI',    models:['gpt-4o','gpt-4o-mini','o1-mini'] },
+      { id:'groq',      name:'Groq',      models:['llama-3.3-70b-versatile','llama3-8b-8192','gemma2-9b-it'] },
+      { id:'ollama',    name:'Ollama (Local)', models:['llama3.2','mistral','codellama','phi3'] },
+    ];
+
+    const save = async () => {
+      setSaving(true);
+      setStatus(null);
+      try {
+        const res = await fetch('http://localhost:8080/api/v1/settings/llm', {
+          method:'PUT', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider, model, api_key: apiKey, ollama_url: ollamaURL })
+        });
+        const d = await res.json();
+        if (res.ok) {
+          setStatus({ ok: true, msg: `✔ Saved — now using ${d.provider} / ${d.model}` });
+          setApiKey(''); // clear key field after save for security
+        } else {
+          setStatus({ ok: false, msg: d.error || 'Save failed' });
+        }
+      } catch(e:any) { setStatus({ ok:false, msg: 'Cannot reach backend — is it running?' }); }
+      setSaving(false);
+    };
+
+    const testConnection = async () => {
+      setTesting(true); setStatus(null);
+      try {
+        const res = await fetch('http://localhost:8080/api/v1/settings/llm/test', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ provider, model, api_key: apiKey })
+        });
+        const d = await res.json();
+        setStatus({ ok: d.ok, msg: d.ok ? `✔ Connected — "${d.response}"` : `✖ ${d.error}` });
+      } catch(e:any) { setStatus({ ok:false, msg: '✖ Cannot reach backend — is it running?' }); }
+      setTesting(false);
+    };
+
+    const prov = PROVIDERS.find(p=>p.id===provider);
+
+    return (
+      <div style={{ padding:28, maxWidth:640 }}>
+        <h2 style={{ fontFamily:"'Figtree',sans-serif", fontSize:22, fontWeight:800,
+          color:'#fff', letterSpacing:'-0.03em', marginBottom:6 }}>AI / LLM Configuration</h2>
+        <p style={{ color:'#545f72', fontSize:13, fontFamily:"'Figtree',sans-serif",
+          lineHeight:1.6, marginBottom:24 }}>
+          Choose your AI provider and enter an API key. Keys are stored in the local database and never leave your machine.
+        </p>
+
+        {/* Provider selector */}
+        <Card style={{ marginBottom:14 }}>
+          <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+            fontFamily:"'IBM Plex Mono',monospace", marginBottom:16 }}>Provider</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+            {PROVIDERS.map(p=>(
+              <button key={p.id} onClick={()=>{ setProvider(p.id); setModel(p.models[0]); setStatus(null); }}
+                style={{ padding:'12px 14px', borderRadius:8, cursor:'pointer', textAlign:'left',
+                  fontFamily:"'Figtree',sans-serif",
+                  background: provider===p.id ? 'rgba(160,120,255,0.08)' : 'rgba(255,255,255,0.02)',
+                  border: `1px solid ${provider===p.id ? 'rgba(160,120,255,0.4)' : 'rgba(255,255,255,0.08)'}`,
+                  transition:'all 0.15s' }}>
+                <div style={{ fontSize:13, fontWeight:600, color: provider===p.id ? '#a078ff' : '#e8eaf0', marginBottom:2 }}>{p.name}</div>
+                <div style={{ fontSize:11, color:'#545f72' }}>{p.models.length} model{p.models.length!==1?'s':''}</div>
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* Model selector */}
+        <Card style={{ marginBottom:14 }}>
+          <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+            fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>Model</div>
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            {prov?.models.map(m=>(
+              <button key={m} onClick={()=>setModel(m)}
+                style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+                  padding:'10px 14px', borderRadius:7, cursor:'pointer',
+                  fontFamily:"'IBM Plex Mono',monospace",
+                  background: model===m ? 'rgba(0,212,255,0.06)' : 'transparent',
+                  border: `1px solid ${model===m ? 'rgba(0,212,255,0.25)' : 'rgba(255,255,255,0.07)'}` }}>
+                <span style={{ fontSize:12, color: model===m ? '#00d4ff' : '#8892a4' }}>{m}</span>
+                {model===m && <span style={{ fontSize:10, color:'#00d4ff' }}>selected</span>}
+              </button>
+            ))}
+          </div>
+        </Card>
+
+        {/* API Key / URL */}
+        <Card style={{ marginBottom:14 }}>
+          {provider === 'ollama' ? (<>
+            <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+              fontFamily:"'IBM Plex Mono',monospace", marginBottom:14 }}>Ollama Server URL</div>
+            <input value={ollamaURL} onChange={e=>setOllamaURL(e.target.value)}
+              placeholder="http://localhost:11434"
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
+              Make sure Ollama is running locally: <code style={{ color:'#00d4ff' }}>ollama serve</code>
+            </div>
+          </>) : (<>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 }}>
+              <div style={{ fontSize:10, color:'#545f72', letterSpacing:'0.1em', textTransform:'uppercase',
+                fontFamily:"'IBM Plex Mono',monospace" }}>API Key</div>
+              <button onClick={()=>setShowKey(k=>!k)} style={{ background:'none', border:'none',
+                cursor:'pointer', color:'#545f72', fontSize:11, fontFamily:"'Figtree',sans-serif" }}>
+                {showKey ? 'hide' : 'show'}
+              </button>
+            </div>
+            <input type={showKey?'text':'password'} value={apiKey} onChange={e=>setApiKey(e.target.value)}
+              placeholder={`Enter your ${prov?.name} API key…`}
+              style={{ width:'100%', background:'#080a0f', border:'1px solid rgba(255,255,255,0.12)',
+                borderRadius:7, padding:'10px 14px', color:'#e8eaf0',
+                fontFamily:"'IBM Plex Mono',monospace", fontSize:12, outline:'none' }}/>
+            <div style={{ fontSize:11, color:'#545f72', marginTop:6, fontFamily:"'Figtree',sans-serif" }}>
+              {provider==='anthropic' && <>Get your key at <span style={{color:'#00d4ff'}}>console.anthropic.com</span></>}
+              {provider==='openai' && <>Get your key at <span style={{color:'#00d4ff'}}>platform.openai.com/api-keys</span></>}
+              {provider==='groq' && <>Get your key at <span style={{color:'#00d4ff'}}>console.groq.com</span></>}
+            </div>
+          </>)}
+        </Card>
+
+        {/* Status message */}
+        {status && (
+          <div style={{ marginBottom:14, padding:'12px 16px', borderRadius:8,
+            background: status.ok ? 'rgba(0,229,160,0.08)' : 'rgba(255,68,85,0.08)',
+            border: `1px solid ${status.ok ? 'rgba(0,229,160,0.2)' : 'rgba(255,68,85,0.2)'}`,
+            fontFamily:"'Figtree',sans-serif", fontSize:13,
+            color: status.ok ? '#00e5a0' : '#ff4455' }}>
+            {status.msg}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div style={{ display:'flex', gap:10 }}>
+          <button onClick={testConnection} disabled={testing}
+            style={{ flex:1, padding:'10px 20px', background:'transparent',
+              border:'1px solid rgba(255,255,255,0.15)', borderRadius:7,
+              color: testing ? '#545f72' : '#e8eaf0', cursor: testing ? 'wait' : 'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:500 }}>
+            {testing ? 'Testing…' : 'Test Connection'}
+          </button>
+          <button onClick={save} disabled={saving}
+            style={{ flex:2, padding:'10px 20px', background:'#a078ff',
+              border:'none', borderRadius:7, color:'#fff', cursor: saving ? 'wait' : 'pointer',
+              fontFamily:"'Figtree',sans-serif", fontSize:13, fontWeight:700,
+              opacity: saving ? 0.7 : 1 }}>
+            {saving ? 'Saving…' : 'Save Configuration'}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   /* ── render ───────────────────────────────────────────────────────────────── */
   const main = () => {
     if (view === 'llm-config') return <LLMConfigView/>;
     if (view === 'secrets')    return <Secrets/>;
     if (view === 'settings')   return <SettingsView/>;
-    if (view === 'versions')   return <VersionsView/>;
+    if (view === 'environments')  return <EnvironmentsView/>;
+    if (view === 'notifications') return <NotificationsView/>;
+    if (view === 'versions')      return <VersionsView/>;
     if (!sel) return <Welcome/>;
     switch(view) {
       case 'dashboard': return <Dashboard/>;
@@ -3229,6 +2910,7 @@ export default function App() {
         {cmdOpen    && <CmdPalette/>}
         {addProj    && <AddProject/>}
         {addFolder  && <AddFolderModal/>}
+        {runModal   && <RunBuildModal/>}
       </div>
     </>
   );

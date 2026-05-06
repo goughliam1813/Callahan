@@ -23,7 +23,7 @@ Callahan is an open-source CI/CD platform that runs entirely on your machine. Th
 ✓ First pipeline running in under 5 minutes
 ✓ No Kubernetes, no cloud bill, no plugin hell
 ✓ AI agents built-in: code review, security scanning, build debugging
-✓ Works with GitHub, GitLab, Bitbucket, Gitea, and any self-hosted Git
+✓ Works with GitHub and GitLab (webhook + PR/MR comments)
 ```
 
 ---
@@ -48,11 +48,37 @@ Callahan is an open-source CI/CD platform that runs entirely on your machine. Th
 
 ## 🚀 Quick Start
 
-### Option A — From source (recommended)
+### Option A — Docker Compose (quickest)
+
+Prerequisites: Docker 24+
 
 ```bash
-# Prerequisites: Go 1.22+, Node.js 18+
-git clone https://github.com/goughliam1813/Callahan.git
+git clone https://github.com/Callahan-ci/Callahan.git
+cd Callahan
+
+# Copy env template and set at least one LLM key
+cp .env.example .env
+# Edit .env → add ANTHROPIC_API_KEY or OPENAI_API_KEY or GROQ_API_KEY
+
+# Build and run (first build ~3 min, subsequent starts are instant)
+docker compose up --build
+```
+
+Open **http://localhost:8080** — dashboard, API, and WebSocket are all on one port.
+
+**With local Ollama (no API key needed):**
+```bash
+docker compose --profile with-ollama up --build
+```
+
+---
+
+### Option B — From source
+
+Prerequisites: Go 1.22+, Node.js 18+
+
+```bash
+git clone https://github.com/Callahan-ci/Callahan.git
 cd Callahan
 
 # Terminal 1 — Backend
@@ -63,26 +89,6 @@ cd frontend && npm install && npm run dev
 ```
 
 Open **http://localhost:3000**
-
----
-
-### Option B — Docker Compose
-
-```bash
-git clone https://github.com/goughliam1813/Callahan.git
-cd Callahan
-docker compose up --build
-```
-
-Open **http://localhost:8080**
-
----
-
-### Option C — One-liner
-
-```bash
-git clone https://github.com/goughliam1813/Callahan.git && cd Callahan/backend && go run ./cmd/callahan
-```
 
 ---
 
@@ -209,8 +215,8 @@ ai:
 3. Add a Personal Access Token (scope: `repo`) — stored as a project secret called `GIT_TOKEN`
 4. Click **Connect** — Callahan auto-detects your language
 
-### GitLab / Bitbucket / Gitea
-Same flow — Callahan auto-detects the provider from the repo URL.
+### GitLab
+Same flow — Callahan auto-detects the provider from the repo URL. Use a GitLab personal access token with `api` scope.
 
 ---
 

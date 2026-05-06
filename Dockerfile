@@ -33,6 +33,7 @@ RUN apk add --no-cache \
     ca-certificates \
     git \
     curl \
+    sqlite-libs \
     docker-cli \
     && addgroup -S callahan \
     && adduser -S -G callahan callahan
